@@ -1,6 +1,7 @@
 mod api;
 mod commands;
 mod compose;
+mod swarm;
 mod vm;
 
 use docker_core::cli::{self, Command};
@@ -71,6 +72,7 @@ fn main() -> ExitCode {
         Command::Pull(n) => ok(commands::pull(&n)),
         Command::Images => ok(commands::images()),
         Command::Rmi(n) => ok(commands::rmi(&n)),
+        Command::Swarm(words) => ok(swarm::run(&words)),
     };
     match result {
         Ok(code) => code,

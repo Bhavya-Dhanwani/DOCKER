@@ -126,6 +126,13 @@ impl Driver {
                 let fix = |s: String| if crate::cli::split_container_ref(&s).is_some() { Ok(s) } else { self.path(&s) };
                 Command::Cp { src: fix(src)?, dst: fix(dst)? }
             }
+            // `docker stack deploy -c <host file>`: the VM needs the file's VM path
+            Command::Swarm(mut w) => {
+                if let Some(i) = w.iter().position(|a| a == "-c" || a == "--compose-file").filter(|i| i + 1 < w.len()) {
+                    w[i + 1] = self.path(&w[i + 1])?;
+                }
+                Command::Swarm(w)
+            }
             other => other,
         })
     }

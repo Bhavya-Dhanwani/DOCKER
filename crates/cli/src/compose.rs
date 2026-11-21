@@ -51,6 +51,8 @@ struct Service {
     mem_limit: Option<Value>,
     working_dir: Option<String>,
     user: Option<String>,
+    /// Only read by `docker stack deploy` (see `stack_services`).
+    deploy: Option<Value>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
 }
@@ -564,9 +566,78 @@ pub fn run(args: &ComposeArgs) -> Res {
     }
 }
 
+/// The `deploy:` section of a service, as far as single-node swarm uses it.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Deploy {
+    pub replicas: Option<u32>,
+    /// `restart_policy.condition`: any | on-failure | none.
+    pub restart_condition: Option<String>,
+    pub parallelism: Option<u32>,
+    pub delay_s: Option<u64>,
+    pub mem_mb: Option<u64>,
+    pub cpu_percent: Option<u32>,
+}
+
+/// `deploy: {replicas, restart_policy, update_config, resources.limits}`.
+pub fn deploy(v: &Value) -> Res<Deploy> {
+    let mut d = Deploy {
+        replicas: v.get("replicas").and_then(Value::as_u64).map(|n| n as u32),
+        restart_condition: v.get("restart_policy").and_then(|r| r.get("condition")).and_then(scalar),
+        ..Deploy::default()
+    };
+    if let Some(u) = v.get("update_config") {
+        d.parallelism = u.get("parallelism").and_then(Value::as_u64).map(|n| n as u32);
+        d.delay_s = u.get("delay").and_then(scalar).map(|s| parse_duration(&s).ok_or(format!("bad update_config.delay {s:?}"))).transpose()?;
+    }
+    if let Some(l) = v.get("resources").and_then(|r| r.get("limits")) {
+        d.mem_mb = l.get("memory").map(mem_mb).transpose()?;
+        // ponytail: `cpus` counts cores in Docker but cpu_percent is a share of the whole machine; cpus*100 clamped is a close-enough cap
+        d.cpu_percent = l
+            .get("cpus")
+            .and_then(scalar)
+            .map(|c| c.parse::<f64>().map(|f| (f * 100.0).round().clamp(1.0, 100.0) as u32).map_err(|_| format!("bad cpus {c:?}")))
+            .transpose()?;
+    }
+    Ok(d)
+}
+
+/// One service of a stack file: its container settings and its `deploy:` section.
+pub struct StackService {
+    pub name: String,
+    pub cfg: Config,
+    pub deploy: Deploy,
+}
+
+/// Load a compose file for `docker stack deploy`. `build:` is not supported (swarm services need an image).
+pub fn stack_services(file: &str, stack: &str) -> Res<Vec<StackService>> {
+    let p = load(&ComposeArgs { file: Some(file.into()), project: Some(stack.into()), sub: ComposeSub::Config })?;
+    let mut out = vec![];
+    for (name, s) in &p.file.services {
+        let pl = plan(&p, name, s)?;
+        if pl.build.is_some() {
+            return Err(format!("service {name}: build is not supported by stack deploy; use an image").into());
+        }
+        let deploy = s.deploy.as_ref().map(deploy).transpose()?.unwrap_or_default();
+        out.push(StackService { name: name.clone(), cfg: pl.cfg, deploy });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deploy_section_maps_to_swarm_settings() {
+        let y = "replicas: 3\nrestart_policy: {condition: on-failure}\nupdate_config: {parallelism: 2, delay: 10s}\nresources: {limits: {cpus: '0.5', memory: 128M}}";
+        let d = deploy(&serde_yaml::from_str(y).unwrap()).unwrap();
+        assert_eq!(
+            d,
+            Deploy { replicas: Some(3), restart_condition: Some("on-failure".into()), parallelism: Some(2), delay_s: Some(10), mem_mb: Some(128), cpu_percent: Some(50) }
+        );
+        assert_eq!(deploy(&serde_yaml::from_str("{}").unwrap()).unwrap(), Deploy::default());
+        assert!(deploy(&serde_yaml::from_str("update_config: {delay: soon}").unwrap()).is_err());
+    }
 
     fn project(yaml: &str) -> Project {
         Project { name: "demo".into(), dir: PathBuf::from("/proj"), file: serde_yaml::from_str(yaml).unwrap() }

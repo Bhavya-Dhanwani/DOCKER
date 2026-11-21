@@ -58,7 +58,7 @@ pub fn decompress<R: std::io::Read + 'static>(r: R, media_type: &str) -> Result<
 #[cfg(target_os = "linux")]
 pub fn unpack(blob: &Path, media_type: &str, dest: &Path) -> Result<()> {
     use crate::error::err;
-    use std::{ffi::CString, fs, io::Read, os::unix::ffi::OsStrExt};
+    use std::{ffi::CString, fs, os::unix::ffi::OsStrExt};
 
     let file = fs::File::open(blob).map_err(|e| err(format!("layer blob missing ({e}); run `docker pull` again")))?;
     let reader = decompress(file, media_type)?;

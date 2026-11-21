@@ -29,19 +29,38 @@ fn classify(file_name: &str) -> Whiteout<'_> {
     }
 }
 
+/// Wrap a layer blob in the right decompressor. The magic bytes decide (zstd `28 B5 2F FD`, gzip `1F 8B`),
+/// because `docker save` archives carry no media type; the media type is only the tie-breaker.
+pub fn decompress<R: std::io::Read + 'static>(r: R, media_type: &str) -> Result<Box<dyn std::io::Read>> {
+    use std::io::{Cursor, Read};
+    let mut r = r;
+    let mut magic = [0u8; 4];
+    let mut got = 0;
+    while got < 4 {
+        match r.read(&mut magic[got..])? {
+            0 => break,
+            n => got += n,
+        }
+    }
+    let r = Cursor::new(magic[..got].to_vec()).chain(r);
+    let zstd = magic == [0x28, 0xB5, 0x2F, 0xFD];
+    let gzip = got >= 2 && magic[..2] == [0x1F, 0x8B];
+    Ok(if zstd || (!gzip && media_type.contains("zstd")) {
+        Box::new(ruzstd::decoding::StreamingDecoder::new(r).map_err(|e| crate::error::err(format!("bad zstd layer: {e}")))?)
+    } else if gzip || media_type.contains("gzip") {
+        Box::new(flate2::read::GzDecoder::new(r))
+    } else {
+        Box::new(r)
+    })
+}
+
 #[cfg(target_os = "linux")]
 pub fn unpack(blob: &Path, media_type: &str, dest: &Path) -> Result<()> {
     use crate::error::err;
     use std::{ffi::CString, fs, io::Read, os::unix::ffi::OsStrExt};
 
     let file = fs::File::open(blob).map_err(|e| err(format!("layer blob missing ({e}); run `docker pull` again")))?;
-    let reader: Box<dyn Read> = if media_type.contains("zstd") {
-        return Err(err("zstd layers are not supported yet"));
-    } else if media_type.contains("gzip") {
-        Box::new(flate2::read::GzDecoder::new(file))
-    } else {
-        Box::new(file)
-    };
+    let reader = decompress(file, media_type)?;
 
     let cpath = |p: &Path| CString::new(p.as_os_str().as_bytes()).expect("no NUL in path");
     let mut ar = tar::Archive::new(reader);
@@ -82,6 +101,35 @@ pub fn unpack(blob: &Path, media_type: &str, dest: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A valid zstd frame made of one raw (stored) block: magic, header (window descriptor only), block header, data.
+    fn zstd_raw(data: &[u8]) -> Vec<u8> {
+        let mut f = vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x50];
+        let bh = 1u32 | ((data.len() as u32) << 3); // last block, type raw
+        f.extend(&bh.to_le_bytes()[..3]);
+        f.extend(data);
+        f
+    }
+
+    #[test]
+    fn decompresses_zstd_gzip_and_plain() {
+        use std::io::{Cursor, Read, Write};
+        let mut out = vec![];
+        decompress(Cursor::new(zstd_raw(b"hello zstd")), "application/vnd.oci.image.layer.v1.tar+zstd").unwrap().read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"hello zstd");
+        // detected by magic even when the media type says nothing
+        out.clear();
+        decompress(Cursor::new(zstd_raw(b"x")), "").unwrap().read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"x");
+        let mut gz = flate2::write::GzEncoder::new(vec![], flate2::Compression::fast());
+        gz.write_all(b"hello gzip").unwrap();
+        out.clear();
+        decompress(Cursor::new(gz.finish().unwrap()), "").unwrap().read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"hello gzip");
+        out.clear();
+        decompress(Cursor::new(b"plain".to_vec()), "application/vnd.oci.image.layer.v1.tar").unwrap().read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"plain");
+    }
 
     #[test]
     fn classifies_whiteouts() {

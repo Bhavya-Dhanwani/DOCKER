@@ -181,6 +181,7 @@ fn load_oci(store: &Store, stage: &Path, say: &mut dyn FnMut(String)) -> Result<
         }
         let meta = meta_from_config(&r.display(), layers, &config_bytes)?;
         store.save(&r, &meta)?;
+        crate::info::record(store, &r, Some(cfg.digest.clone()), None, &config_bytes);
         names.push(r.display());
     }
     Ok(names)
@@ -215,6 +216,7 @@ fn load_docker(store: &Store, stage: &Path, say: &mut dyn FnMut(String)) -> Resu
             let r = Reference::parse(tag)?;
             let meta = meta_from_config(&r.display(), layers.clone(), &config_bytes)?;
             store.save(&r, &meta)?;
+            crate::info::record(store, &r, Some(format!("sha256:{}", hex_of(&config_bytes))), None, &config_bytes);
             names.push(r.display());
         }
     }

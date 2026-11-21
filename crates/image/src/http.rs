@@ -2,14 +2,21 @@
 //! ponytail: avoids needing a C toolchain for a TLS library; swap this one function for a Rust
 //! HTTP client (ureq + rustls) if you want zero external binaries.
 use crate::error::{err, Result};
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::atomic::{AtomicU64, Ordering},
+    thread,
+    time::Duration,
+};
 
 pub struct Req<'a> {
-    /// GET (follows redirects), HEAD, POST, PUT, ...
+    /// GET (follows redirects), HEAD, POST, PUT, PATCH, ...
     pub method: &'a str,
     pub url: &'a str,
     pub headers: &'a [(&'a str, String)],
-    /// File to send as the request body (PUT).
+    /// File to send as the request body (PUT/PATCH).
     pub upload: Option<&'a Path>,
 }
 
@@ -19,6 +26,40 @@ pub struct Reply {
     pub www_authenticate: Option<String>,
     pub location: Option<String>,
     pub content_digest: Option<String>,
+    /// `Range: 0-<last byte>` of an upload session (resumable uploads).
+    pub range: Option<String>,
+    /// `Retry-After` in seconds, when the server sent one.
+    pub retry_after: Option<u64>,
+}
+
+/// A scratch file name that no other thread is using (`send` derives its header files from it).
+pub fn scratch(dir: &Path, what: &str) -> PathBuf {
+    static N: AtomicU64 = AtomicU64::new(0);
+    dir.join(format!("{what}-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)))
+}
+
+/// Statuses worth another try: the server is overloaded or flaky, not "no".
+pub fn transient(status: u16) -> bool {
+    status == 429 || (500..600).contains(&status)
+}
+
+/// Seconds to wait before retry number `attempt` (0-based): 1, 2, 4 ... capped at 30, or what the server asked.
+pub fn backoff(attempt: u32, retry_after: Option<u64>) -> Duration {
+    Duration::from_secs(retry_after.unwrap_or(1u64 << attempt.min(5)).min(30))
+}
+
+/// `send`, retried with backoff on 429/5xx and on curl failures (connection resets), `tries` attempts in all.
+/// Only for requests that are safe to repeat: GET, HEAD, POST that opens a session, PUT of a whole body.
+pub fn send_retry(req: &Req, dest: &Path, tries: u32) -> Result<Reply> {
+    for attempt in 0.. {
+        let last = attempt + 1 >= tries;
+        match send(req, dest) {
+            Ok(r) if transient(r.status) && !last => thread::sleep(backoff(attempt, r.retry_after)),
+            Err(_) if !last => thread::sleep(backoff(attempt, None)),
+            other => return other,
+        }
+    }
+    unreachable!()
 }
 
 pub fn get(url: &str, headers: &[(&str, String)], dest: &Path) -> Result<Reply> {
@@ -39,13 +80,13 @@ pub fn send(req: &Req, dest: &Path) -> Result<Reply> {
     fs::write(&hdr_in, req.headers.iter().map(|(k, v)| format!("{k}: {v}\n")).collect::<String>())?;
 
     let mut c = Command::new("curl");
-    c.args(["-sS", "--retry", "2"]);
+    c.arg("-sS");
     match req.method {
         "GET" => {
-            c.arg("-L");
+            c.args(["-L", "--retry", "2"]);
         }
         "HEAD" => {
-            c.arg("-I");
+            c.args(["-I", "--retry", "2"]);
         }
         m => {
             c.args(["-X", m]);
@@ -69,6 +110,8 @@ pub fn send(req: &Req, dest: &Path) -> Result<Reply> {
         www_authenticate: last_header(&dump, "www-authenticate"),
         location: last_header(&dump, "location"),
         content_digest: last_header(&dump, "docker-content-digest"),
+        range: last_header(&dump, "range"),
+        retry_after: last_header(&dump, "retry-after").and_then(|v| v.parse().ok()),
     })
 }
 
@@ -82,5 +125,21 @@ mod tests {
         assert_eq!(last_header(dump, "Location").as_deref(), Some("/b"));
         assert_eq!(last_header(dump, "docker-content-digest").as_deref(), Some("sha256:x"));
         assert_eq!(last_header(dump, "etag"), None);
+    }
+
+    #[test]
+    fn retry_policy() {
+        assert!(transient(429) && transient(503) && transient(500));
+        assert!(!transient(404) && !transient(401) && !transient(201));
+        assert_eq!(backoff(0, None), Duration::from_secs(1));
+        assert_eq!(backoff(2, None), Duration::from_secs(4));
+        assert_eq!(backoff(20, None), Duration::from_secs(30));
+        assert_eq!(backoff(0, Some(7)), Duration::from_secs(7));
+        assert_eq!(backoff(0, Some(9999)), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn scratch_names_are_unique() {
+        assert_ne!(scratch(Path::new("/t"), "x"), scratch(Path::new("/t"), "x"));
     }
 }

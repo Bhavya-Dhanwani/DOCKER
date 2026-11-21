@@ -353,7 +353,7 @@ mod tests {
         while off < b.len() {
             let len = u32::from_ne_bytes(b[off..off + 4].try_into().unwrap()) as usize;
             types.push(u16::from_ne_bytes(b[off + 4..off + 6].try_into().unwrap()));
-            assert!(len >= 16 && len % 4 == 0);
+            assert!(len >= 16 && len.is_multiple_of(4));
             off += len;
         }
         assert_eq!(off, b.len());

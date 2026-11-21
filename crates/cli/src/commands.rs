@@ -347,6 +347,7 @@ pub fn pause(q: &str, on: bool) -> Res {
 
 pub fn wait(q: &str) -> Res {
     let id = registry::find(q)?.id;
+    let mut gone_since: Option<std::time::Instant> = None;
     loop {
         let e = registry::find(&id)?;
         if let Some(c) = e.exit_code {
@@ -354,8 +355,11 @@ pub fn wait(q: &str) -> Res {
             return Ok(());
         }
         if !e.running() {
-            println!("-1"); // supervisor vanished without recording an exit
-            return Ok(());
+            // the process can end a moment before its supervisor records the exit code: give it 5s
+            if gone_since.get_or_insert_with(std::time::Instant::now).elapsed() > Duration::from_secs(5) {
+                println!("-1"); // supervisor vanished without recording an exit
+                return Ok(());
+            }
         }
         thread::sleep(Duration::from_millis(200));
     }

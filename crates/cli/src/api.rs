@@ -793,11 +793,21 @@ fn route(r: &Request, w: &mut dyn Write) -> io::Result<Reply> {
                 // Headers go out at once: `docker run` waits for them before it starts the container.
                 head(w, 200, "application/json", None)?;
                 let mut code = 0;
+                let mut stopped_at: Option<std::time::Instant> = None;
                 loop {
                     match registry::find(&e.id) {
                         Ok(x) if !x.running() && !x.restarting && !x.created => {
-                            code = x.exit_code.unwrap_or(-1);
-                            break;
+                            // The process can be gone a moment before its supervisor records the exit code:
+                            // wait for the record (up to 5s) instead of reporting -1 for a clean exit.
+                            let since = *stopped_at.get_or_insert_with(std::time::Instant::now);
+                            if let Some(c) = x.exit_code {
+                                code = c;
+                                break;
+                            }
+                            if since.elapsed() > Duration::from_secs(5) {
+                                code = -1;
+                                break;
+                            }
                         }
                         Ok(x) => code = x.exit_code.unwrap_or(code),
                         Err(_) => break, // removed (`--rm`): the last exit code we saw is all we have
@@ -2435,7 +2445,7 @@ b:1", "2"));
 
     #[test]
     fn commit_changes_and_config_edit_image_metadata() {
-        let mut m = docker_image::ImageMeta { name: "a:latest".into(), layers: vec![], entrypoint: vec![], cmd: vec!["sh".into()], env: vec!["A=1".into()], working_dir: String::new(), user: String::new(), exposed: vec![], labels: Default::default(), healthcheck: None };
+        let mut m = docker_image::ImageMeta { name: "a:latest".into(), layers: vec![], entrypoint: vec![], cmd: vec!["sh".into()], env: vec!["A=1".into()], working_dir: String::new(), user: String::new(), exposed: vec![], labels: Default::default(), healthcheck: None, ..Default::default() };
         apply_change(&mut m, r#"CMD ["echo", "hi"]"#).unwrap();
         assert_eq!(m.cmd, ["echo", "hi"]);
         apply_change(&mut m, "CMD echo hi").unwrap();
@@ -2462,7 +2472,7 @@ b:1", "2"));
         assert_eq!((j["cpu_stats"]["cpu_usage"]["total_usage"].as_u64(), j["precpu_stats"]["cpu_usage"]["total_usage"].as_u64(), j["cpu_stats"]["online_cpus"].as_u64()), (Some(3_000), Some(1_000), Some(4)));
         assert_eq!(stats_json(&e, &Sample::default(), &b, 1, 1)["preread"], "0001-01-01T00:00:00Z");
         assert_eq!((j["memory_stats"]["usage"].as_u64(), j["memory_stats"]["limit"].as_u64(), j["pids_stats"]["current"].as_u64()), (Some(6), Some(100), Some(2)));
-        let mut m = docker_image::ImageMeta { name: "a:latest".into(), layers: vec![], entrypoint: vec![], cmd: vec![], env: vec![], working_dir: String::new(), user: String::new(), exposed: vec![], labels: Default::default(), healthcheck: None };
+        let mut m = docker_image::ImageMeta { name: "a:latest".into(), layers: vec![], entrypoint: vec![], cmd: vec![], env: vec![], working_dir: String::new(), user: String::new(), exposed: vec![], labels: Default::default(), healthcheck: None, ..Default::default() };
         m.layers = ["1", "2"].iter().map(|c| docker_image::LayerRef { digest: c.repeat(64), media_type: String::new(), size: 7 }).collect();
         let h = history(&m);
         assert_eq!((h[0]["Tags"][0].as_str(), h[1]["Id"].as_str(), h.as_array().map(Vec::len)), (Some("a:latest"), Some("<missing>"), Some(2)));

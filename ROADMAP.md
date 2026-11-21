@@ -6,21 +6,22 @@ Goal: a Docker-compatible CLI in Rust that uses less RAM and disk. Containers ar
 
 ## Status at a glance
 
-**Made:** the container engine (namespaces, cgroup v2, overlayfs, seccomp), pull/push/build (multi-stage, `.dockerignore`),
-compose, networks (name DNS) and volumes, restart policies, healthchecks, terminals (`run -it`, `exec -it`), `docker update`,
-the Engine API daemon (the real Docker CLI and the Docker SDK for Python both pass their end-to-end checks), Windows and macOS
-forwarding into a hidden Linux VM, the `Sasta Docker` desktop GUI, and the node, postgres, redis, nginx, python and mariadb images.
+**Made:** the container engine (namespaces, cgroup v2, overlayfs, seccomp), pull/push/build (multi-stage, `.dockerignore`, `ADD` URL/tar, `RUN --mount`, heredocs, `ONBUILD`, `SHELL`, `VOLUME`, `STOPSIGNAL`),
+registry features (digest pulls, zstd, resumable push, credential helpers, search/history), compose, networks (UDP, IPv6, subnets, name DNS) and volumes, restart policies, healthchecks,
+terminals (`run -it`, `exec -it`), `docker update`, Swarm-lite (single node), rootless mode (user namespaces, slirp4netns/pasta), the Engine API (real Docker CLI and Docker SDK for Python pass their checks),
+Windows and macOS forwarding into a hidden Linux VM, the `Sasta Docker` desktop GUI, and the node, postgres, redis, nginx, python and mariadb images.
 
 **Remaining:**
-- Rootless mode (see "Rootless (5b)" below for why it is a separate project)
-- Swarm / multi-node orchestration (not planned: a different product)
 - macOS has never been run on a real Mac (the Lima driver is written and compiled only)
-- No stdin on `attach` for containers that were started without a terminal; `docker update --restart`
-- Not tried against other Docker clients (Go SDK, IDE plugins, Portainer, `docker compose` v2 binary)
-- The GUI has only been checked by looking at it: its buttons and dialogs have not been clicked through end to end
-- Only about a dozen real images have been run, so other images may hit bugs
-- Engine API endpoints not implemented: `export`/`commit`, image history/search, `POST /containers/prune` family, plugins, configs/secrets
+- The GUI has only been checked by looking at it: its buttons and dialogs have not been clicked through end to end; it has no Swarm, compose or rootless views
+- Rootless: no `build`, no `rmi`/`prune` of layers owned by mapped uids, no user-defined networks or name DNS, no UDP `-p`, limits only inside a delegated cgroup; `pull` and `--cpu` untested rootless; the systemd `user@UID.service` delegation path untested
+- Swarm: single node only (no `swarm join`), `service create/update` do not wait for convergence, `service logs -f` prints a snapshot, `depends_on` ignored, `stack deploy` does not prune removed services
+- IPv6 to the internet (NAT66) untested (no IPv6 route on the test host); plain `-p` does not also listen on `[::]`
+- Registry: zstd tested only with hand-made frames, parallel upload/mount/chunk resume only against a mock registry, `docker manifest inspect` not implemented
+- Engine API: `changes`/`export`/`archive`/`commit` need a running container; `images/search` returns an empty list; `commit` does not carry the container's run-time cmd/env
+- Build: `ADD --checksum/--keep-git-dir/--exclude`, git URLs, `COPY --parents`, `.tar.zst` are rejected; anonymous `VOLUME`s are never garbage-collected
 - Windows-native containers beyond the Job Object backend (`--native`)
+- Only about a dozen real images have been run, so other images may hit bugs
 
 | Phase | What | State |
 |---|---|---|

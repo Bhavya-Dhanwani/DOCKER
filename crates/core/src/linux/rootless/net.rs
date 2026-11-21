@@ -151,7 +151,7 @@ mod tests {
 
     #[test]
     fn helper_command_lines() {
-        let ports = [Port { host: 8080, container: 80 }];
+        let ports = [Port { host: 8080, container: 80, host_ip: None, udp: false }];
         assert_eq!(pasta_ports(&ports), "8080:80");
         assert_eq!(pasta_ports(&[]), "none");
         let a = pasta_args(7, &ports);

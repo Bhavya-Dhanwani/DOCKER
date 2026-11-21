@@ -1040,7 +1040,7 @@ mod tests {
 
         let lower = tmp("copy-lower");
         fs::create_dir_all(lower.join("app")).unwrap();
-        let (out, _) = copy_layer(&stage, &Src::Context(Local::new(&ctx, &Ignore::default())), &["a.txt".into()], "/app", "/", &[lower.clone()]).unwrap();
+        let (out, _) = copy_layer(&stage, &Src::Context(Local::new(&ctx, &Ignore::default())), &["a.txt".into()], "/app", "/", std::slice::from_ref(&lower)).unwrap();
         assert!(out.join("app/a.txt").is_file(), "a file copied onto an existing image directory goes inside it");
         for d in [&ctx, &stage, &lower] {
             let _ = fs::remove_dir_all(d);

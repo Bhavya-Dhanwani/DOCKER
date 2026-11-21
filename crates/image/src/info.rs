@@ -153,6 +153,7 @@ mod tests {
             exposed: vec![],
             labels: BTreeMap::new(),
             healthcheck: None,
+            ..Default::default()
         }
     }
 

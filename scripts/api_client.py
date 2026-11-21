@@ -339,7 +339,12 @@ check("changes on a stopped container is 409", st == 409)
 call("POST", f"/containers/{fid}/start")
 wait_state(fid, "running")
 
-st, t = call("GET", f"/containers/{fid}/top")
+# the container counts as running a moment before its init has exec'd `sleep`: give it a few seconds
+for _ in range(20):
+    st, t = call("GET", f"/containers/{fid}/top")
+    if st == 200 and any("sleep" in p[-1] for p in t["Processes"]):
+        break
+    time.sleep(0.25)
 check("top lists the processes with titles", st == 200 and t["Titles"][:2] == ["UID", "PID"] and any("sleep" in p[-1] for p in t["Processes"]))
 st, s1 = call("GET", f"/containers/{fid}/stats?stream=false")
 check("stats?stream=false returns one object with cpu, memory and pids", st == 200 and s1["memory_stats"]["usage"] > 0 and s1["cpu_stats"]["online_cpus"] >= 1 and s1["pids_stats"]["current"] >= 1 and s1["name"] == "/apifs" and s1["cpu_stats"]["system_cpu_usage"] > 0)

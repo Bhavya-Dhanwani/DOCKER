@@ -10,19 +10,27 @@ pub fn exec(e: &Entry, cmd: &[String], tty: bool) -> Result<i32> {
     let pid = e.pid;
     // open everything first: after joining the mount namespace /proc paths mean something else
     let open = |p: String| fs::File::open(&p).map_err(|x| Error::io(format!("open {p}"), x));
-    let namespaces = [
+    let rootless = crate::registry::rootless();
+    // rootless: join the container's user namespace first; it grants the rights to join the others
+    let user_ns = rootless.then_some(("user", libc::CLONE_NEWUSER));
+    let namespaces = user_ns.into_iter().chain([
         ("pid", libc::CLONE_NEWPID),
         ("uts", libc::CLONE_NEWUTS),
         ("ipc", libc::CLONE_NEWIPC),
         ("net", libc::CLONE_NEWNET),
         ("mnt", libc::CLONE_NEWNS), // last: joining it changes how the others resolve
-    ]
-    .map(|(n, flag)| open(format!("/proc/{pid}/ns/{n}")).map(|f| (f, flag)));
+    ])
+    .map(|(n, flag)| open(format!("/proc/{pid}/ns/{n}")).map(|f| (f, flag)))
+    .collect::<Vec<_>>();
     let root = open(format!("/proc/{pid}/root"))?;
 
-    // count the exec'd process against the container's limits
+    // count the exec'd process against the container's limits (rootless: only when a cgroup was delegated)
     let procs = cgroup::dir(&e.id).join("cgroup.procs");
-    fs::write(&procs, process::id().to_string()).map_err(|x| Error::io(format!("write {}", procs.display()), x))?;
+    if let Err(x) = fs::write(&procs, process::id().to_string())
+        && !rootless
+    {
+        return Err(Error::io(format!("write {}", procs.display()), x));
+    }
 
     for ns in namespaces {
         let (f, flag) = ns?;

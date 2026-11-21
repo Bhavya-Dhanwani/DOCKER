@@ -57,6 +57,19 @@ pub fn decompress<R: std::io::Read + 'static>(r: R, media_type: &str) -> Result<
 
 #[cfg(target_os = "linux")]
 pub fn unpack(blob: &Path, media_type: &str, dest: &Path) -> Result<()> {
+    unpack_as(blob, media_type, dest, false)
+}
+
+/// Unpack for rootless use. Must run inside a user namespace (where whiteout `mknod 0/0` is allowed):
+/// uses `user.overlay.*` xattrs (overlayfs `userxattr`) and tolerates chown/device failures
+/// (an unmapped uid cannot be owned) instead of aborting.
+#[cfg(target_os = "linux")]
+pub fn unpack_rootless(blob: &Path, media_type: &str, dest: &Path) -> Result<()> {
+    unpack_as(blob, media_type, dest, true)
+}
+
+#[cfg(target_os = "linux")]
+fn unpack_as(blob: &Path, media_type: &str, dest: &Path, rootless: bool) -> Result<()> {
     use crate::error::err;
     use std::{ffi::CString, fs, os::unix::ffi::OsStrExt};
 
@@ -66,8 +79,9 @@ pub fn unpack(blob: &Path, media_type: &str, dest: &Path) -> Result<()> {
     let cpath = |p: &Path| CString::new(p.as_os_str().as_bytes()).expect("no NUL in path");
     let mut ar = tar::Archive::new(reader);
     ar.set_preserve_permissions(true);
-    ar.set_preserve_ownerships(true);
-    ar.set_unpack_xattrs(true);
+    ar.set_preserve_ownerships(!rootless);
+    ar.set_unpack_xattrs(!rootless);
+    let opaque_attr = if rootless { c"user.overlay.opaque" } else { c"trusted.overlay.opaque" };
     for entry in ar.entries()? {
         let mut entry = entry?;
         let path = entry.path()?.into_owned();
@@ -75,12 +89,20 @@ pub fn unpack(blob: &Path, media_type: &str, dest: &Path) -> Result<()> {
         let parent = dest.join(path.parent().unwrap_or(Path::new("")));
         match classify(&name) {
             Whiteout::No => {
-                entry.unpack_in(dest)?;
+                let kind = entry.header().entry_type();
+                if rootless && (kind.is_character_special() || kind.is_block_special()) {
+                    continue; // devices need real root; the runtime binds host ones instead
+                }
+                let (uid, gid) = (entry.header().uid().unwrap_or(0) as u32, entry.header().gid().unwrap_or(0) as u32);
+                if entry.unpack_in(dest)? && rootless && (uid != 0 || gid != 0) {
+                    // best effort: works under a full uid/gid map, EINVAL under a single-id map (stays root-owned)
+                    unsafe { libc::lchown(cpath(&dest.join(&path)).as_ptr(), uid, gid) };
+                }
             }
             Whiteout::Opaque => {
                 fs::create_dir_all(&parent)?;
                 let r = unsafe {
-                    libc::lsetxattr(cpath(&parent).as_ptr(), c"trusted.overlay.opaque".as_ptr(), b"y".as_ptr().cast(), 1, 0)
+                    libc::lsetxattr(cpath(&parent).as_ptr(), opaque_attr.as_ptr(), b"y".as_ptr().cast(), 1, 0)
                 };
                 if r < 0 {
                     return Err(err(format!("set opaque dir: {}", std::io::Error::last_os_error())));

@@ -89,7 +89,12 @@ pub fn finalize(user: &str, sec: &Security) -> Result<()> {
         let passwd = fs::read_to_string("/etc/passwd").unwrap_or_default();
         let group = fs::read_to_string("/etc/group").unwrap_or_default();
         let ids = crate::user::resolve(user, &passwd, &group)?;
-        sys::become_user(ids.uid, ids.gid)?;
+        if crate::registry::rootless() && super::rootless::single_map() && (ids.uid != 0 || ids.gid != 0) {
+            // only id 0 exists in this user namespace; the process stays "root" (= the calling user)
+            super::rootless::warn(&format!("USER {user} ignored: single-uid mapping has no uid {}", ids.uid));
+        } else {
+            sys::become_user(ids.uid, ids.gid)?;
+        }
     }
     if sec.no_new_privs && unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0 {
         return Err(Error::sys("set no_new_privs"));

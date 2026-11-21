@@ -24,6 +24,8 @@ pub use ignore::Ignore;
 pub use info::{history, inspect, HistoryRow};
 pub use pull::{pull, pull_for};
 pub use search::{search, Hit};
+#[cfg(target_os = "linux")]
+pub use layer::unpack_rootless;
 pub use push::push;
 pub use reference::{normalize_registry, Reference};
 pub use store::{dir_size, Health, ImageMeta, LayerRef, Store};

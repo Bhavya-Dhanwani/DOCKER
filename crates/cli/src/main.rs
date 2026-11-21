@@ -24,6 +24,11 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     }
+    // `docker --rootless ...`: unprivileged mode (also selected automatically for any non-root Linux user)
+    if args.first().is_some_and(|a| a == "--rootless") {
+        args.remove(0);
+        docker_core::registry::set_rootless(true);
+    }
     let cmd = match cli::parse(args) {
         Ok(c) => c,
         Err(e) => {

@@ -20,10 +20,13 @@ pub fn overlay_opts(layers: &[PathBuf], upper: &Path, work: &Path) -> String {
 }
 
 fn mount_overlay(layers: &[PathBuf], id: &str) -> Result<PathBuf> {
-    let base = PathBuf::from("/run/rust-docker").join(id);
+    let base = super::rootless::run_root().join(id);
     fs::create_dir_all(&base).map_err(|e| Error::io(format!("mkdir {}", base.display()), e))?;
     // tmpfs: container writes live in RAM (counted against --mem) and vanish on exit: zero SSD writes
     sys::mount("tmpfs", &sys::path_str(&base), Some("tmpfs"), 0, Some("mode=755"))?;
+    if crate::registry::rootless() {
+        return super::rootless::mount_root(layers, &base);
+    }
     let (upper, work, merged) = (base.join("upper"), base.join("work"), base.join("merged"));
     for d in [&upper, &work, &merged] {
         fs::create_dir(d).map_err(|e| Error::io(format!("mkdir {}", d.display()), e))?;
@@ -34,7 +37,10 @@ fn mount_overlay(layers: &[PathBuf], id: &str) -> Result<PathBuf> {
 }
 
 fn mount_step_overlay(layers: &[PathBuf], upper: &Path, work: &Path, id: &str) -> Result<PathBuf> {
-    let merged = PathBuf::from("/run/rust-docker").join(id).join("merged");
+    if crate::registry::rootless() {
+        return Err(Error::Usage("docker build is not supported in rootless mode yet".into()));
+    }
+    let merged = super::rootless::run_root().join(id).join("merged");
     fs::create_dir_all(&merged).map_err(|e| Error::io(format!("mkdir {}", merged.display()), e))?;
     // plain overlay semantics: no redirects or metacopy, so the upper dir is a portable layer
     let opts = format!("{},redirect_dir=off,metacopy=off", overlay_opts(layers, upper, work));
@@ -79,6 +85,10 @@ pub fn enter(src: &Source, id: &str, rw: bool, volumes: &[Volume]) -> Result<()>
     };
     let root_s = sys::path_str(&root);
     sys::mount(&root_s, &root_s, None, MS_BIND | MS_REC, None)?; // pivot_root needs a mount point
+    let rootless = crate::registry::rootless();
+    if rootless {
+        super::rootless::bind_devices(&root)?; // no mknod without real root: bind the host's nodes
+    }
     for v in volumes {
         mount_volume(&root, v)?;
     }
@@ -94,13 +104,17 @@ pub fn enter(src: &Source, id: &str, rw: bool, volumes: &[Volume]) -> Result<()>
     }
     sys::mount("proc", "/proc", Some("proc"), 0, None)?;
     sys::mount("tmpfs", "/tmp", Some("tmpfs"), 0, Some("size=64m"))?;
-    sys::mount("tmpfs", "/dev", Some("tmpfs"), 0, Some("size=1m,mode=755"))?;
-    for (name, major, minor) in [("null", 1, 3), ("zero", 1, 5), ("random", 1, 8), ("urandom", 1, 9), ("tty", 5, 0)] {
-        sys::mknod_char(&format!("/dev/{name}"), major, minor)?;
+    if !rootless {
+        sys::mount("tmpfs", "/dev", Some("tmpfs"), 0, Some("size=1m,mode=755"))?;
+        for (name, major, minor) in [("null", 1, 3), ("zero", 1, 5), ("random", 1, 8), ("urandom", 1, 9), ("tty", 5, 0)] {
+            sys::mknod_char(&format!("/dev/{name}"), major, minor)?;
+        }
     }
     // a private devpts: the container creates its terminals here (and `tty`/ttyname work)
     fs::create_dir_all("/dev/pts").map_err(|e| Error::io("mkdir /dev/pts", e))?;
-    sys::mount("devpts", "/dev/pts", Some("devpts"), 0, Some("newinstance,ptmxmode=0666,mode=0620,gid=5"))?;
+    // rootless: gid 5 usually is not mapped in the user namespace
+    let pts = if rootless { "newinstance,ptmxmode=0666,mode=0600" } else { "newinstance,ptmxmode=0666,mode=0620,gid=5" };
+    sys::mount("devpts", "/dev/pts", Some("devpts"), 0, Some(pts))?;
     let _ = std::os::unix::fs::symlink("pts/ptmx", "/dev/ptmx");
     // what shells and databases expect: /dev/fd (process substitution), std streams, POSIX shared memory
     for (target, link) in [("/proc/self/fd", "fd"), ("/proc/self/fd/0", "stdin"), ("/proc/self/fd/1", "stdout"), ("/proc/self/fd/2", "stderr")] {

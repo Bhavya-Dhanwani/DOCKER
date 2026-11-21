@@ -168,7 +168,7 @@ fn try_wait(pid: i32) -> Option<i32> {
 
 /// Where a detached terminal container accepts `attach` clients (the Engine API connects here).
 pub fn attach_sock(id: &str) -> std::path::PathBuf {
-    std::path::Path::new("/run/rust-docker").join(format!("{id}.tty"))
+    super::rootless::run_root().join(format!("{id}.tty"))
 }
 
 /// The attach socket of a detached terminal container: input from any client goes to the terminal, and

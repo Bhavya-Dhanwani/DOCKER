@@ -9,6 +9,7 @@ mod net;
 mod netlink;
 mod pty;
 mod rootfs;
+pub mod rootless;
 mod sys;
 
 use crate::{
@@ -104,7 +105,11 @@ fn plan(cfg: &Config) -> Result<Plan> {
     let meta = store.get(&r).map_err(img)?.ok_or_else(|| {
         Error::Usage(format!("image {} not found locally; run `docker pull {}`", r.display(), cfg.target))
     })?;
-    let layers = meta.layers.iter().map(|l| store.ensure_layer(l)).collect::<docker_image::Result<Vec<_>>>().map_err(img)?;
+    let layers = if registry::rootless() {
+        rootless::ensure_layers(&store, &meta.layers)?
+    } else {
+        meta.layers.iter().map(|l| store.ensure_layer(l)).collect::<docker_image::Result<Vec<_>>>().map_err(img)?
+    };
 
     // Docker semantics: ENTRYPOINT stays, arguments replace CMD
     let mut cmd = match &cfg.entrypoint {
@@ -234,13 +239,40 @@ fn run_container(cfg: &Config, mut plan: Plan) -> Result<i32> {
         None
     };
 
-    let mode = cfg.network.unwrap_or(Network::Bridge);
+    let mut mode = cfg.network.unwrap_or(Network::Bridge);
     if mode != Network::Bridge && !cfg.ports.is_empty() {
         return Err(Error::Usage("-p needs --network bridge".into()));
     }
+    // rootless: no host bridge. A user-space helper (slirp4netns/pasta) serves the default network;
+    // without one the container shares the host's network namespace.
+    let rl = registry::rootless();
+    let mut rl_helper = None;
+    let mut rl_map = None;
+    if rl {
+        let m = rootless::detect();
+        rootless::describe(&m);
+        rl_map = Some(m);
+        if mode == Network::Bridge {
+            rl_helper = rootless::net::detect();
+            if cfg.network_name.is_some() {
+                rootless::warn("user-defined networks are not available rootless; using the default rootless network");
+            }
+            if rl_helper.is_none() {
+                rootless::warn("neither slirp4netns nor pasta found: sharing the HOST network namespace (like --network host)");
+                if let Some(p) = cfg.ports.iter().find(|p| p.host != p.container) {
+                    return Err(Error::Usage(format!(
+                        "-p {}:{} needs slirp4netns or pasta (with the host network only identical ports like -p {}:{} work)",
+                        p.host, p.container, p.container, p.container
+                    )));
+                }
+                mode = Network::Host;
+            }
+        }
+        let _ = fs::create_dir_all(rootless::run_root());
+    }
     let _cleanup = RunDirs(id.clone());
-    let listeners = if cfg.ports.is_empty() { None } else { Some(net::bind_ports(&cfg.ports)?) };
-    let lease = if mode == Network::Bridge { Some(net::Lease::acquire()?) } else { None };
+    let listeners = if cfg.ports.is_empty() || rl { None } else { Some(net::bind_ports(&cfg.ports)?) };
+    let lease = if mode == Network::Bridge && !rl { Some(net::Lease::acquire()?) } else { None };
     let ip = lease.as_ref().map(|l| l.ip);
     if mode != Network::None {
         // DNS: a generated resolv.conf bind-mounted into the container
@@ -248,7 +280,8 @@ fn run_container(cfg: &Config, mut plan: Plan) -> Result<i32> {
         fs::create_dir_all(&dir).map_err(|e| Error::io("mkdir run dir", e))?;
         let host = fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
         let file = dir.join("resolv.conf");
-        fs::write(&file, net::resolv_conf(&host, mode == Network::Bridge)).map_err(|e| Error::io("write resolv.conf", e))?;
+        let text = if rl_helper.is_some() { format!("nameserver {}\n", rootless::net::DNS) } else { net::resolv_conf(&host, mode == Network::Bridge) };
+        fs::write(&file, text).map_err(|e| Error::io("write resolv.conf", e))?;
         plan.volumes.push(Volume { host: file.to_string_lossy().into_owned(), container: "/etc/resolv.conf".into(), ro: true });
     }
     if let (Network::Bridge, Some(ip)) = (mode, ip) {
@@ -277,6 +310,7 @@ fn run_container(cfg: &Config, mut plan: Plan) -> Result<i32> {
     let mut restarts = 0u32;
     let code = loop {
         let cgroup = Cgroup::create(&id, cfg)?;
+        let helper_net = rl_helper.is_some();
         let (rd, wr) = sys::pipe()?; // parent -> child: "you are in the cgroup, go"
         let (nr_r, nr_w) = sys::pipe()?; // child -> parent: "my network namespace exists"
         let (nd_r, nd_w) = sys::pipe()?; // parent -> child: "your veth is in place"
@@ -285,11 +319,12 @@ fn run_container(cfg: &Config, mut plan: Plan) -> Result<i32> {
         // The child gets its own pid namespace at birth and unshares the rest itself, so this process
         // stays in the host namespaces. It also stays single-threaded (the -p forwarder and the health
         // monitor are helper *processes*), which makes forking the next run after a restart safe.
-        let code = match sys::fork_newpid()? {
+        let forked = if rl { sys::fork_ns(libc::CLONE_NEWUSER | libc::CLONE_NEWPID)? } else { sys::fork_newpid()? };
+        let code = match forked {
             sys::Fork::Child => {
                 drop((wr, nr_r, nd_w, ready));
                 let link = tty.map(|(_, c)| c);
-                let net = ChildNet { mode, ip, ready: nr_w, go: nd_r };
+                let net = ChildNet { mode, ip, helper: helper_net, ready: nr_w, go: nd_r };
                 let err = child(&plan, &id, cfg.rw, rd, net, link).unwrap_err();
                 eprintln!("docker: {err}");
                 process::exit(127);
@@ -297,13 +332,25 @@ fn run_container(cfg: &Config, mut plan: Plan) -> Result<i32> {
             sys::Fork::Parent(pid) => {
                 drop((rd, nr_w, nd_r));
                 let link = tty.map(|(p, _)| p);
+                if let Some(m) = &rl_map {
+                    // the child is a stranger in its new user namespace until its id maps exist
+                    if let Err(e) = rootless::write_maps(pid, m) {
+                        sys::kill(pid);
+                        let _ = sys::wait(pid);
+                        return Err(e);
+                    }
+                }
                 cgroup.add_pid(pid)?;
                 drop(wr); // child is released once it is inside the cgroup
-                if ip.is_some() {
+                if ip.is_some() || helper_net {
                     let mut b = [0u8; 1];
                     // the child reports once its network namespace exists; EOF means it already died
                     if fs::File::from(nr_r).read(&mut b).unwrap_or(0) == 1 {
-                        if let Err(e) = net::attach(pid as u32, &id) {
+                        let attached = match rl_helper {
+                            Some(h) => rootless::net::start(h, pid as u32, &cfg.ports, &RunDirs::etc(&id)).map(|hp| helpers.push(hp)),
+                            None => net::attach(pid as u32, &id),
+                        };
+                        if let Err(e) = attached {
                             sys::kill(pid);
                             let _ = sys::wait(pid);
                             return Err(e);
@@ -405,7 +452,7 @@ impl RunDirs {
 
 impl Drop for RunDirs {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(Path::new("/run/rust-docker").join(&self.0));
+        let _ = fs::remove_dir_all(rootless::run_root().join(&self.0));
         let _ = fs::remove_dir_all(Self::etc(&self.0));
     }
 }
@@ -413,6 +460,8 @@ impl Drop for RunDirs {
 struct ChildNet {
     mode: Network,
     ip: Option<std::net::Ipv4Addr>,
+    /// Rootless: a slirp4netns/pasta helper configures the namespace from outside.
+    helper: bool,
     ready: OwnedFd,
     go: OwnedFd,
 }
@@ -441,12 +490,15 @@ fn child(plan: &Plan, id: &str, rw: bool, gate: OwnedFd, net: ChildNet, tty: Opt
     }
     sys::unshare(ns)?;
     match (net.mode, net.ip) {
-        (Network::Bridge, Some(ip)) => {
+        (Network::Bridge, ip) if ip.is_some() || net.helper => {
             fs::File::from(net.ready).write_all(&[1]).map_err(|e| Error::io("network handshake", e))?;
             if fs::File::from(net.go).read(&mut [0u8; 1]).unwrap_or(0) != 1 {
                 return Err(Error::Usage("network setup failed on the host side".into()));
             }
-            net::configure_inside(ip)?;
+            match ip {
+                Some(ip) => net::configure_inside(ip)?,
+                None => net::loopback_up()?, // the helper configured the tap device and routes
+            }
         }
         (Network::None, _) => net::loopback_up()?,
         _ => {}
@@ -473,6 +525,11 @@ pub fn stats(id: &str) -> Option<Stats> {
 }
 
 pub fn stop(id: &str) -> Result<()> {
+    if registry::rootless() && !cgroup::dir(id).join("cgroup.kill").exists() {
+        // no delegated cgroup: killing the container's init takes its whole pid namespace with it
+        let e = registry::find(id)?;
+        return if e.running() { sys::signal(e.pid as i32, libc::SIGKILL) } else { Ok(()) };
+    }
     cgroup::kill(id)
 }
 

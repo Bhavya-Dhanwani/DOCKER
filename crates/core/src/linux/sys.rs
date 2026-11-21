@@ -52,12 +52,17 @@ pub fn mknod_char(path: &str, major: u32, minor: u32) -> Result<()> {
 /// fork() whose child (and only the child) is PID 1 of a new pid namespace.
 /// Unlike unshare(CLONE_NEWPID) + fork(), the caller stays in its own pid namespace and can still start threads.
 pub fn fork_newpid() -> Result<Fork> {
+    fork_ns(libc::CLONE_NEWPID)
+}
+
+/// fork() whose child lives in the namespaces named by `flags` (rootless: `CLONE_NEWUSER` too).
+pub fn fork_ns(flags: libc::c_int) -> Result<Fork> {
     // raw clone with a null stack behaves like fork(); all remaining arguments are unused (0)
-    let r = unsafe { libc::syscall(libc::SYS_clone, (libc::CLONE_NEWPID | libc::SIGCHLD) as libc::c_ulong, 0, 0, 0, 0) };
+    let r = unsafe { libc::syscall(libc::SYS_clone, (flags | libc::SIGCHLD) as libc::c_ulong, 0, 0, 0, 0) };
     match r {
         0 => Ok(Fork::Child),
         p if p > 0 => Ok(Fork::Parent(p as i32)),
-        _ => Err(Error::sys("clone (new pid namespace)")),
+        _ => Err(Error::sys("clone (new namespaces; user namespaces may be disabled)")),
     }
 }
 
@@ -156,7 +161,12 @@ pub fn kill(pid: i32) {
 
 /// Become `uid:gid` (clears supplementary groups first). Must run before exec, as root.
 pub fn become_user(uid: u32, gid: u32) -> Result<()> {
-    check(unsafe { libc::setgroups(0, std::ptr::null()) } as i64, || "setgroups".into())?;
+    // under a single-id rootless mapping setgroups is denied by the kernel: there are no groups to drop anyway
+    if let Err(e) = check(unsafe { libc::setgroups(0, std::ptr::null()) } as i64, || "setgroups".into())
+        && !crate::registry::rootless()
+    {
+        return Err(e);
+    }
     check(unsafe { libc::setgid(gid) } as i64, || "setgid".into())?;
     check(unsafe { libc::setuid(uid) } as i64, || "setuid".into())
 }

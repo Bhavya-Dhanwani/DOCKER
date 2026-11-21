@@ -17,6 +17,8 @@ pub use error::{Error, Result};
 pub use archive::{load, save};
 pub use auth::{login, logout};
 pub use ignore::Ignore;
+#[cfg(target_os = "linux")]
+pub use layer::unpack_rootless;
 pub use pull::pull;
 pub use push::push;
 pub use reference::{normalize_registry, Reference};

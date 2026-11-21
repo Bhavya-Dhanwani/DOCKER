@@ -106,10 +106,38 @@ pub fn now_unix() -> u64 {
     now()
 }
 
+static ROOTLESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `docker --rootless ...`
+pub fn set_rootless(on: bool) {
+    ROOTLESS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Rootless mode: forced by `--rootless`, and automatic for any non-root user on Linux.
+pub fn rootless() -> bool {
+    non_root_linux() || ROOTLESS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(target_os = "linux")]
+fn non_root_linux() -> bool {
+    unsafe { libc::geteuid() != 0 }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn non_root_linux() -> bool {
+    false
+}
+
 /// Where containers, images, logs and scratch data live. Override with `RUST_DOCKER_HOME`.
 pub fn data_dir() -> PathBuf {
     if let Some(d) = env::var_os("RUST_DOCKER_HOME") {
         return PathBuf::from(d);
+    }
+    if rootless() {
+        // never share a store with the root engine, even when --rootless is used as root
+        if let Some(h) = env::var_os("XDG_DATA_HOME").map(PathBuf::from).or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share"))) {
+            return h.join("sasta-docker");
+        }
     }
     let base = env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)

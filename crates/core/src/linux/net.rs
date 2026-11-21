@@ -123,7 +123,7 @@ pub fn configure_inside(ip: Ipv4Addr) -> Result<()> {
 
 /// Per-container files that are bind-mounted into it (resolv.conf, hosts).
 pub fn etc_dir(id: &str) -> std::path::PathBuf {
-    std::path::Path::new("/run/rust-docker").join(format!("{id}.etc"))
+    super::rootless::run_root().join(format!("{id}.etc"))
 }
 
 /// Rewrite /etc/hosts of every running member of `network`, in place so the bind mounts see the change.

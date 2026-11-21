@@ -32,7 +32,7 @@ sleep 1
 echo "== ADD: URL and local archives"
 fresh
 mkdir -p "$ctx/t/in"; echo inner > "$ctx/t/in/f.txt"; echo top > "$ctx/t/top.txt"
-(cd "$ctx/t" && tar cf ../a.tar . && tar czf ../b.tgz . && tar cjf ../c.tar.bz2 . 2>/dev/null; tar cJf ../d.tar.xz . 2>/dev/null)
+(cd "$ctx/t" && tar cf ../a.tar . && tar czf ../b.tgz .; command -v bzip2 >/dev/null && tar cjf ../c.tar.bz2 .; command -v xz >/dev/null && tar cJf ../d.tar.xz .)
 rm -rf "$ctx/t"; echo plain > "$ctx/plain.txt"; gzip -c "$ctx/plain.txt" > "$ctx/plain.txt.gz"
 cat > "$ctx/Dockerfile" <<'EOF'
 FROM alpine
@@ -73,7 +73,7 @@ ADD --chown=1001:1002 --chmod=0640 f /owned
 EOF
 $D build -t cm "$ctx" >/dev/null 2>&1; check "chmod build succeeds" test $? -eq 0
 check "COPY --chmod=600 on a file" eq "$(run cm stat -c %a /m600)" 600
-check "COPY --chmod=755 applies to the directory and files in it" eq "$(run cm stat -c '%a %a' /m755 /m755/g | tr '\n' ' ')" "755 755 "
+check "COPY --chmod=755 applies to the directory and files in it" eq "$(run cm stat -c %a /m755 /m755/g | tr '\n' ' ')" "755 755 "
 check "ADD --chown --chmod" eq "$(run cm stat -c '%a %u:%g' /owned)" "640 1001:1002"
 
 echo "== heredocs"

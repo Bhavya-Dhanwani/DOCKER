@@ -350,8 +350,8 @@ fn pid_file() -> PathBuf {
 
 #[cfg(unix)]
 fn alive(pid: u32) -> bool {
-    unsafe { libc::kill(pid as i32, 0) == 0 }
-        && fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| String::from_utf8_lossy(&c).contains("__supervisor"))
+    let up = unsafe { libc::kill(pid as i32, 0) } == 0;
+    up && fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| String::from_utf8_lossy(&c).contains("__supervisor"))
 }
 
 #[cfg(not(unix))]
@@ -733,7 +733,7 @@ fn service_ps(names: &[&str]) -> Res {
     for name in names {
         let spec = services(None)?.into_iter().find(|s| s.name == *name).ok_or_else(|| format!("no such service: {name}"))?;
         for (_, e) in tasks_of(&spec.name) {
-            println!("{:<14} {:<34} {:<20} {:<16} {}", &e.id[..12], e.label(), e.image, commands::status_of(&e, now), "local");
+            println!("{:<14} {:<34} {:<20} {:<16} local", &e.id[..12], e.label(), e.image, commands::status_of(&e, now));
         }
     }
     Ok(())

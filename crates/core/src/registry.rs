@@ -115,7 +115,11 @@ pub fn set_rootless(on: bool) {
 
 /// Rootless mode: forced by `--rootless`, and automatic for any non-root user on Linux.
 pub fn rootless() -> bool {
-    non_root_linux() || ROOTLESS.load(std::sync::atomic::Ordering::Relaxed)
+    if non_root_linux() {
+        // latch: inside the container's user namespace we look like uid 0, but we are still rootless
+        ROOTLESS.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    ROOTLESS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[cfg(target_os = "linux")]

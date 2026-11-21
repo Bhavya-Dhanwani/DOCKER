@@ -30,6 +30,7 @@ pub use build::build;
 pub use cp::{cp, secure_join};
 pub use stdin::stdin_sock;
 pub use exec::exec;
+pub use net::{refresh_hosts, reset_hosts};
 
 const DEFAULT_PATH: &str = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
@@ -285,8 +286,15 @@ fn run_container(cfg: &Config, mut plan: Plan) -> Result<i32> {
     }
     let _cleanup = RunDirs(id.clone());
     let listeners = if cfg.ports.is_empty() || rl { None } else { Some(net::bind_ports(&cfg.ports)?) };
-    let lease = if mode == Network::Bridge && !rl { Some(net::Lease::acquire()?) } else { None };
+    let (lease, presence) = match mode {
+        Network::Bridge if !rl => {
+            let (l, p) = net::Lease::acquire(cfg.network_name.as_deref())?;
+            (Some(l), Some(p))
+        }
+        _ => (None, None),
+    };
     let ip = lease.as_ref().map(|l| l.ip);
+    let subnet = lease.as_ref().map_or(crate::networks::DEFAULT_SUBNET, |l| l.subnet);
     if mode != Network::None {
         // DNS: a generated resolv.conf bind-mounted into the container
         let dir = RunDirs::etc(&id);
@@ -349,7 +357,7 @@ fn run_container(cfg: &Config, mut plan: Plan) -> Result<i32> {
                     process::exit(127);
                 }
                 let link = tty.map(|(_, c)| c);
-                let net = ChildNet { mode, ip, helper: helper_net, ready: nr_w, go: nd_r };
+                let net = ChildNet { mode, ip, subnet, helper: helper_net, ready: nr_w, go: nd_r };
                 let err = child(&plan, &id, cfg.rw, rd, net, link).unwrap_err();
                 eprintln!("docker: {err}");
                 process::exit(127);
@@ -467,6 +475,11 @@ fn run_container(cfg: &Config, mut plan: Plan) -> Result<i32> {
     if let Some(n) = &cfg.network_name {
         net::refresh_hosts(n); // ... and that we are gone
     }
+    drop(_cleanup); // run dirs first: tearing the bridge down can take a moment
+    drop(presence); // we no longer use the bridge: remove it (and the NAT rules) if nobody else does
+    if mode == Network::Bridge {
+        net::teardown_if_idle();
+    }
     code
 }
 
@@ -492,6 +505,7 @@ struct ChildNet {
     ip: Option<std::net::Ipv4Addr>,
     /// Rootless: a slirp4netns/pasta helper configures the namespace from outside.
     helper: bool,
+    subnet: crate::networks::Subnet,
     ready: OwnedFd,
     go: OwnedFd,
 }
@@ -526,7 +540,7 @@ fn child(plan: &Plan, id: &str, rw: bool, gate: OwnedFd, net: ChildNet, tty: Opt
                 return Err(Error::Usage("network setup failed on the host side".into()));
             }
             match ip {
-                Some(ip) => net::configure_inside(ip)?,
+                Some(ip) => net::configure_inside(ip, net.subnet)?,
                 None => net::loopback_up()?, // the helper configured the tap device and routes
             }
         }

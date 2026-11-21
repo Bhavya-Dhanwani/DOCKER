@@ -17,6 +17,8 @@ has() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
 ipof() { $D inspect "$1" | sed -n 's/.*"ip": "\([0-9.]*\)".*/\1/p'; }
 
 echo "== bridge (default)"
+# the bridge now disappears with the last container, so keep one around for the host-side checks below
+$D run -d --name keep alpine sleep 1000 </dev/null >/dev/null
 out=$($D run alpine ip -4 addr show eth0 </dev/null)
 check "eth0 has a 172.30.x.x/16 address" has "$out" "172.30."
 check "default route via the gateway" has "$($D run alpine ip route </dev/null)" "default via 172.30.0.1"
@@ -37,7 +39,8 @@ check "container -> container" has "$($D run alpine nc -w3 "$srv" 80 </dev/null)
 check "-p port conflict fails fast" sh -c "! $D run -d -p 18080:80 alpine sleep 1 </dev/null"
 $D rm -f srv >/dev/null 2>&1; $D rm -f pub >/dev/null 2>&1
 sleep 1
-check "veth ends are cleaned up" sh -c "! ls /sys/class/net | grep -q '^rdv'"
+n=$(ls /sys/class/net | grep -c '^rdv')
+check "veth ends are cleaned up (only keep's is left)" test "$n" -le 1
 
 echo "== outbound through NAT"
 check "container reaches an outside IP (ICMP via masquerade)" $D run alpine ping -c1 -W3 1.1.1.1 </dev/null
@@ -59,6 +62,7 @@ check "none: -p is rejected" sh -c "! $D run --network none -p 1:1 alpine true <
 check "host: shares the host interfaces" has "$($D run --network host alpine ip -o link </dev/null)" "eth0"
 check "host: container sees the bridge too" has "$($D run --network host alpine ip -o link </dev/null)" "rdbr0"
 
+$D rm -f keep >/dev/null 2>&1
 echo "== cleanup"
 check "no leftover run dirs" sh -c "! ls /run/rust-docker/* 2>/dev/null | grep -q ."
 check "no leftover cgroups" sh -c "! ls /sys/fs/cgroup | grep -q rust-docker"

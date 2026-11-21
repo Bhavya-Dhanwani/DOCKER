@@ -19,7 +19,7 @@ usage:
   docker stats [--no-stream] [container...]
   docker cp <container>:<path> <host-path> | <host-path> <container>:<path>
   docker volume create|ls|rm|inspect|prune [name]
-  docker network create|ls|rm|inspect [name]
+  docker network create [--subnet CIDR]|ls|rm|inspect|connect|disconnect
   docker compose [-f <file>] [-p <project>] up [-d] [--build] | down [-v] | ps | logs [-f] [service] | config | build
   docker daemon [--host unix:///path | tcp://127.0.0.1:2375]     serve the Docker Engine API
   docker system df
@@ -170,10 +170,14 @@ pub enum ComposeSub {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum NetCmd {
-    Create(String),
+    /// name, `--subnet`
+    Create(String, Option<String>),
     Ls,
     Rm(String),
     Inspect(String),
+    /// network, container
+    Connect(String, String),
+    Disconnect(String, String),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -269,24 +273,81 @@ pub struct BuildArgs {
     pub context: String,
 }
 
-/// `-p host:container` (TCP).
+/// `-p [ip:]host:container[/tcp|udp]` (one port; a range expands to several).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Port {
+    /// Host address to listen on (None = all IPv4 addresses).
+    #[serde(default)]
+    pub host_ip: Option<std::net::IpAddr>,
     pub host: u16,
     pub container: u16,
+    #[serde(default)]
+    pub udp: bool,
 }
 
 impl Port {
+    /// Exactly one mapping (no range).
     pub fn parse(s: &str) -> Result<Port> {
+        match Port::parse_all(s)?.as_slice() {
+            [p] => Ok(*p),
+            _ => Err(Error::Usage(format!("bad port mapping {s:?}: a range is not allowed here"))),
+        }
+    }
+
+    /// `[ip:]host[-end]:container[-end][/tcp|udp]`, `[::1]:8080:80`; ranges must have equal length.
+    pub fn parse_all(s: &str) -> Result<Vec<Port>> {
         let bad = |m: &str| Error::Usage(format!("bad port mapping {s:?}: {m}"));
-        let body = match s.split_once('/') {
-            Some((b, "tcp")) => b,
-            Some(_) => return Err(bad("only TCP is supported yet")),
-            None => s,
+        let (body, udp) = match s.rsplit_once('/') {
+            Some((b, "tcp")) => (b, false),
+            Some((b, "udp")) => (b, true),
+            Some(_) => return Err(bad("protocol must be tcp or udp")),
+            None => (s, false),
         };
-        let (h, c) = body.split_once(':').ok_or_else(|| bad("expected host:container"))?;
+        let (ip, ports) = if let Some(rest) = body.strip_prefix('[') {
+            let (ip, r) = rest.split_once("]:").ok_or_else(|| bad("expected [ip]:host:container"))?;
+            (Some(ip), r)
+        } else {
+            match body.matches(':').count() {
+                1 => (None, body),
+                2 => body.split_once(':').map(|(i, r)| (Some(i), r)).unwrap_or((None, body)),
+                _ => return Err(bad("expected [ip:]host:container")),
+            }
+        };
+        let host_ip = ip.map(|i| i.parse().map_err(|_| bad("bad host address"))).transpose()?;
+        let (h, c) = ports.split_once(':').ok_or_else(|| bad("expected host:container"))?;
         let num = |x: &str| x.parse::<u16>().ok().filter(|&n| n > 0).ok_or_else(|| bad("ports are 1-65535"));
-        Ok(Port { host: num(h)?, container: num(c)? })
+        let range = |x: &str| -> Result<(u16, u16)> {
+            let (a, b) = match x.split_once('-') {
+                Some((a, b)) => (num(a)?, num(b)?),
+                None => (num(x)?, num(x)?),
+            };
+            if a > b { Err(bad("empty port range")) } else { Ok((a, b)) }
+        };
+        let ((h0, h1), (c0, c1)) = (range(h)?, range(c)?);
+        if h1 - h0 != c1 - c0 {
+            return Err(bad("port ranges must have the same length"));
+        }
+        Ok((0..=h1 - h0).map(|k| Port { host_ip, host: h0 + k, container: c0 + k, udp }).collect())
+    }
+
+    /// Back to the `-p` argument form (what `parse` accepts).
+    pub fn to_arg(&self) -> String {
+        let ip = match self.host_ip {
+            None => String::new(),
+            Some(std::net::IpAddr::V6(a)) => format!("[{a}]:"),
+            Some(a) => format!("{a}:"),
+        };
+        format!("{ip}{}:{}{}", self.host, self.container, if self.udp { "/udp" } else { "" })
+    }
+
+    /// Short form for `ps`: `8080->80`, `5353->53/udp`, `127.0.0.1:8080->80`.
+    pub fn label(&self) -> String {
+        let ip = match self.host_ip {
+            None => String::new(),
+            Some(std::net::IpAddr::V6(a)) => format!("[{a}]:"),
+            Some(a) => format!("{a}:"),
+        };
+        format!("{ip}{}->{}{}", self.host, self.container, if self.udp { "/udp" } else { "" })
     }
 }
 
@@ -683,7 +744,30 @@ fn parse_network(args: Vec<String>) -> Result<NetCmd> {
         }
     };
     match sub.as_str() {
-        "create" => one("create").map(NetCmd::Create),
+        "create" => {
+            let (mut subnet, mut name) = (None, vec![]);
+            let mut a = rest.iter();
+            while let Some(x) = a.next() {
+                match x.as_str() {
+                    "--subnet" => subnet = Some(a.next().ok_or_else(|| usage("--subnet needs a CIDR"))?.clone()),
+                    "-d" | "--driver" => {
+                        if a.next().map(String::as_str) != Some("bridge") {
+                            return Err(usage("only --driver bridge is supported"));
+                        }
+                    }
+                    f if f.starts_with('-') => return Err(usage(&format!("unknown network create option {f:?}"))),
+                    n => name.push(n.to_string()),
+                }
+            }
+            match <[String; 1]>::try_from(name) {
+                Ok([n]) if is_volume_name(&n) => Ok(NetCmd::Create(n, subnet)),
+                _ => Err(usage("usage: docker network create [--driver bridge] [--subnet CIDR] <name>")),
+            }
+        }
+        "connect" | "disconnect" => match <[String; 2]>::try_from(rest.clone()) {
+            Ok([n, c]) if is_volume_name(&n) => Ok(if sub == "connect" { NetCmd::Connect(n, c) } else { NetCmd::Disconnect(n, c) }),
+            _ => Err(usage(&format!("usage: docker network {sub} <network> <container>"))),
+        },
         "rm" | "remove" => one("rm").map(NetCmd::Rm),
         "inspect" => one("inspect").map(NetCmd::Inspect),
         "ls" | "list" if rest.is_empty() => Ok(NetCmd::Ls),
@@ -932,7 +1016,7 @@ fn parse_run(args: Vec<String>) -> Result<Config> {
                 }
                 cfg.aliases.push(a);
             }
-            "-p" | "--publish" => cfg.ports.push(Port::parse(&value("host:container")?)?),
+            "-p" | "--publish" => cfg.ports.extend(Port::parse_all(&value("[ip:]host:container[/udp]")?)?),
             "-v" | "--volume" => cfg.volumes.push(Volume::parse(&value("host:container[:ro]")?)?),
             "--mem" => {
                 let mb: u64 = value("a number of MB")?
@@ -1052,7 +1136,7 @@ impl Command {
                     flag("--network-alias", Some(a.clone()));
                 }
                 for p in &c.ports {
-                    flag("-p", Some(format!("{}:{}", p.host, p.container)));
+                    flag("-p", Some(p.to_arg()));
                 }
                 for e in &c.env {
                     flag("-e", Some(e.clone()));
@@ -1121,7 +1205,16 @@ impl Command {
                 VolumeCmd::Prune => vec![s("volume"), s("prune")],
             },
             Command::Network(n) => match n {
-                NetCmd::Create(x) => vec![s("network"), s("create"), x.clone()],
+                NetCmd::Create(x, sub) => {
+                    let mut v = vec![s("network"), s("create")];
+                    if let Some(c) = sub {
+                        v.extend([s("--subnet"), c.clone()]);
+                    }
+                    v.push(x.clone());
+                    v
+                }
+                NetCmd::Connect(n, c) => vec![s("network"), s("connect"), n.clone(), c.clone()],
+                NetCmd::Disconnect(n, c) => vec![s("network"), s("disconnect"), n.clone(), c.clone()],
                 NetCmd::Ls => vec![s("network"), s("ls")],
                 NetCmd::Rm(x) => vec![s("network"), s("rm"), x.clone()],
                 NetCmd::Inspect(x) => vec![s("network"), s("inspect"), x.clone()],
@@ -1306,7 +1399,7 @@ mod tests {
         for line in [
             "run -d --name web -p 8080:80 -e A=1 -e B -v ./data:/data:ro --mem 64 --cpu 50 --procs 9 --cap-drop ALL --cap-add chown --security-opt no-new-privileges --privileged --rw --network host alpine sh -c id",
             "run alpine", "run --rm -d alpine sleep 1", "exec web ls -la", "ps", "ps -a", "logs web", "logs -f web", "stop web", "rm web", "rm -f web",
-            "run --entrypoint /bin/sh -w /app -u 1000:1000 alpine -c id", "exec -t web sh", "run -d -t -i --restart on-failure:3 --health-cmd true --health-interval 5s --health-retries 2 alpine", "run --restart always --no-healthcheck alpine", "inspect web", "start web", "restart -t 3 web", "kill web", "pause web", "unpause web", "update --mem 64 --cpu 50 --procs 100 web", "wait web", "top web", "rename a b", "cp web:/x ./y", "cp ./y web:/x", "stats", "stats --no-stream a b", "daemon", "daemon --host tcp://127.0.0.1:2375", "compose up", "compose -f a.yml -p proj up -d --build", "compose down -v", "compose ps", "compose logs -f web", "compose config", "compose build", "network create n1", "network ls", "network rm n1", "network inspect n1", "run --network appnet --network-alias db --network-alias database alpine", "volume create data", "volume ls", "volume rm data", "volume inspect data", "volume prune", "system df", "container prune", "build -t app:1 -f Df --build-arg A=1 --build-arg B=2 --target final --no-cache .", "pull alpine", "push a:1",
+            "run --entrypoint /bin/sh -w /app -u 1000:1000 alpine -c id", "exec -t web sh", "run -d -t -i --restart on-failure:3 --health-cmd true --health-interval 5s --health-retries 2 alpine", "run --restart always --no-healthcheck alpine", "inspect web", "start web", "restart -t 3 web", "kill web", "pause web", "unpause web", "update --mem 64 --cpu 50 --procs 100 web", "wait web", "top web", "rename a b", "cp web:/x ./y", "cp ./y web:/x", "stats", "stats --no-stream a b", "daemon", "daemon --host tcp://127.0.0.1:2375", "compose up", "compose -f a.yml -p proj up -d --build", "compose down -v", "compose ps", "compose logs -f web", "compose config", "compose build", "network create n1", "network create --subnet 10.9.0.0/24 n2", "network connect n1 web", "network disconnect n1 web", "run -p 5353:53/udp -p 127.0.0.1:8080:80 -p [::1]:9090:90 -p 8000-8002:8100-8102 alpine", "network ls", "network rm n1", "network inspect n1", "run --network appnet --network-alias db --network-alias database alpine", "volume create data", "volume ls", "volume rm data", "volume inspect data", "volume prune", "system df", "container prune", "build -t app:1 -f Df --build-arg A=1 --build-arg B=2 --target final --no-cache .", "pull alpine", "push a:1",
             "tag a b", "save -o x.tar a b:1", "load -i x.tar", "login -u me -p x ghcr.io", "login -u me --password-stdin", "logout", "logout ghcr.io", "images", "rmi a", "prune", "version",
             "swarm init", "service create --name w --replicas 2 -p 80:80 alpine sleep 9", "service scale w=3 x=1", "stack deploy -c a.yml s",
         ] {
@@ -1444,7 +1537,9 @@ mod tests {
         let c = run("run --network appnet --network-alias web alpine");
         assert_eq!((c.network, c.network_name.as_deref(), c.aliases.as_slice()), (Some(Network::Bridge), Some("appnet"), ["web".to_string()].as_slice()));
         assert_eq!(run("run --network host alpine").network_name, None);
-        assert_eq!(p("network create n").unwrap(), Command::Network(NetCmd::Create("n".into())));
+        assert_eq!(p("network create n").unwrap(), Command::Network(NetCmd::Create("n".into(), None)));
+        assert_eq!(p("network create --driver bridge --subnet 10.1.0.0/24 n").unwrap(), Command::Network(NetCmd::Create("n".into(), Some("10.1.0.0/24".into()))));
+        assert!(p("network create --driver overlay n").is_err());
         assert_eq!(p("network ls").unwrap(), Command::Network(NetCmd::Ls));
         for bad in ["network", "network create", "network create ../x", "network ls x", "network bogus", "run --network-alias ../x alpine", "run --network a/b alpine"] {
             assert!(p(bad).is_err(), "{bad}");
@@ -1477,9 +1572,19 @@ mod tests {
     fn network_flags() {
         let c = run("run --network host -p 8080:80 -p 9000:90/tcp alpine");
         assert_eq!(c.network, Some(Network::Host));
-        assert_eq!(c.ports, [Port { host: 8080, container: 80 }, Port { host: 9000, container: 90 }]);
+        let tcp = |host, container| Port { host_ip: None, host, container, udp: false };
+        assert_eq!(c.ports, [tcp(8080, 80), tcp(9000, 90)]);
+        let c = run("run -p 5353:53/udp -p 127.0.0.1:8080:80 -p [::1]:9090:90 -p 8000-8001:8100-8101 alpine");
+        assert_eq!(c.ports.len(), 5);
+        assert_eq!(c.ports[0], Port { udp: true, ..tcp(5353, 53) });
+        assert_eq!(c.ports[1].host_ip, Some("127.0.0.1".parse().unwrap()));
+        assert_eq!(c.ports[2].host_ip, Some("::1".parse().unwrap()));
+        assert_eq!((c.ports[4].host, c.ports[4].container), (8001, 8101));
+        assert_eq!(c.ports[2].to_arg(), "[::1]:9090:90");
+        assert_eq!(c.ports[0].label(), "5353->53/udp");
+        assert_eq!(c.ports[1].label(), "127.0.0.1:8080->80");
         assert_eq!(run("run alpine").network, None);
-        for bad in ["8080", "0:80", "70000:80", "80:80/udp", "a:b"] {
+        for bad in ["8080", "0:80", "70000:80", "80:80/sctp", "a:b", "8000-8002:80-81", "9-1:9-1"] {
             assert!(Port::parse(bad).is_err(), "{bad}");
         }
         assert_eq!(run("run --network wifi alpine").network_name.as_deref(), Some("wifi")); // any other word names a network

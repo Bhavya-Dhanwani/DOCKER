@@ -319,8 +319,10 @@ fn port_list(e: &Entry) -> Vec<Value> {
     e.ports
         .iter()
         .filter_map(|p| {
-            let (h, c) = p.split_once("->")?;
-            Some(json!({ "PrivatePort": c.parse::<u16>().ok()?, "PublicPort": h.parse::<u16>().ok()?, "Type": "tcp", "IP": "0.0.0.0" }))
+            let (h, c) = p.split_once("->")?; // "[ip:]host->container[/udp]"
+            let (c, proto) = c.split_once('/').unwrap_or((c, "tcp"));
+            let (ip, h) = h.rsplit_once(':').unwrap_or(("0.0.0.0", h));
+            Some(json!({ "PrivatePort": c.parse::<u16>().ok()?, "PublicPort": h.parse::<u16>().ok()?, "Type": proto, "IP": ip.trim_matches(['[', ']']) }))
         })
         .collect()
 }
@@ -340,8 +342,8 @@ fn container_inspect(e: &Entry) -> Value {
         (None, Some(ip)) => json!({ "bridge": { "IPAddress": ip } }),
         _ => json!({}),
     };
-    let exposed: Map<String, Value> = c.ports.iter().map(|p| (format!("{}/tcp", p.container), json!({}))).collect();
-    let bindings: Map<String, Value> = c.ports.iter().map(|p| (format!("{}/tcp", p.container), json!([{ "HostIp": "", "HostPort": p.host.to_string() }]))).collect();
+    let exposed: Map<String, Value> = c.ports.iter().map(|p| (format!("{}/{}", p.container, if p.udp { "udp" } else { "tcp" }), json!({}))).collect();
+    let bindings: Map<String, Value> = c.ports.iter().map(|p| (format!("{}/{}", p.container, if p.udp { "udp" } else { "tcp" }), json!([{ "HostIp": p.host_ip.map(|i| i.to_string()).unwrap_or_default(), "HostPort": p.host.to_string() }]))).collect();
     json!({
         "Id": e.id, "Created": rfc3339(e.started_unix), "Path": e.cmd.first(), "Args": e.cmd.iter().skip(1).collect::<Vec<_>>(),
         "State": {
@@ -424,12 +426,12 @@ pub fn config_from_create(body: &Value, ncpu: u64) -> Result<Config, String> {
     if let Some(Value::Object(pb)) = host.get("PortBindings") {
         for (k, v) in pb {
             let (container, proto) = k.split_once('/').unwrap_or((k, "tcp"));
-            if proto != "tcp" {
+            if !matches!(proto, "tcp" | "udp") {
                 return Err(format!("{proto} port bindings are not supported"));
             }
             for b in v.as_array().into_iter().flatten() {
                 if let Some(hp) = b.get("HostPort").and_then(Value::as_str).filter(|h| !h.is_empty()) {
-                    cfg.ports.push(Port::parse(&format!("{hp}:{container}")).map_err(|e| e.to_string())?);
+                    cfg.ports.push(Port::parse(&format!("{}{hp}:{container}/{proto}", b.get("HostIp").and_then(Value::as_str).filter(|i| !i.is_empty()).map(|i| format!("{i}:")).unwrap_or_default())).map_err(|e| e.to_string())?);
                 }
             }
         }
@@ -2388,7 +2390,7 @@ mod tests {
         assert_eq!((c.env.as_slice(), c.workdir.as_deref(), c.user.as_deref(), c.tty), (["A=1".to_string()].as_slice(), Some("/srv"), Some("1000"), true));
         assert_eq!(c.volumes.len(), 3);
         assert!(c.volumes[0].ro && !c.volumes[1].ro && c.volumes[1].is_named());
-        assert_eq!(c.ports, [Port { host: 8080, container: 80 }]);
+        assert_eq!(c.ports, [Port { host_ip: None, host: 8080, container: 80, udp: false }]);
         assert_eq!((c.mem_bytes, c.cpu_percent, c.restart), (Some(268435456), Some(25), Restart::OnFailure(3)));
         assert_eq!((c.cap_add.as_slice(), c.cap_drop.as_slice()), (["NET_ADMIN".to_string()].as_slice(), ["ALL".to_string()].as_slice()));
         assert_eq!((c.network_name.as_deref(), c.aliases.as_slice()), (Some("appnet"), ["web".to_string()].as_slice()));
@@ -2396,7 +2398,7 @@ mod tests {
         assert_eq!((h.test[2].as_str(), h.interval_s, h.retries), ("true", 5, 2));
         assert!(c.detach);
         assert!(config_from_create(&json!({}), 1).is_err());
-        assert!(config_from_create(&json!({"Image": "a", "HostConfig": {"PortBindings": {"53/udp": [{"HostPort": "53"}]}}}), 1).is_err());
+        assert!(config_from_create(&json!({"Image": "a", "HostConfig": {"PortBindings": {"53/sctp": [{"HostPort": "53"}]}}}), 1).is_err());
         assert!(config_from_create(&json!({"Image": "a", "HostConfig": {"NetworkMode": "container:abc"}}), 1).is_err());
     }
 

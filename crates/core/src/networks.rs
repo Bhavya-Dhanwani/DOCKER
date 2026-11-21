@@ -7,7 +7,12 @@ use crate::{
     error::{Error, Result},
     registry::{self, Entry},
 };
-use std::{fs, path::{Path, PathBuf}};
+use std::{
+    collections::HashSet,
+    fs,
+    net::{Ipv4Addr, Ipv6Addr},
+    path::{Path, PathBuf},
+};
 
 fn root() -> PathBuf {
     registry::data_dir().join("networks")
@@ -28,17 +33,31 @@ pub fn exists(name: &str) -> bool {
 }
 
 pub fn create(name: &str) -> Result<()> {
-    create_in(&root(), name)
+    create_in(&root(), name, None)
 }
 
-fn create_in(root: &Path, name: &str) -> Result<()> {
+/// `network create --subnet 10.5.0.0/24`
+pub fn create_with(name: &str, subnet: Option<&str>) -> Result<()> {
+    create_in(&root(), name, subnet)
+}
+
+fn create_in(root: &Path, name: &str, subnet: Option<&str>) -> Result<()> {
     check(name)?;
+    let subnet = subnet.map(Subnet::parse).transpose()?;
+    if let Some(s) = subnet {
+        let mut taken = vec![DEFAULT_SUBNET];
+        taken.extend(list_in(root).iter().filter_map(|n| read_subnet(&root.join(format!("{n}.json")))));
+        if let Some(o) = taken.into_iter().find(|o| o.overlaps(&s)) {
+            return Err(Error::Usage(format!("subnet {} overlaps {}", s.cidr(), o.cidr())));
+        }
+    }
     let f = root.join(format!("{name}.json"));
     if f.exists() {
         return Err(Error::Usage(format!("network {name} already exists")));
     }
     fs::create_dir_all(root).map_err(|e| Error::io("create networks dir", e))?;
-    fs::write(&f, format!("{{\"name\":{name:?},\"created_unix\":{}}}", registry::now_unix())).map_err(|e| Error::io("write network", e))
+    let sub = subnet.map(|s| format!(",\"subnet\":\"{}\"", s.cidr())).unwrap_or_default();
+    fs::write(&f, format!("{{\"name\":{name:?},\"created_unix\":{}{sub}}}", registry::now_unix())).map_err(|e| Error::io("write network", e))
 }
 
 pub fn list() -> Vec<String> {
@@ -106,11 +125,161 @@ pub fn hosts_file(own: &Host, others: &[Host]) -> String {
     let mut mine = vec!["container".to_string()];
     mine.extend(own.names.iter().cloned());
     s.push_str(&line(&own.ip, &mine));
+    // its own IPv6 address too (peers stay IPv4-only: some tools take the first address they get and do not retry)
+    if let Ok(v4) = own.ip.parse::<Ipv4Addr>() {
+        s.push_str(&line(&ip6_of(v4).to_string(), &mine));
+    }
     for o in others.iter().filter(|o| o.ip != own.ip) {
         s.push_str(&line(&o.ip, &o.names));
     }
     s
 }
+
+// ---- addressing
+
+/// An IPv4 subnet on the shared bridge. The gateway is its first address (.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Subnet {
+    pub base: Ipv4Addr,
+    pub prefix: u8,
+}
+
+/// The pool used by containers on the default bridge and on networks made without `--subnet`.
+pub const DEFAULT_SUBNET: Subnet = Subnet { base: Ipv4Addr::new(172, 30, 0, 0), prefix: 16 };
+/// IPv6 ULA /64 on the bridge; a container's address embeds its IPv4 one (see `ip6_of`).
+pub const GATEWAY6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x5a57, 0, 0, 0, 0, 0, 1);
+pub const PREFIX6: u8 = 64;
+
+/// `172.30.0.5` -> `fd00:5a57::ac1e:5`: unique whenever the IPv4 address is, and needs no extra state.
+pub fn ip6_of(v4: Ipv4Addr) -> Ipv6Addr {
+    let o = v4.octets();
+    Ipv6Addr::new(0xfd00, 0x5a57, 0, 0, 0, 0, u16::from_be_bytes([o[0], o[1]]), u16::from_be_bytes([o[2], o[3]]))
+}
+
+impl Subnet {
+    /// `10.5.0.0/24`: network address, prefix 8..=29.
+    pub fn parse(s: &str) -> Result<Subnet> {
+        let bad = |m: &str| Error::Usage(format!("bad subnet {s:?}: {m}"));
+        let (ip, p) = s.split_once('/').ok_or_else(|| bad("expected a.b.c.d/n"))?;
+        let base: Ipv4Addr = ip.parse().map_err(|_| bad("not an IPv4 address"))?;
+        let prefix: u8 = p.parse().ok().filter(|p| (8..=29).contains(p)).ok_or_else(|| bad("prefix must be 8-29"))?;
+        let sub = Subnet { base, prefix };
+        if u32::from(base) & !sub.mask() != 0 {
+            return Err(bad("host bits are set (use the network address)"));
+        }
+        Ok(sub)
+    }
+
+    fn mask(&self) -> u32 {
+        u32::MAX << (32 - self.prefix as u32)
+    }
+
+    pub fn size(&self) -> u32 {
+        1 << (32 - self.prefix as u32)
+    }
+
+    pub fn gateway(&self) -> Ipv4Addr {
+        self.addr(1)
+    }
+
+    pub fn addr(&self, n: u32) -> Ipv4Addr {
+        Ipv4Addr::from(u32::from(self.base) + n)
+    }
+
+    pub fn contains(&self, ip: Ipv4Addr) -> bool {
+        u32::from(ip) & self.mask() == u32::from(self.base)
+    }
+
+    pub fn overlaps(&self, o: &Subnet) -> bool {
+        self.contains(o.base) || o.contains(self.base)
+    }
+
+    pub fn cidr(&self) -> String {
+        format!("{}/{}", self.base, self.prefix)
+    }
+
+    /// The next free address *after* host index `after` (wrapping; skips network, gateway, broadcast and
+    /// any .0/.255). Rotating instead of reusing the lowest free address keeps neighbours' ARP caches from
+    /// pointing at a dead container's MAC when its address goes to a new one.
+    pub fn pick_after(&self, used: &HashSet<Ipv4Addr>, after: u32) -> Option<(Ipv4Addr, u32)> {
+        let n = self.size() - 3;
+        (0..n)
+            .map(|k| 2 + (after.max(1) - 1 + k) % n) // index `after` + 1, wrapped into 2..=size-2
+            .map(|i| (self.addr(i), i))
+            .find(|(ip, _)| ip.octets()[3] != 0 && ip.octets()[3] != 255 && !used.contains(ip))
+    }
+}
+
+/// The subnet of a user-defined network (the default pool if it was made without `--subnet`).
+pub fn subnet_of(name: Option<&str>) -> Subnet {
+    name.and_then(|n| read_subnet(&root().join(format!("{n}.json")))).unwrap_or(DEFAULT_SUBNET)
+}
+
+fn read_subnet(file: &Path) -> Option<Subnet> {
+    let v: serde_json::Value = serde_json::from_slice(&fs::read(file).ok()?).ok()?;
+    Subnet::parse(v.get("subnet")?.as_str()?).ok()
+}
+
+/// Every subnet in use: the default pool plus those of networks created with `--subnet`.
+pub fn all_subnets() -> Vec<Subnet> {
+    let mut v = vec![DEFAULT_SUBNET];
+    v.extend(list().iter().filter_map(|n| read_subnet(&root().join(format!("{n}.json")))));
+    v
+}
+
+fn refresh(network: &str) {
+    #[cfg(target_os = "linux")]
+    crate::platform::refresh_hosts(network);
+    #[cfg(not(target_os = "linux"))]
+    let _ = network;
+}
+
+/// `network connect`: add a running bridge container to a user-defined network (name discovery only: a
+/// container keeps its address, so a network with its own `--subnet` can only be joined at `run` time).
+pub fn connect(network: &str, container: &str) -> Result<()> {
+    if !exists(network) {
+        return Err(Error::Usage(format!("no such network: {network}")));
+    }
+    let e = registry::find(container)?;
+    let (Some(ip), true) = (e.ip.as_deref().and_then(|i| i.parse::<Ipv4Addr>().ok()), e.running()) else {
+        return Err(Error::Usage(format!("{} is not a running container on the bridge", e.label())));
+    };
+    if let Some(cur) = e.config.as_ref().and_then(|c| c.network_name.as_deref()) {
+        return Err(Error::Usage(if cur == network {
+            format!("{} is already on {network}", e.label())
+        } else {
+            format!("{} is already on {cur}: `docker network disconnect {cur} {}` first", e.label(), e.label())
+        }));
+    }
+    if !subnet_of(Some(network)).contains(ip) {
+        return Err(Error::Usage(format!("{network} has its own subnet; start the container with --network {network} instead")));
+    }
+    registry::update(&e.id, |e| {
+        if let Some(c) = e.config.as_mut() {
+            c.network_name = Some(network.to_string());
+            c.network.get_or_insert(crate::cli::Network::Bridge);
+        }
+    })?;
+    refresh(network);
+    Ok(())
+}
+
+pub fn disconnect(network: &str, container: &str) -> Result<()> {
+    let e = registry::find(container)?;
+    if e.config.as_ref().and_then(|c| c.network_name.as_deref()) != Some(network) {
+        return Err(Error::Usage(format!("{} is not connected to {network}", e.label())));
+    }
+    registry::update(&e.id, |e| {
+        if let Some(c) = e.config.as_mut() {
+            c.network_name = None;
+        }
+    })?;
+    #[cfg(target_os = "linux")]
+    crate::platform::reset_hosts(&e); // it no longer sees its old peers ...
+    refresh(network); // ... and they no longer see it
+    Ok(())
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -126,9 +295,10 @@ mod tests {
         let h = hosts_file(&own, &[host("172.30.0.6", &["db", "ffff00001111"]), host("172.30.0.5", &["dup"])]);
         assert!(h.starts_with("127.0.0.1\tlocalhost\n::1\t"));
         assert!(h.contains("172.30.0.5\tcontainer web abc123def456 frontend\n"));
+        assert!(h.contains("fd00:5a57::ac1e:5\tcontainer web abc123def456 frontend\n"));
         assert!(h.contains("172.30.0.6\tdb ffff00001111\n"));
         assert!(!h.contains("dup"), "an entry with our own address is not repeated");
-        assert_eq!(hosts_file(&host("172.30.0.2", &["x", "x"]), &[]).lines().last().unwrap(), "172.30.0.2\tcontainer x");
+        assert_eq!(hosts_file(&host("172.30.0.2", &["x", "x"]), &[]).lines().last().unwrap(), "fd00:5a57::ac1e:2\tcontainer x");
     }
 
     #[test]
@@ -136,12 +306,39 @@ mod tests {
         let root = std::env::temp_dir().join(format!("rd-net-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         for bad in ["bridge", "host", "none", "../x", "", "a b"] {
-            assert!(create_in(&root, bad).is_err(), "{bad}");
+            assert!(create_in(&root, bad, None).is_err(), "{bad}");
         }
-        create_in(&root, "appnet").unwrap();
-        create_in(&root, "backend").unwrap();
-        assert!(create_in(&root, "appnet").is_err(), "no duplicates");
+        create_in(&root, "appnet", None).unwrap();
+        create_in(&root, "backend", Some("10.5.0.0/24")).unwrap();
+        assert!(create_in(&root, "appnet", None).is_err(), "no duplicates");
         assert_eq!(list_in(&root), ["appnet", "backend"]);
+        assert!(create_in(&root, "x", Some("10.5.0.128/25")).is_err(), "overlap with another network");
+        assert!(create_in(&root, "x", Some("172.30.4.0/24")).is_err(), "overlap with the default pool");
+        assert_eq!(read_subnet(&root.join("backend.json")), Some(Subnet::parse("10.5.0.0/24").unwrap()));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn subnets_parse_and_pick_addresses() {
+        for bad in ["10.0.0.1/24", "10.0.0.0/30", "10.0.0.0/7", "10.0.0.0", "x/24", "10.0.0.0/24/1"] {
+            assert!(Subnet::parse(bad).is_err(), "{bad}");
+        }
+        let s = Subnet::parse("10.9.0.0/24").unwrap();
+        assert_eq!((s.gateway(), s.size(), s.cidr()), (Ipv4Addr::new(10, 9, 0, 1), 256, "10.9.0.0/24".to_string()));
+        assert!(s.contains(Ipv4Addr::new(10, 9, 0, 200)) && !s.contains(Ipv4Addr::new(10, 9, 1, 1)));
+        assert_eq!(s.pick_after(&HashSet::new(), 1), Some((Ipv4Addr::new(10, 9, 0, 2), 2)));
+        assert_eq!(s.pick_after(&HashSet::new(), 253), Some((Ipv4Addr::new(10, 9, 0, 254), 254)));
+        assert_eq!(s.pick_after(&HashSet::new(), 254), Some((Ipv4Addr::new(10, 9, 0, 2), 2)), "wraps past .255");
+        let all: HashSet<Ipv4Addr> = (2u32..255).map(|n| s.addr(n)).collect();
+        assert_eq!(s.pick_after(&all, 7), None);
+        // the default pool behaves as it always did
+        let mut used = HashSet::new();
+        let d = DEFAULT_SUBNET;
+        assert_eq!(d.pick_after(&used, 1), Some((Ipv4Addr::new(172, 30, 0, 2), 2)));
+        used.insert(Ipv4Addr::new(172, 30, 0, 3));
+        assert_eq!(d.pick_after(&used, 2).unwrap().1, 4, "skips addresses in use");
+        assert_eq!(d.pick_after(&used, 254), Some((Ipv4Addr::new(172, 30, 1, 1), 257)));
+        assert_eq!(d.pick_after(&HashSet::new(), 65534), Some((Ipv4Addr::new(172, 30, 0, 2), 2)));
+        assert_eq!(ip6_of(Ipv4Addr::new(172, 30, 0, 5)).to_string(), "fd00:5a57::ac1e:5");
     }
 }

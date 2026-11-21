@@ -81,7 +81,7 @@ impl Entry {
             restarts: 0,
             restarting: false,
             created: false,
-            ports: cfg.ports.iter().map(|p| format!("{}->{}", p.host, p.container)).collect(),
+            ports: cfg.ports.iter().map(|p| p.label()).collect(),
             exit_code: None,
             finished_unix: None,
         }

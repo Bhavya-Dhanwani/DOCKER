@@ -478,10 +478,12 @@ pub fn load(input: &str) -> Res {
 pub fn network(cmd: &docker_core::cli::NetCmd) -> Res {
     use docker_core::{cli::NetCmd::*, networks};
     match cmd {
-        Create(n) => {
-            networks::create(n)?;
+        Create(n, subnet) => {
+            networks::create_with(n, subnet.as_deref())?;
             println!("{n}");
         }
+        Connect(n, c) => networks::connect(n, c)?,
+        Disconnect(n, c) => networks::disconnect(n, c)?,
         Ls => {
             println!("{:<24} {:>10}", "NETWORK", "CONTAINERS");
             println!("{:<24} {:>10}", "bridge (default)", "-");
@@ -499,9 +501,17 @@ pub fn network(cmd: &docker_core::cli::NetCmd) -> Res {
             }
             let members: Vec<_> = networks::members(Some(n), "")
                 .iter()
-                .map(|e| serde_json::json!({ "name": e.label(), "ip": e.ip, "id": e.id }))
+                .map(|e| {
+                    let ip6 = e.ip.as_deref().and_then(|i| i.parse().ok()).map(networks::ip6_of);
+                    serde_json::json!({ "name": e.label(), "ip": e.ip, "ip6": ip6, "id": e.id })
+                })
                 .collect();
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "name": n, "containers": members }))?);
+            let sub = networks::subnet_of(Some(n));
+            let info = serde_json::json!({
+                "name": n, "driver": "bridge", "subnet": sub.cidr(), "gateway": sub.gateway(),
+                "ipv6_subnet": "fd00:5a57::/64", "ipv6_gateway": networks::GATEWAY6, "containers": members,
+            });
+            println!("{}", serde_json::to_string_pretty(&info)?);
         }
     }
     Ok(())

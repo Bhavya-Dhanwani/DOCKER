@@ -31,6 +31,7 @@ fn classify(file_name: &str) -> Whiteout<'_> {
 
 /// Wrap a layer blob in the right decompressor. The magic bytes decide (zstd `28 B5 2F FD`, gzip `1F 8B`),
 /// because `docker save` archives carry no media type; the media type is only the tie-breaker.
+#[cfg(any(target_os = "linux", test))]
 pub fn decompress<R: std::io::Read + 'static>(r: R, media_type: &str) -> Result<Box<dyn std::io::Read>> {
     use std::io::{Cursor, Read};
     let mut r = r;

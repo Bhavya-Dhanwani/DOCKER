@@ -21,10 +21,14 @@ fn clip(s: String, n: usize) -> String {
 }
 
 pub fn pull(name: &str) -> Res {
+    pull_platform(name, None)
+}
+
+pub fn pull_platform(name: &str, platform: Option<&str>) -> Res {
     let r = Reference::parse(name)?;
     let store = store();
     println!("Pulling {}", r.display());
-    let meta = docker_image::pull(&store, &r, &mut |line| println!("{line}"))?;
+    let meta = docker_image::pull_for(&store, &r, platform, &mut |line| println!("{line}"))?;
     #[cfg(target_os = "linux")]
     for l in &meta.layers {
         store.ensure_layer(l)?; // unpack now so `run` starts instantly
@@ -146,7 +150,11 @@ pub fn logs(follow: bool, q: &str) -> Res {
 }
 
 pub fn inspect(q: &str) -> Res {
-    let e = registry::find(q)?;
+    // like Docker, `inspect` also takes an image when no container has that name
+    let e = match registry::find(q) {
+        Ok(e) => e,
+        Err(err) => return image_inspect(q).map_err(|_| err.into()),
+    };
     let mut v = serde_json::to_value(&e)?;
     v["running"] = serde_json::json!(e.running());
     println!("{}", serde_json::to_string_pretty(&v)?);
@@ -503,6 +511,32 @@ pub fn network(cmd: &docker_core::cli::NetCmd) -> Res {
                 .collect();
             println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "name": n, "containers": members }))?);
         }
+    }
+    Ok(())
+}
+
+pub fn image_inspect(name: &str) -> Res {
+    let v = docker_image::inspect(&store(), &Reference::parse(name)?)?;
+    println!("{}", serde_json::to_string_pretty(&[v])?);
+    Ok(())
+}
+
+pub fn history(name: &str) -> Res {
+    let rows = docker_image::history(&store(), &Reference::parse(name)?)?;
+    println!("{:<22} {:<40} {:>10}", "CREATED", "CREATED BY", "SIZE");
+    for r in rows {
+        let created = if r.created.is_empty() { "<missing>".to_string() } else { clip(r.created, 20) };
+        println!("{:<22} {:<40} {:>10}", created, clip(r.created_by.replace('\t', " "), 40), mb(r.size));
+    }
+    Ok(())
+}
+
+pub fn search(term: &str) -> Res {
+    let hits = docker_image::search(&store().tmp_dir(), term, 25)?;
+    println!("{:<36} {:<50} {:>6} {:>8}", "NAME", "DESCRIPTION", "STARS", "OFFICIAL");
+    for h in hits {
+        let desc = h.short_description.unwrap_or_default().replace('\n', " ");
+        println!("{:<36} {:<50} {:>6} {:>8}", clip(h.repo_name, 35), clip(desc, 49), h.star_count, if h.is_official { "[OK]" } else { "" });
     }
     Ok(())
 }

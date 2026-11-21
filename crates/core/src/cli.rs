@@ -25,7 +25,7 @@ usage:
   docker system df
   docker container prune     remove all exited containers
   docker build -t <name[:tag]> [-f <Dockerfile>] [--build-arg K=V] [--target <stage>] [--no-cache] <context>
-  docker pull <image>
+  docker pull [--platform os/arch] <image[:tag]|image@sha256:digest>
   docker push <image>
   docker save -o <file.tar> <image>...
   docker load -i <file.tar>
@@ -36,6 +36,9 @@ usage:
   docker logout [server]
   docker images
   docker rmi <image>
+  docker search <term>             search Docker Hub
+  docker history <image>
+  docker image inspect <image>
   docker prune          delete unused image layers and build leftovers
   docker swarm init|leave|status        single-node swarm: a background reconciler keeps services running
   docker service create [--name N] [--replicas R] [-p H:C] [-e K=V] [--network N] [--restart-condition any|on-failure|none]
@@ -371,6 +374,13 @@ pub enum Command {
     Prune,
     /// `docker swarm|service|stack ...`: the raw words (group first), parsed by the CLI crate's swarm module.
     Swarm(Vec<String>),
+    /// `docker pull --platform linux/amd64 <image>`
+    PullPlatform { image: String, platform: String },
+    /// `docker search <term>` (Docker Hub)
+    Search(String),
+    History(String),
+    /// `docker image inspect <image>`
+    ImageInspect(String),
 }
 
 fn usage(msg: &str) -> Error {
@@ -501,10 +511,13 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command> {
         },
         Some("build") => parse_build(rest).map(Command::Build),
         Some("prune") => only_flags(rest, &[]).map(|_| Command::Prune),
-        Some("pull") => flags_then_one(rest, &[], "image").map(|(_, v)| Command::Pull(v)),
+        Some("pull") => parse_pull(rest),
         Some("rmi") => flags_then_one(rest, &[], "image").map(|(_, v)| Command::Rmi(v)),
         Some("images") => only_flags(rest, &[]).map(|_| Command::Images),
         Some(g @ ("swarm" | "service" | "stack")) => Ok(Command::Swarm([vec![g.to_string()], rest].concat())),
+        Some("search") => flags_then_one(rest, &[], "term").map(|(_, v)| Command::Search(v)),
+        Some("history") => flags_then_one(rest, &[], "image").map(|(_, v)| Command::History(v)),
+        Some("image-inspect") => flags_then_one(rest, &[], "image").map(|(_, v)| Command::ImageInspect(v)),
         _ => Err(usage("expected a command")),
     }
 }
@@ -538,11 +551,33 @@ fn resolve_alias(name: Option<String>, mut rest: Vec<String>) -> (Option<String>
         ("container", "prune") => "container-prune",
         ("image", "ls" | "list") => "images",
         ("image", "rm") => "rmi",
+        ("image", "inspect") => "image-inspect",
         ("system", "df") => "system-df",
         ("system", "prune") => "prune",
         (_, other) => other,
     };
     (Some(mapped.to_string()), rest)
+}
+
+/// `docker pull [--platform os/arch] <image>`
+fn parse_pull(args: Vec<String>) -> Result<Command> {
+    let mut it = args.into_iter().peekable();
+    let mut platform = None;
+    while let Some(f) = it.next_if(|a| a.starts_with('-')) {
+        match f.split_once('=') {
+            Some(("--platform", v)) => platform = Some(v.to_string()),
+            None if f == "--platform" => platform = Some(it.next().ok_or_else(|| usage("--platform needs os/arch"))?),
+            _ => return Err(usage(&format!("unknown flag {f}"))),
+        }
+    }
+    let image = it.next().ok_or_else(|| usage("missing <image>"))?;
+    if it.next().is_some() {
+        return Err(usage("too many arguments"));
+    }
+    Ok(match platform {
+        Some(platform) => Command::PullPlatform { image, platform },
+        None => Command::Pull(image),
+    })
 }
 
 fn parse_update(args: Vec<String>) -> Result<Command> {
@@ -1171,6 +1206,10 @@ impl Command {
             Command::Version => vec![s("version")],
             Command::Vm(_) => vec![s("vm")], // handled locally, never forwarded
             Command::Swarm(words) => words.clone(),
+            Command::PullPlatform { image, platform } => vec![s("pull"), s("--platform"), platform.clone(), image.clone()],
+            Command::Search(t) => vec![s("search"), t.clone()],
+            Command::History(n) => vec![s("history"), n.clone()],
+            Command::ImageInspect(n) => vec![s("image"), s("inspect"), n.clone()],
         }
     }
 }
@@ -1214,6 +1253,24 @@ mod tests {
     fn command_is_optional_and_its_flags_are_not_ours() {
         assert!(run("run alpine").cmd.is_empty());
         assert_eq!(run("run alpine ls -a --all").cmd, ["ls", "-a", "--all"]);
+    }
+
+    #[test]
+    fn pull_platform_search_history_commands() {
+        assert_eq!(
+            p("pull --platform linux/amd64 alpine").unwrap(),
+            Command::PullPlatform { image: "alpine".into(), platform: "linux/amd64".into() }
+        );
+        assert_eq!(p("pull --platform=linux/arm64 a").unwrap(), Command::PullPlatform { image: "a".into(), platform: "linux/arm64".into() });
+        assert!(p("pull --platform").is_err() && p("pull --bogus a").is_err());
+        assert_eq!(p("search nginx").unwrap(), Command::Search("nginx".into()));
+        assert_eq!(p("history a:1").unwrap(), Command::History("a:1".into()));
+        assert_eq!(p("image history a:1").unwrap(), Command::History("a:1".into()));
+        assert_eq!(p("image inspect a:1").unwrap(), Command::ImageInspect("a:1".into()));
+        assert_eq!(p("inspect web").unwrap(), Command::Inspect("web".into()));
+        for c in [Command::Search("x".into()), Command::History("x".into()), Command::ImageInspect("x".into()), Command::PullPlatform { image: "i".into(), platform: "linux/arm64".into() }] {
+            assert_eq!(p(&c.to_args().join(" ")).unwrap(), c);
+        }
     }
 
     #[test]

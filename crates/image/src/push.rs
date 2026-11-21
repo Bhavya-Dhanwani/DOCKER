@@ -4,11 +4,16 @@ use crate::{
     error::{err, Result},
     pack::pack,
     reference::Reference,
-    remote::{host_arch, Client},
+    remote::{host_arch, Client, Upload},
     store::{ImageMeta, Store},
 };
 use serde_json::{json, Map, Value};
-use std::fs;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::{mpsc, Mutex},
+    thread,
+};
 
 const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
 const OCI_CONFIG: &str = "application/vnd.oci.image.config.v1+json";
@@ -75,42 +80,136 @@ pub fn manifest_json(config: (&str, u64), layers: &[(String, u64)]) -> Value {
 
 /// Push `r` (which must already be in the store, e.g. via `docker tag`). Returns the manifest digest.
 pub fn push(store: &Store, r: &Reference, say: &mut dyn FnMut(String)) -> Result<String> {
+    if r.is_digest() {
+        return Err(err("cannot push a digest reference; push a tag"));
+    }
     let meta = store.get(r)?.ok_or_else(|| err(format!("no such image: {}", r.display())))?;
+    let mounts = mount_sources(store, r, &meta);
+    let repos: Vec<String> = mounts.iter().map(|(repo, _)| repo.clone()).collect();
     let creds = auth::load(store.root(), &r.registry);
-    let client = Client::connect(r, &store.tmp_dir(), creds.as_ref(), true)?;
+    let client = Client::connect_mounting(r, &store.tmp_dir(), creds.as_ref(), true, &repos)?;
     let work = store.new_staging_dir("push")?;
-    let result = push_layers(store, &client, r, &meta, &work, say);
+    let result = push_layers(store, &client, r, &meta, &mounts, &work, say);
     let _ = fs::remove_dir_all(&work);
+    if let Ok(d) = &result {
+        crate::info::set_digest(store, r, d);
+    }
     result
 }
 
-fn push_layers(store: &Store, client: &Client, r: &Reference, meta: &ImageMeta, work: &std::path::Path, say: &mut dyn FnMut(String)) -> Result<String> {
+/// Other repos of the same registry whose local images share layers with `meta`: (repo, layer digests).
+/// Pushed earlier, those layers are probably in the registry already, so a cross-repo mount can skip the upload.
+fn mount_sources(store: &Store, r: &Reference, meta: &ImageMeta) -> Vec<(String, Vec<String>)> {
+    let mut out: Vec<(String, Vec<String>)> = vec![];
+    for other in store.list() {
+        let Ok(o) = Reference::parse(&other.name) else { continue };
+        if o.registry != r.registry || o.repo == r.repo {
+            continue;
+        }
+        let shared: Vec<String> = other.layers.iter().filter(|l| meta.layers.iter().any(|m| m.digest == l.digest)).map(|l| l.digest.clone()).collect();
+        if shared.is_empty() {
+            continue;
+        }
+        match out.iter_mut().find(|(repo, _)| *repo == o.repo) {
+            Some((_, v)) => v.extend(shared),
+            None => out.push((o.repo, shared)),
+        }
+    }
+    out.truncate(3);
+    out
+}
+
+/// Layers uploaded at once. ponytail: fixed; each upload is its own curl process, so this is cheap to raise.
+const WORKERS: usize = 3;
+
+struct Job {
+    short: String,
+    digest: String,
+    blob: PathBuf,
+    mounts: Vec<String>,
+}
+
+/// Skip the upload if the registry has the blob, else mount it or send it. Reports through `say`.
+fn upload_one(client: &Client, j: &Job, say: &dyn Fn(String)) -> Result<()> {
+    if client.blob_exists(&j.digest)? {
+        say(format!("{}: Layer already exists", j.short));
+        return Ok(());
+    }
+    say(format!("{}: Pushing", j.short));
+    match client.upload_blob(&j.digest, &j.blob, &j.mounts)? {
+        Upload::Mounted(from) => say(format!("{}: Mounted from {from}", j.short)),
+        Upload::Pushed => say(format!("{}: Pushed", j.short)),
+    }
+    Ok(())
+}
+
+fn push_layers(store: &Store, client: &Client, r: &Reference, meta: &ImageMeta, mounts: &[(String, Vec<String>)], work: &Path, say: &mut dyn FnMut(String)) -> Result<String> {
     let (mut layers, mut diff_ids) = (vec![], vec![]);
-    let blob = work.join("blob");
-    for l in &meta.layers {
-        let dir = store.layer_path(&l.digest)?;
-        if !dir.is_dir() {
-            return Err(err(format!("layer {} is missing from the store; pull or rebuild the image", &l.digest[7..19])));
+    let (jobs_tx, jobs_rx) = mpsc::sync_channel::<Job>(1); // bounded: at most a few packed layers sit on disk
+    let jobs_rx = Mutex::new(jobs_rx);
+    let (msg_tx, msg_rx) = mpsc::channel::<String>();
+    let failure: Mutex<Option<crate::error::Error>> = Mutex::new(None);
+
+    // Packing (CPU) in this thread overlaps with WORKERS uploading threads (network).
+    let packed: Result<()> = thread::scope(|s| {
+        for _ in 0..WORKERS {
+            let (rx, tx, failure) = (&jobs_rx, msg_tx.clone(), &failure);
+            s.spawn(move || {
+                loop {
+                    // take the guard only for the receive, or the workers would run one at a time
+                    let next = rx.lock().expect("lock").recv();
+                    let Ok(job) = next else { break };
+                    let say = |m: String| {
+                        let _ = tx.send(m);
+                    };
+                    if let Err(e) = upload_one(client, &job, &say) {
+                        failure.lock().expect("lock").get_or_insert(e);
+                    }
+                    let _ = fs::remove_file(&job.blob);
+                }
+            });
         }
-        let short = l.digest[7..19].to_string();
-        let p = pack(&dir, &blob)?;
-        if client.blob_exists(&p.digest)? {
-            say(format!("{short}: Layer already exists"));
-        } else {
-            say(format!("{short}: Pushing"));
-            client.upload_blob(&p.digest, &blob)?;
-            say(format!("{short}: Pushed"));
+        drop(msg_tx);
+        let mut feed = || -> Result<()> {
+            for (i, l) in meta.layers.iter().enumerate() {
+                let dir = store.layer_path(&l.digest)?;
+                if !dir.is_dir() {
+                    return Err(err(format!("layer {} is missing from the store; pull or rebuild the image", &l.digest[7..19])));
+                }
+                if failure.lock().expect("lock").is_some() {
+                    break;
+                }
+                let blob = work.join(format!("layer-{i}"));
+                let p = pack(&dir, &blob)?;
+                let mounts = mounts.iter().filter(|(_, ds)| ds.contains(&l.digest)).map(|(repo, _)| repo.clone()).collect();
+                let job = Job { short: l.digest[7..19].to_string(), digest: p.digest.clone(), blob, mounts };
+                jobs_tx.send(job).map_err(|_| err("upload threads stopped"))?;
+                layers.push((p.digest, p.size));
+                diff_ids.push(p.diff_id);
+                for m in msg_rx.try_iter() {
+                    say(m);
+                }
+            }
+            Ok(())
+        };
+        let res = feed();
+        drop(jobs_tx); // lets the workers finish and exit
+        for m in msg_rx.iter() {
+            say(m); // ends when every worker has dropped its sender
         }
-        let _ = fs::remove_file(&blob);
-        layers.push((p.digest, p.size));
-        diff_ids.push(p.diff_id);
+        res
+    });
+    packed?;
+    if let Some(e) = failure.into_inner().expect("lock") {
+        return Err(e);
     }
 
+    let blob = work.join("blob");
     let config = serde_json::to_vec(&config_json(meta, &diff_ids))?;
     let config_digest = format!("sha256:{}", hex(&config));
     fs::write(&blob, &config)?;
     if !client.blob_exists(&config_digest)? {
-        client.upload_blob(&config_digest, &blob)?;
+        client.upload_blob(&config_digest, &blob, &[])?;
     }
     let manifest = serde_json::to_vec(&manifest_json((&config_digest, config.len() as u64), &layers))?;
     fs::write(&blob, &manifest)?;

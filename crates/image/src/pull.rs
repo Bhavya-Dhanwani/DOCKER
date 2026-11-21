@@ -1,7 +1,7 @@
 use crate::{
     error::{err, Result},
     reference::Reference,
-    remote::{host_arch, pick_platform, Client},
+    remote::{host_arch, parse_platform, pick_platform, Client},
     store::{Health, ImageMeta, LayerRef, Store},
 };
 use serde::Deserialize;
@@ -60,15 +60,23 @@ fn health_from(h: HealthConfig) -> Option<Health> {
 /// Download an image (config + layer blobs, digest-verified) into the store.
 /// Layers already present are skipped, which is where the disk savings come from.
 pub fn pull(store: &Store, r: &Reference, say: &mut dyn FnMut(String)) -> Result<ImageMeta> {
+    pull_for(store, r, None, say)
+}
+
+/// `pull` for an explicit `os/arch` (`--platform`); None = this host's architecture. `r` may be a digest reference.
+pub fn pull_for(store: &Store, r: &Reference, platform: Option<&str>, say: &mut dyn FnMut(String)) -> Result<ImageMeta> {
+    let (os, arch) = match platform {
+        Some(p) => parse_platform(p)?,
+        None => ("linux".to_string(), host_arch().to_string()),
+    };
     let creds = crate::auth::load(store.root(), &r.registry);
     let client = Client::connect(r, &store.tmp_dir(), creds.as_ref(), false)?;
-    let mut m = client.manifest(&r.tag)?;
+    let (mut m, mut manifest_digest) = client.manifest(&r.tag)?;
     if !m.manifests.is_empty() {
-        let arch = host_arch();
-        let digest = pick_platform(&m, arch)
-            .ok_or_else(|| err(format!("{} has no linux/{arch} build", r.display())))?
+        let digest = pick_platform(&m, &os, &arch)
+            .ok_or_else(|| err(format!("{} has no {os}/{arch} build", r.display())))?
             .to_string();
-        m = client.manifest(&digest)?;
+        (m, manifest_digest) = client.manifest(&digest)?;
     }
     let cfg = m.config.as_ref().ok_or_else(|| err("manifest has no config"))?;
     let cfg_path = store.tmp_dir().join("config.json");
@@ -94,6 +102,7 @@ pub fn pull(store: &Store, r: &Reference, say: &mut dyn FnMut(String)) -> Result
 
     let meta = meta_from_config(&r.display(), layers, &cfg_bytes)?;
     store.save(r, &meta)?;
+    crate::info::record(store, r, Some(cfg.digest.clone()), Some(manifest_digest), &cfg_bytes);
     Ok(meta)
 }
 

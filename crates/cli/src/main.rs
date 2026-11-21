@@ -73,6 +73,10 @@ fn main() -> ExitCode {
         Command::Images => ok(commands::images()),
         Command::Rmi(n) => ok(commands::rmi(&n)),
         Command::Swarm(words) => ok(swarm::run(&words)),
+        Command::PullPlatform { image, platform } => ok(commands::pull_platform(&image, Some(&platform))),
+        Command::Search(t) => ok(commands::search(&t)),
+        Command::History(n) => ok(commands::history(&n)),
+        Command::ImageInspect(n) => ok(commands::image_inspect(&n)),
     };
     match result {
         Ok(code) => code,

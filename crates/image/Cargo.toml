@@ -10,6 +10,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 flate2 = "1"
+# pure-Rust zstd decoder for application/vnd.oci.image.layer.v1.tar+zstd layers
+ruzstd = "0.8"
 tar = "0.4"
 bzip2-rs = "0.1.2"
 lzma-rs = "0.3.0"

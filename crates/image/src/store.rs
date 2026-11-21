@@ -189,6 +189,7 @@ impl Store {
     pub fn remove(&self, r: &Reference) -> Result<u64> {
         let meta = self.get(r)?.ok_or_else(|| err(format!("no such image: {}", r.display())))?;
         fs::remove_file(self.image_file(r))?;
+        crate::info::forget(self, r);
         let still_used: HashSet<String> =
             self.list().into_iter().flat_map(|m| m.layers.into_iter().map(|l| l.digest)).collect();
         let mut freed = 0;

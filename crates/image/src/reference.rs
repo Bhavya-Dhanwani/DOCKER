@@ -25,13 +25,26 @@ pub fn normalize_registry(s: &str) -> Result<String> {
 
 impl Reference {
     pub fn parse(s: &str) -> Result<Self> {
-        if s.is_empty() || s.contains(char::is_whitespace) || s.contains('@') {
+        if s.is_empty() || s.contains(char::is_whitespace) {
             return Err(err(format!("unsupported image reference {s:?}")));
         }
-        let (name, tag) = match s.rfind(':') {
-            Some(i) if !s[i + 1..].contains('/') => (&s[..i], &s[i + 1..]),
-            _ => (s, "latest"),
+        let (named, digest) = match s.split_once('@') {
+            Some((n, d)) => (n, Some(d)),
+            None => (s, None),
         };
+        if let Some(d) = digest {
+            let hex = d.strip_prefix("sha256:").unwrap_or("");
+            if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(err(format!("bad digest in image reference {s:?} (want sha256:<64 hex>)")));
+            }
+        }
+        let (name, mut tag) = match named.rfind(':') {
+            Some(i) if !named[i + 1..].contains('/') => (&named[..i], &named[i + 1..]),
+            _ => (named, "latest"),
+        };
+        if let Some(d) = digest {
+            tag = d; // `repo:tag@digest`: the digest pins the content, the tag is dropped
+        }
         if name.is_empty() || tag.is_empty() {
             return Err(err(format!("bad image reference {s:?}")));
         }
@@ -46,24 +59,30 @@ impl Reference {
         // the repo ends up in URLs and file names: keep it boring
         let ok = |c: char| c.is_ascii_alphanumeric() || "._-/".contains(c);
         let host_ok = registry.chars().all(|c| c.is_ascii_alphanumeric() || ".-:".contains(c)) && !registry.starts_with('.');
-        if !host_ok || !repo.chars().all(ok) || repo.contains("..") || !tag.chars().all(|c| ok(c) && c != '/') {
+        if !host_ok || !repo.chars().all(ok) || repo.contains("..") || !tag.chars().all(|c| (ok(c) && c != '/') || (digest.is_some() && c == ':')) {
             return Err(err(format!("bad image reference {s:?}")));
         }
         Ok(Reference { registry, repo, tag: tag.to_string() })
     }
 
-    /// Name as Docker prints it: `alpine:3.19`, `ghcr.io/org/app:tag`.
+    /// Pinned by content digest (`tag` holds `sha256:...`) rather than a movable tag.
+    pub fn is_digest(&self) -> bool {
+        self.tag.starts_with("sha256:")
+    }
+
+    /// Name as Docker prints it: `alpine:3.19`, `ghcr.io/org/app:tag`, `alpine@sha256:...`.
     pub fn display(&self) -> String {
+        let sep = if self.is_digest() { '@' } else { ':' };
         if self.registry == HUB {
-            format!("{}:{}", self.repo.strip_prefix("library/").unwrap_or(&self.repo), self.tag)
+            format!("{}{sep}{}", self.repo.strip_prefix("library/").unwrap_or(&self.repo), self.tag)
         } else {
-            format!("{}/{}:{}", self.registry, self.repo, self.tag)
+            format!("{}/{}{sep}{}", self.registry, self.repo, self.tag)
         }
     }
 
     /// File-name-safe form of `display`.
     pub fn key(&self) -> String {
-        self.display().replace(['/', ':'], "_")
+        self.display().replace(['/', ':', '@'], "_")
     }
 }
 
@@ -108,8 +127,21 @@ mod tests {
     }
 
     #[test]
+    fn digest_references() {
+        let h = "a".repeat(64);
+        let r = Reference::parse(&format!("alpine@sha256:{h}")).unwrap();
+        assert_eq!((r.repo.as_str(), r.tag.as_str()), ("library/alpine", format!("sha256:{h}").as_str()));
+        assert!(r.is_digest());
+        assert_eq!(r.display(), format!("alpine@sha256:{h}"));
+        let r = Reference::parse(&format!("localhost:5000/a/b:v1@sha256:{h}")).unwrap();
+        assert_eq!((r.registry.as_str(), r.repo.as_str(), r.is_digest()), ("localhost:5000", "a/b", true));
+        assert!(!r.key().contains(['/', ':', '@']));
+        assert!(!Reference::parse("alpine:3").unwrap().is_digest());
+    }
+
+    #[test]
     fn rejects_junk() {
-        for s in ["", "a b", "a@sha256:x", "../etc", "a:", "a/../b"] {
+        for s in ["", "a b", "a@sha256:x", "a@md5:00", "../etc", "a:", "a/../b"] {
             assert!(Reference::parse(s).is_err(), "{s}");
         }
     }

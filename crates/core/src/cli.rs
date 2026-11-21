@@ -37,6 +37,11 @@ usage:
   docker images
   docker rmi <image>
   docker prune          delete unused image layers and build leftovers
+  docker swarm init|leave|status        single-node swarm: a background reconciler keeps services running
+  docker service create [--name N] [--replicas R] [-p H:C] [-e K=V] [--network N] [--restart-condition any|on-failure|none]
+                 [--mem MB] [--cpu P] [--update-delay S] [--update-parallelism N] <image> [cmd...]
+  docker service ls|ps|inspect|logs|rm <name> | scale <name>=<N>... | update [--image I] [-e K=V] [--replicas R] <name>
+  docker stack deploy -c <compose.yml> <name> | ls | ps | services | rm <name>
 
 run flags:
   -d, --detach          run in the background, print the container id
@@ -356,6 +361,8 @@ pub enum Command {
     Images,
     Rmi(String),
     Prune,
+    /// `docker swarm|service|stack ...`: the raw words (group first), parsed by the CLI crate's swarm module.
+    Swarm(Vec<String>),
 }
 
 fn usage(msg: &str) -> Error {
@@ -489,6 +496,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command> {
         Some("pull") => flags_then_one(rest, &[], "image").map(|(_, v)| Command::Pull(v)),
         Some("rmi") => flags_then_one(rest, &[], "image").map(|(_, v)| Command::Rmi(v)),
         Some("images") => only_flags(rest, &[]).map(|_| Command::Images),
+        Some(g @ ("swarm" | "service" | "stack")) => Ok(Command::Swarm([vec![g.to_string()], rest].concat())),
         _ => Err(usage("expected a command")),
     }
 }
@@ -1137,6 +1145,7 @@ impl Command {
             Command::Prune => vec![s("prune")],
             Command::Version => vec![s("version")],
             Command::Vm(_) => vec![s("vm")], // handled locally, never forwarded
+            Command::Swarm(words) => words.clone(),
         }
     }
 }
@@ -1217,6 +1226,7 @@ mod tests {
             "run alpine", "run --rm -d alpine sleep 1", "exec web ls -la", "ps", "ps -a", "logs web", "logs -f web", "stop web", "rm web", "rm -f web",
             "run --entrypoint /bin/sh -w /app -u 1000:1000 alpine -c id", "exec -t web sh", "run -d -t -i --restart on-failure:3 --health-cmd true --health-interval 5s --health-retries 2 alpine", "run --restart always --no-healthcheck alpine", "inspect web", "start web", "restart -t 3 web", "kill web", "pause web", "unpause web", "update --mem 64 --cpu 50 --procs 100 web", "wait web", "top web", "rename a b", "cp web:/x ./y", "cp ./y web:/x", "stats", "stats --no-stream a b", "daemon", "daemon --host tcp://127.0.0.1:2375", "compose up", "compose -f a.yml -p proj up -d --build", "compose down -v", "compose ps", "compose logs -f web", "compose config", "compose build", "network create n1", "network ls", "network rm n1", "network inspect n1", "run --network appnet --network-alias db --network-alias database alpine", "volume create data", "volume ls", "volume rm data", "volume inspect data", "volume prune", "system df", "container prune", "build -t app:1 -f Df --build-arg A=1 --build-arg B=2 --target final --no-cache .", "pull alpine", "push a:1",
             "tag a b", "save -o x.tar a b:1", "load -i x.tar", "login -u me -p x ghcr.io", "login -u me --password-stdin", "logout", "logout ghcr.io", "images", "rmi a", "prune", "version",
+            "swarm init", "service create --name w --replicas 2 -p 80:80 alpine sleep 9", "service scale w=3 x=1", "stack deploy -c a.yml s",
         ] {
             let cmd = p(line).unwrap();
             assert_eq!(p(&cmd.to_args().join(" ")).unwrap(), cmd, "{line}");

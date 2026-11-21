@@ -4,6 +4,24 @@ Goal: a Docker-compatible CLI in Rust that uses less RAM and disk. Containers ar
 **Linux runs them natively; macOS and Windows run the same engine inside a tiny hidden Linux VM**
 (Apple Virtualization.framework / WSL2 or Hyper-V), exactly how Docker Desktop, Podman and OrbStack do it.
 
+## Status at a glance
+
+**Made:** the container engine (namespaces, cgroup v2, overlayfs, seccomp), pull/push/build (multi-stage, `.dockerignore`),
+compose, networks (name DNS) and volumes, restart policies, healthchecks, terminals (`run -it`, `exec -it`), `docker update`,
+the Engine API daemon (the real Docker CLI and the Docker SDK for Python both pass their end-to-end checks), Windows and macOS
+forwarding into a hidden Linux VM, the `Sasta Docker` desktop GUI, and the node, postgres, redis, nginx, python and mariadb images.
+
+**Remaining:**
+- Rootless mode (see "Rootless (5b)" below for why it is a separate project)
+- Swarm / multi-node orchestration (not planned: a different product)
+- macOS has never been run on a real Mac (the Lima driver is written and compiled only)
+- No stdin on `attach` for containers that were started without a terminal; `docker update --restart`
+- Not tried against other Docker clients (Go SDK, IDE plugins, Portainer, `docker compose` v2 binary)
+- The GUI has only been checked by looking at it: its buttons and dialogs have not been clicked through end to end
+- Only about a dozen real images have been run, so other images may hit bugs
+- Engine API endpoints not implemented: `export`/`commit`, image history/search, `POST /containers/prune` family, plugins, configs/secrets
+- Windows-native containers beyond the Job Object backend (`--native`)
+
 | Phase | What | State |
 |---|---|---|
 | 1 | Pull images (Docker Hub / OCI), dedup layer store, run from overlayfs, cgroup limits | **done**, verified end-to-end with `alpine` on Linux ARM64 (pull, run, RAM-only writes, OOM kill, pids limit, clean teardown) |
@@ -35,13 +53,13 @@ Doing it half-way would hand out a "rootless" mode with silent ownership and net
 - `docker vm init` on Windows imports a new WSL2 distro from Alpine's root filesystem (pulled with our own image code), installs the Linux engine, and runs `apk add curl` inside it. Verified for real on this machine: it created the `rust-docker` distro, after which `docker pull`, `run`, `build` (with a `RUN apk add jq` over the internet), container DNS and a published port reachable from Windows all worked.
 - The engine lives in the VM's own disk: images and layers never touch the Windows drive. Bind mounts from `C:\...` go through WSL's drive mount (slower, and Linux file modes on those files are approximate).
 - WSL shuts an idle VM down, which would kill detached containers, so every command makes sure a hidden `sleep` keeps it alive.
-- The GUI dashboard shows Windows-native (`--native`) containers only; showing VM containers is future work.
+- The GUI talks to the VM through the same `docker` CLI, so it shows the containers and images that live in the VM.
 - Not done: a TTY (`-it`), UNC paths (`\\server\share`), macOS Virtualization.framework (the macOS driver uses Lima, which must be installed).
 
 ## Known gaps
-- Security: seccomp is a denylist of dangerous syscalls (not Docker's full allowlist profile); no AppArmor/SELinux; no `--read-only`, no user-namespace remapping.
-- Registry: push uses monolithic blob uploads (no chunked/resumable, no cross-repo blob mount); layers are re-tarred on every push; no zstd; credentials are stored in `<store>/auth.json` (mode 0600, not encrypted); only validated against a mock registry and Docker Hub's pull path, not a live push to a real registry.
-- Build: no `ADD` of URLs/tarballs, `COPY --chmod`, `RUN --mount`, `SHELL`, `ONBUILD`; `VOLUME`/`HEALTHCHECK`/`STOPSIGNAL` are ignored. Built layers are overlay directories (not tarballs), so a built image cannot be pushed until phase 5.
-- zstd-compressed layers, registry login (anonymous pulls only), pulling by digest.
-- Networking: no UDP `-p`, no IPv6, no name-based container DNS, no user-defined networks; the NAT rule and bridge are left in place after the last container exits.
-- Do not run untrusted code: no seccomp or capability dropping yet.
+- Security: seccomp is a denylist of dangerous syscalls (not Docker's full allowlist profile); no AppArmor/SELinux; no user-namespace remapping. Do not run untrusted code.
+- Registry: push uses monolithic blob uploads (no chunked/resumable, no cross-repo blob mount); layers are re-tarred on every push; no zstd; credentials are stored in `<store>/auth.json` (mode 0600, not encrypted). Built layers are overlay directories, not tarballs, so a built image cannot be pushed as is without repacking.
+- Build: no `ADD` of URLs/tarballs, `COPY --chmod`, `RUN --mount`, `SHELL`, `ONBUILD`; `VOLUME` and `STOPSIGNAL` are ignored. `buildx build` is only an alias (no multi-platform builds, no BuildKit cache).
+- Networking: no UDP `-p`, no IPv6; the NAT rule and bridge are left in place after the last container exits.
+- Engine API over Windows-to-WSL TCP: WSL's localhost forwarding drops half-closed connections, so exec/attach are only reliable over the Linux unix socket.
+- Container attach has no window-resize message.

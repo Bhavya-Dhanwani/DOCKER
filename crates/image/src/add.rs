@@ -162,6 +162,16 @@ mod tests {
     }
 
     #[test]
+    fn extracts_bzip2_tar() {
+        let d = tmp("bz2");
+        let src = d.join("a.bin");
+        fs::write(&src, include_bytes!("testdata.tar.bz2")).unwrap(); // `tar cjf` of one file f.txt
+        assert!(extract_archive(&src, &d.join("out"), &d.join("scratch")).unwrap());
+        assert_eq!(fs::read_to_string(d.join("out/f.txt")).unwrap().trim(), "inner");
+        let _ = fs::remove_dir_all(d);
+    }
+
+    #[test]
     fn sniffs_formats() {
         assert_eq!(sniff(&[0x1f, 0x8b, 8]), Kind::Gzip);
         assert_eq!(sniff(b"BZh91AY"), Kind::Bzip2);

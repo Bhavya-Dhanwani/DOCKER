@@ -515,6 +515,9 @@ fn child(plan: &Plan, id: &str, rw: bool, gate: OwnedFd, net: ChildNet, tty: Opt
 
 pub fn stats(id: &str) -> Option<Stats> {
     let d = cgroup::dir(id);
+    if registry::rootless() && !d.join("cpu.stat").exists() {
+        return rootless::proc_stats(registry::find(id).ok()?.pid);
+    }
     let read = |f: &str| fs::read_to_string(d.join(f)).ok();
     let cpu_us = read("cpu.stat")?.lines().find_map(|l| l.strip_prefix("usage_usec ")?.trim().parse::<u64>().ok())?;
     Some(Stats {

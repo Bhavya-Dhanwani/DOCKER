@@ -184,3 +184,16 @@ pub fn bind_devices(root: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+/// Liveness and rough usage of a container without a cgroup: only its init process (`pid`) is measured.
+pub fn proc_stats(pid: u32) -> Option<crate::stats::Stats> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let f: Vec<&str> = stat[stat.rfind(')')? + 1..].split_whitespace().collect();
+    if f.first() == Some(&"Z") {
+        return None; // dead, not yet reaped
+    }
+    let ticks = f.get(11)?.parse::<u64>().ok()? + f.get(12)?.parse::<u64>().ok()?; // utime + stime
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let rss_kb = status.lines().find_map(|l| l.strip_prefix("VmRSS:")).and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok()).unwrap_or(0);
+    Some(crate::stats::Stats { mem_bytes: rss_kb * 1024, cpu_ms: ticks * 10, procs: 1 })
+}

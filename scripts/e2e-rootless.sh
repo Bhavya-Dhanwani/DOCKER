@@ -82,18 +82,24 @@ check "--network host shares the host's interfaces" eq "$(dk run --network host 
 if command -v slirp4netns >/dev/null; then
   check "slirp4netns: own netns with tap0" has "$(dk run alpine sh -c 'cat /proc/net/dev')" tap0
   check "slirp4netns: not the host's interfaces" has "$(dk run alpine sh -c 'cat /proc/net/dev')" lo
-  check "slirp4netns: DNS + outbound HTTP" has "$(dk run alpine wget -q -T10 -O- http://example.com 2>&1)" "Example Domain"
-  dk run -d --name pub -p 18080:80 alpine httpd -f -p 80 -h /etc >/dev/null
+  check "slirp4netns: DNS + outbound HTTP" has "$(dk run alpine wget -q -T10 -O- http://archive.ubuntu.com/ubuntu/ 2>&1 | head -c 2000)" "Index of"
+  dk run -d --name pub -p 18080:80 alpine sh -c 'while true; do printf "HTTP/1.0 200 OK
+
+rootless-ok
+" | nc -l -p 80; done' >/dev/null
   sleep 1
-  check "slirp4netns: -p publishes a TCP port" has "$(curl -s -m 5 http://127.0.0.1:18080/os-release)" "Alpine"
+  check "slirp4netns: -p publishes a TCP port" has "$(curl -s -m 5 http://127.0.0.1:18080/)" "rootless-ok"
   dk stop -t 1 pub >/dev/null 2>&1; dk rm pub >/dev/null 2>&1
 fi
 if command -v pasta >/dev/null; then
   export SASTA_ROOTLESS_NET=pasta
-  check "pasta: outbound HTTP" has "$(dk run alpine wget -q -T10 -O- http://example.com 2>&1)" "Example Domain"
-  dk run -d --name pubp -p 18081:80 alpine httpd -f -p 80 -h /etc >/dev/null
+  check "pasta: outbound HTTP" has "$(dk run alpine wget -q -T10 -O- http://archive.ubuntu.com/ubuntu/ 2>&1 | head -c 2000)" "Index of"
+  dk run -d --name pubp -p 18081:80 alpine sh -c 'while true; do printf "HTTP/1.0 200 OK
+
+rootless-ok
+" | nc -l -p 80; done' >/dev/null
   sleep 1
-  check "pasta: -p publishes a TCP port" has "$(curl -s -m 5 http://127.0.0.1:18081/os-release)" "Alpine"
+  check "pasta: -p publishes a TCP port" has "$(curl -s -m 5 http://127.0.0.1:18081/)" "rootless-ok"
   dk stop -t 1 pubp >/dev/null 2>&1; dk rm pubp >/dev/null 2>&1
   unset SASTA_ROOTLESS_NET
 fi

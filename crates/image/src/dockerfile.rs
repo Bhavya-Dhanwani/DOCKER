@@ -76,12 +76,12 @@ fn healthcheck(rest: &str, line: usize) -> Result<Option<HealthSpec>> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Instruction {
-    From { image: String, alias: Option<String> },
-    Run(Cmd),
+    From { image: String, alias: Option<String>, platform: Option<String> },
+    Run { cmd: Cmd, mounts: Vec<Mount> },
     Cmd(Cmd),
     Entrypoint(Cmd),
-    /// `COPY` and `ADD` (local files only). `from` is a build stage or an image; `chown` is `user[:group]`.
-    Copy { srcs: Vec<String>, dst: String, from: Option<String>, chown: Option<String> },
+    /// `COPY` and `ADD`.
+    Copy(CopySpec),
     Env(Vec<(String, String)>),
     Arg { name: String, default: Option<String> },
     Workdir(String),
@@ -90,10 +90,79 @@ pub enum Instruction {
     User(String),
     /// `HEALTHCHECK NONE` is `None`.
     Healthcheck(Option<HealthSpec>),
-    /// Accepted but has no effect here (VOLUME, STOPSIGNAL, MAINTAINER).
+    /// `SHELL ["/bin/bash", "-c"]`: what shell-form RUN/CMD/ENTRYPOINT use from here on.
+    Shell(Vec<String>),
+    /// `ONBUILD <instruction>`: the instruction text, run when this image is used as a `FROM`.
+    Onbuild(String),
+    Volume(Vec<String>),
+    StopSignal(String),
+    /// Accepted but has no effect here (MAINTAINER).
     Ignored(String),
 }
 
+/// `COPY` / `ADD`. `from` is a build stage or an image; `chown` is `user[:group]`, `chmod` octal.
+/// `add` enables URL download and tar auto-extraction. A source named like a heredoc is an inline file.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CopySpec {
+    pub srcs: Vec<String>,
+    pub dst: String,
+    pub from: Option<String>,
+    pub chown: Option<String>,
+    pub chmod: Option<String>,
+    pub add: bool,
+    pub heredocs: Vec<Heredoc>,
+}
+
+/// An inline file: `COPY <<EOF /dst`, or the script of `RUN <<EOF`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Heredoc {
+    pub name: String,
+    /// Always newline-terminated; leading tabs already stripped for `<<-`.
+    pub body: String,
+    /// Unquoted delimiter: `$VAR` in the body is expanded (COPY only; the shell does it for RUN).
+    pub expand: bool,
+}
+
+/// `RUN --mount=type=...`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Mount {
+    /// A persistent directory shared between builds.
+    Cache { target: String, id: Option<String> },
+    /// A directory (or file) of the build context, read-only unless `rw` (then writes are discarded).
+    Bind { source: String, target: String, rw: bool },
+    Tmpfs { target: String },
+    /// `docker build --secret id=<id>,src=<file>`; mounted at `/run/secrets/<id>` unless `target` is set.
+    Secret { id: String, target: Option<String>, required: bool },
+}
+
+/// A signal name (`SIGTERM`, `term`; real-time signals are not supported) or number, as `STOPSIGNAL` takes.
+pub fn parse_signal(s: &str) -> Option<i32> {
+    if let Ok(n) = s.trim().parse::<i32>() {
+        return (1..=64).contains(&n).then_some(n);
+    }
+    let up = s.trim().to_ascii_uppercase();
+    let name = up.strip_prefix("SIG").unwrap_or(&up);
+    Some(match name {
+        "HUP" => 1,
+        "INT" => 2,
+        "QUIT" => 3,
+        "ILL" => 4,
+        "ABRT" => 6,
+        "KILL" => 9,
+        "USR1" => 10,
+        "SEGV" => 11,
+        "USR2" => 12,
+        "PIPE" => 13,
+        "ALRM" => 14,
+        "TERM" => 15,
+        "CHLD" => 17,
+        "CONT" => 18,
+        "STOP" => 19,
+        "TSTP" => 20,
+        "WINCH" => 28,
+        _ => return None,
+    })
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Step {
     pub line: usize,
@@ -106,41 +175,105 @@ fn at(line: usize, msg: impl std::fmt::Display) -> Error {
     err(format!("Dockerfile line {line}: {msg}"))
 }
 
+/// One instruction as written: continuations joined, plus the heredoc bodies that follow it.
+struct Logical {
+    line: usize,
+    text: String,
+    heredocs: Vec<Heredoc>,
+}
+
+/// `<<EOF`, `<<-EOF`, `<<"EOF"` markers in an instruction line: (delimiter, strip leading tabs, expand).
+/// `<<<` (here-string) and `<<` followed by a non-identifier (shell arithmetic) are not markers.
+fn heredoc_markers(text: &str) -> Vec<(String, bool, bool)> {
+    let c: Vec<char> = text.chars().collect();
+    let mut out = vec![];
+    let mut i = 0;
+    while i + 2 < c.len() {
+        if c[i] != '<' || c[i + 1] != '<' || (i > 0 && c[i - 1] == '<') || c[i + 2] == '<' {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 2;
+        let strip = c.get(j) == Some(&'-');
+        if strip {
+            j += 1;
+        }
+        let quote = c.get(j).copied().filter(|q| *q == '"' || *q == '\'');
+        if quote.is_some() {
+            j += 1;
+        }
+        let start = j;
+        while j < c.len() && (c[j].is_ascii_alphanumeric() || c[j] == '_') {
+            j += 1;
+        }
+        let ident_ok = c.get(start).is_some_and(|ch| ch.is_ascii_alphabetic() || *ch == '_');
+        if ident_ok && quote.is_none_or(|q| c.get(j) == Some(&q)) {
+            out.push((c[start..j].iter().collect(), strip, quote.is_none()));
+        }
+        i = j.max(i + 2);
+    }
+    out
+}
+
 /// Logical lines (continuations joined, comments and blanks dropped) with their starting line number.
-fn logical_lines(src: &str) -> Vec<(usize, String)> {
+/// `RUN`/`COPY`/`ADD` heredoc bodies are consumed from the lines after the instruction.
+fn logical_lines(src: &str) -> Result<Vec<Logical>> {
+    let lines: Vec<&str> = src.lines().map(|l| l.trim_end_matches('\r')).collect();
     let mut out = vec![];
     let mut cur: Option<(usize, String)> = None;
-    for (i, raw) in src.lines().enumerate() {
-        let line = raw.trim_end_matches('\r');
-        let t = line.trim();
+    let mut i = 0;
+    while i < lines.len() {
+        let t = lines[i].trim();
+        i += 1;
         if t.starts_with('#') || t.is_empty() {
             continue; // comments and blank lines are skipped, even inside a continuation
         }
-        let (n, mut text) = cur.take().unwrap_or((i + 1, String::new()));
+        let (n, mut text) = cur.take().unwrap_or((i, String::new()));
         if !text.is_empty() {
             text.push(' ');
         }
-        match t.strip_suffix('\\') {
-            Some(body) => {
-                text.push_str(body.trim_end());
-                cur = Some((n, text));
-            }
-            None => {
-                text.push_str(t);
-                out.push((n, text));
+        if let Some(body) = t.strip_suffix('\\') {
+            text.push_str(body.trim_end());
+            cur = Some((n, text));
+            continue;
+        }
+        text.push_str(t);
+        let kw = text.split_whitespace().next().unwrap_or("").to_ascii_uppercase();
+        let mut heredocs = vec![];
+        if matches!(kw.as_str(), "RUN" | "COPY" | "ADD") {
+            for (name, strip, expand) in heredoc_markers(&text) {
+                let mut body = String::new();
+                loop {
+                    let Some(raw) = lines.get(i) else { return Err(at(n, format!("heredoc <<{name} is never terminated"))) };
+                    i += 1;
+                    let l = if strip { raw.trim_start_matches('\t') } else { raw };
+                    if l == name {
+                        break;
+                    }
+                    body.push_str(l);
+                    body.push('\n');
+                }
+                heredocs.push(Heredoc { name, body, expand });
             }
         }
+        out.push(Logical { line: n, text, heredocs });
     }
-    if let Some(c) = cur {
-        out.push(c);
+    if let Some((line, text)) = cur {
+        out.push(Logical { line, text, heredocs: vec![] });
     }
-    out
+    Ok(out)
 }
 
 /// Shell-like word splitting: whitespace separates, `'..'` and `".."` group, `\x` escapes.
 /// `\$` is kept as-is so `subst` can tell it was escaped.
 pub fn words(s: &str) -> Result<Vec<String>> {
+    Ok(split_words(s)?.into_iter().map(|(w, _)| w).collect())
+}
+
+/// Like `words`, also giving the byte offset of each word's first *unquoted* `=` (so `"a b"="c d"` splits right).
+fn split_words(s: &str) -> Result<Vec<(String, Option<usize>)>> {
     let mut out = vec![];
+    let mut eq: Option<usize> = None;
     let mut cur = String::new();
     let mut started = false;
     let mut chars = s.chars().peekable();
@@ -148,7 +281,7 @@ pub fn words(s: &str) -> Result<Vec<String>> {
         match c {
             c if c.is_whitespace() => {
                 if started {
-                    out.push(std::mem::take(&mut cur));
+                    out.push((std::mem::take(&mut cur), eq.take()));
                     started = false;
                 }
             }
@@ -191,12 +324,15 @@ pub fn words(s: &str) -> Result<Vec<String>> {
             }
             c => {
                 started = true;
+                if c == '=' && eq.is_none() {
+                    eq = Some(cur.len());
+                }
                 cur.push(c);
             }
         }
     }
     if started {
-        out.push(cur);
+        out.push((cur, eq));
     }
     Ok(out)
 }
@@ -253,17 +389,26 @@ fn cmd(rest: &str) -> Cmd {
     Cmd::Shell(rest.trim().to_string())
 }
 
-/// `K=V K2="v 2"` pairs (ENV, LABEL).
+/// `K=V K2="v 2" "k 3"=v` pairs (ENV, LABEL). The key may be quoted.
 fn pairs(rest: &str, line: usize) -> Result<Vec<(String, String)>> {
-    words(rest)?
+    split_words(rest)?
         .into_iter()
-        .map(|w| {
-            w.split_once('=')
-                .filter(|(k, _)| !k.is_empty())
-                .map(|(k, v)| (k.to_string(), v.to_string()))
+        .map(|(w, eq)| {
+            eq.filter(|&i| i > 0)
+                .map(|i| (w[..i].to_string(), w[i + 1..].to_string()))
                 .ok_or_else(|| at(line, format!("expected KEY=VALUE, got {w:?}")))
         })
         .collect()
+}
+
+/// `LABEL k=v k2=v2`, or the legacy `LABEL key value with spaces`.
+fn label_pairs(rest: &str, line: usize) -> Result<Vec<(String, String)>> {
+    let first = split_words(rest)?.into_iter().next();
+    if first.is_some_and(|(_, eq)| eq.is_some()) {
+        return pairs(rest, line);
+    }
+    let (k, v) = rest.split_once(char::is_whitespace).ok_or_else(|| at(line, "LABEL needs KEY=VALUE"))?;
+    Ok(vec![(words(k)?.concat(), words(v)?.join(" "))])
 }
 
 fn string_list(rest: &str) -> Result<Vec<String>> {
@@ -275,33 +420,67 @@ fn string_list(rest: &str) -> Result<Vec<String>> {
     words(rest)
 }
 
-/// Leading `--from=X` / `--chown=U:G` flags of COPY/ADD; returns them and the rest of the line.
-fn copy_flags(rest: &str, kw: &str, line: usize) -> Result<(Option<String>, Option<String>, String)> {
-    let (mut from, mut chown) = (None, None);
+/// Leading `--flag[=value]` words of an instruction: (name, value) pairs and the rest of the line.
+fn leading_flags(rest: &str) -> (Vec<(String, String)>, &str) {
+    let mut flags = vec![];
     let mut rest = rest.trim_start();
     while let Some(flag) = rest.strip_prefix("--") {
         let end = flag.find(char::is_whitespace).unwrap_or(flag.len());
         let (name, value) = flag[..end].split_once('=').unwrap_or((&flag[..end], ""));
-        match (name, value) {
-            ("from", v) if !v.is_empty() && kw == "COPY" => from = Some(v.to_string()),
-            ("chown", v) if !v.is_empty() => chown = Some(v.to_string()),
-            _ => return Err(at(line, format!("{kw} --{name} is not supported (supported: --from=<stage|image>, --chown=<user[:group]>)"))),
-        }
+        flags.push((name.to_string(), value.to_string()));
         rest = flag[end..].trim_start();
     }
-    Ok((from, chown, rest.to_string()))
+    (flags, rest)
 }
 
-fn reject_flags(rest: &str, kw: &str, line: usize) -> Result<()> {
-    match rest.trim_start().strip_prefix("--") {
-        Some(flag) => Err(at(line, format!("{kw} --{} is not supported yet", flag.split(['=', ' ']).next().unwrap_or("")))),
-        None => Ok(()),
+/// `COPY`/`ADD` flags: `--from` (COPY only), `--chown`, `--chmod` (octal), `--link` (accepted, no effect).
+fn copy_flags(rest: &str, kw: &str, line: usize) -> Result<(CopySpec, String)> {
+    let mut spec = CopySpec { add: kw == "ADD", ..CopySpec::default() };
+    let (flags, rest) = leading_flags(rest);
+    for (name, v) in flags {
+        match (name.as_str(), v) {
+            ("from", v) if !v.is_empty() && kw == "COPY" => spec.from = Some(v),
+            ("chown", v) if !v.is_empty() => spec.chown = Some(v),
+            ("chmod", v) if !v.is_empty() && v.len() <= 4 && v.bytes().all(|b| (b'0'..=b'7').contains(&b)) => spec.chmod = Some(v),
+            ("link", _) => {}
+            (name, _) => return Err(at(line, format!("{kw} --{name} is not supported (supported: --from=<stage|image>, --chown=<user[:group]>, --chmod=<octal>)"))),
+        }
     }
+    Ok((spec, rest.to_string()))
+}
+
+/// `--mount=type=cache,target=/x,id=y` (comma separated `key[=value]` list).
+fn parse_mount(spec: &str, line: usize) -> Result<Mount> {
+    let kv: Vec<(&str, &str)> = spec.split(',').filter(|s| !s.is_empty()).map(|p| p.split_once('=').unwrap_or((p, ""))).collect();
+    let get = |names: &[&str]| kv.iter().find(|(k, _)| names.contains(k)).map(|(_, v)| v.to_string()).filter(|v| !v.is_empty());
+    let target = get(&["target", "dst", "destination"]);
+    let need_target = || target.clone().ok_or_else(|| at(line, "--mount needs target=<path>"));
+    let ty = get(&["type"]).unwrap_or_else(|| "bind".into());
+    Ok(match ty.as_str() {
+        "cache" => Mount::Cache { target: need_target()?, id: get(&["id"]) },
+        "tmpfs" => Mount::Tmpfs { target: need_target()? },
+        "bind" => {
+            if get(&["from"]).is_some() {
+                return Err(at(line, "--mount=type=bind,from=... is not supported (bind mounts read the build context)"));
+            }
+            let rw = kv.iter().any(|(k, v)| matches!(*k, "rw" | "readwrite") && *v != "false");
+            Mount::Bind { source: get(&["source", "src"]).unwrap_or_else(|| "/".into()), target: need_target()?, rw }
+        }
+        "secret" => {
+            let id = get(&["id"]).ok_or_else(|| at(line, "--mount=type=secret needs id=<name>"))?;
+            Mount::Secret { id, target, required: kv.iter().any(|(k, v)| *k == "required" && *v != "false") }
+        }
+        other => return Err(at(line, format!("--mount type={other} is not supported (cache, bind, tmpfs, secret)"))),
+    })
+}
+
+fn heredoc_word(src: &str) -> Option<&str> {
+    src.strip_prefix("<<").map(|w| w.trim_start_matches('-').trim_matches(['"', '\'']))
 }
 
 pub fn parse(src: &str) -> Result<Vec<Step>> {
     let mut steps = vec![];
-    for (line, text) in logical_lines(src) {
+    for Logical { line, text, heredocs } in logical_lines(src)? {
         let (kw, rest) = text.split_once(char::is_whitespace).map_or((text.as_str(), ""), |(k, r)| (k, r.trim()));
         let upper = kw.to_ascii_uppercase();
         if rest.is_empty() && upper != "ENTRYPOINT" {
@@ -309,33 +488,71 @@ pub fn parse(src: &str) -> Result<Vec<Step>> {
         }
         let inst = match upper.as_str() {
             "FROM" => {
-                reject_flags(rest, "FROM", line)?;
+                let (flags, rest) = leading_flags(rest);
+                let mut platform = None;
+                for (name, v) in flags {
+                    match name.as_str() {
+                        "platform" if !v.is_empty() => platform = Some(v),
+                        _ => return Err(at(line, format!("FROM --{name} is not supported (supported: --platform=<os/arch>)"))),
+                    }
+                }
                 let w = words(rest)?;
                 match w.as_slice() {
-                    [img] => Instruction::From { image: img.clone(), alias: None },
+                    [img] => Instruction::From { image: img.clone(), alias: None, platform },
                     [img, as_, name] if as_.eq_ignore_ascii_case("as") => {
-                        Instruction::From { image: img.clone(), alias: Some(name.clone()) }
+                        Instruction::From { image: img.clone(), alias: Some(name.clone()), platform }
                     }
-                    _ => return Err(at(line, "expected FROM <image> [AS <name>]")),
+                    _ => return Err(at(line, "expected FROM [--platform=<p>] <image> [AS <name>]")),
                 }
             }
             "RUN" => {
-                reject_flags(rest, "RUN", line)?;
-                Instruction::Run(cmd(rest))
+                let (flags, rest) = leading_flags(rest);
+                let mut mounts = vec![];
+                for (name, v) in flags {
+                    match name.as_str() {
+                        "mount" => mounts.push(parse_mount(&v, line)?),
+                        "network" | "security" => {} // the build network is the host's; accepted for compatibility
+                        _ => return Err(at(line, format!("RUN --{name} is not supported (supported: --mount)"))),
+                    }
+                }
+                let cmd = match heredocs.as_slice() {
+                    [] => cmd(rest),
+                    // `RUN <<EOF`: the body is the script itself
+                    [h] if heredoc_word(rest.trim()).is_some() => Cmd::Shell(h.body.clone()),
+                    // `RUN cat <<EOF > f`: the shell reads the bodies, which must follow the line in order
+                    hs => {
+                        let mut s = rest.to_string();
+                        for h in hs {
+                            s.push('\n');
+                            s.push_str(&h.body);
+                            s.push_str(&h.name);
+                        }
+                        Cmd::Shell(s)
+                    }
+                };
+                Instruction::Run { cmd, mounts }
             }
             "CMD" => Instruction::Cmd(cmd(rest)),
             "ENTRYPOINT" => Instruction::Entrypoint(if rest.is_empty() { Cmd::Exec(vec![]) } else { cmd(rest) }),
             "COPY" | "ADD" => {
-                let (from, chown, rest) = copy_flags(rest, &upper, line)?;
+                let (mut spec, rest) = copy_flags(rest, &upper, line)?;
                 let mut w = string_list(&rest)?;
                 if w.len() < 2 {
                     return Err(at(line, format!("{upper} needs at least a source and a destination")));
                 }
-                let dst = w.pop().expect("len >= 2");
-                if upper == "ADD" && w.iter().any(|s| s.contains("://")) {
-                    return Err(at(line, "ADD from a URL is not supported yet"));
+                spec.dst = w.pop().expect("len >= 2");
+                for s in &mut w {
+                    if let Some(name) = heredoc_word(s).map(str::to_string) {
+                        let h = heredocs.iter().find(|h| h.name == name).ok_or_else(|| at(line, format!("heredoc <<{name} has no body")))?;
+                        spec.heredocs.push(h.clone());
+                        *s = name;
+                    }
                 }
-                Instruction::Copy { srcs: w, dst, from, chown }
+                if spec.from.is_some() && !spec.heredocs.is_empty() {
+                    return Err(at(line, "--from cannot be combined with a heredoc source"));
+                }
+                spec.srcs = w;
+                Instruction::Copy(spec)
             }
             "ENV" => {
                 let first = rest.split_whitespace().next().unwrap_or("");
@@ -353,13 +570,31 @@ pub fn parse(src: &str) -> Result<Vec<Step>> {
             },
             "WORKDIR" => Instruction::Workdir(rest.to_string()),
             "EXPOSE" => Instruction::Expose(words(rest)?),
-            "LABEL" => Instruction::Label(pairs(rest, line)?),
+            "LABEL" => Instruction::Label(label_pairs(rest, line)?),
             "USER" => Instruction::User(rest.to_string()),
             "HEALTHCHECK" => Instruction::Healthcheck(healthcheck(rest, line)?),
-            "VOLUME" | "STOPSIGNAL" | "MAINTAINER" => Instruction::Ignored(upper),
-            "SHELL" | "ONBUILD" => return Err(at(line, format!("{upper} is not supported yet"))),
+            "VOLUME" => Instruction::Volume(string_list(rest)?),
+            "STOPSIGNAL" => {
+                if parse_signal(rest).is_none() {
+                    return Err(at(line, format!("invalid signal {rest:?}")));
+                }
+                Instruction::StopSignal(rest.to_string())
+            }
+            "SHELL" => match serde_json::from_str::<Vec<String>>(rest) {
+                Ok(v) if !v.is_empty() => Instruction::Shell(v),
+                _ => return Err(at(line, "SHELL needs a JSON array, e.g. [\"/bin/bash\", \"-c\"]")),
+            },
+            "ONBUILD" => {
+                let inner = parse(rest).map_err(|e| at(line, format!("ONBUILD: {e}")))?;
+                match inner.as_slice() {
+                    [s] if !matches!(s.inst, Instruction::From { .. } | Instruction::Onbuild(_)) => Instruction::Onbuild(rest.to_string()),
+                    _ => return Err(at(line, "ONBUILD takes one instruction other than FROM or ONBUILD")),
+                }
+            }
+            "MAINTAINER" => Instruction::Ignored(upper),
             other => return Err(at(line, format!("unknown instruction {other}"))),
         };
+        // heredoc bodies are not part of the displayed text
         steps.push(Step { line, text, inst });
     }
     Ok(steps)
@@ -382,13 +617,13 @@ mod tests {
         let steps = parse("# hi\nFROM alpine\n\nRUN echo a \\\n  # note\n  && echo b\nCMD [\"sh\"]\n").unwrap();
         assert_eq!(steps.len(), 3);
         assert_eq!(steps[1].line, 4);
-        assert_eq!(steps[1].inst, Instruction::Run(Cmd::Shell("echo a && echo b".into())));
+        assert_eq!(steps[1].inst, Instruction::Run { cmd: Cmd::Shell("echo a && echo b".into()), mounts: vec![] });
         assert_eq!(steps[2].inst, Instruction::Cmd(Cmd::Exec(vec!["sh".into()])));
     }
 
     #[test]
     fn keywords_are_case_insensitive_and_from_alias() {
-        assert_eq!(one("from alpine:3.19 as build"), Instruction::From { image: "alpine:3.19".into(), alias: Some("build".into()) });
+        assert_eq!(one("from alpine:3.19 as build"), Instruction::From { image: "alpine:3.19".into(), alias: Some("build".into()), platform: None });
     }
 
     #[test]
@@ -402,13 +637,20 @@ mod tests {
 
     #[test]
     fn copy_arg_workdir_label_expose() {
-        assert_eq!(one("COPY a b /dst/"), Instruction::Copy { srcs: vec!["a".into(), "b".into()], dst: "/dst/".into(), from: None, chown: None });
-        assert_eq!(one("COPY [\"a b\", \"/d\"]"), Instruction::Copy { srcs: vec!["a b".into()], dst: "/d".into(), from: None, chown: None });
+        let cp = |srcs: &[&str], dst: &str| CopySpec { srcs: srcs.iter().map(|s| s.to_string()).collect(), dst: dst.into(), ..CopySpec::default() };
+        assert_eq!(one("COPY a b /dst/"), Instruction::Copy(cp(&["a", "b"], "/dst/")));
+        assert_eq!(one("COPY [\"a b\", \"/d\"]"), Instruction::Copy(cp(&["a b"], "/d")));
         assert_eq!(
-            one("COPY --from=build --chown=1000:1000 /out/app /usr/bin/app"),
-            Instruction::Copy { srcs: vec!["/out/app".into()], dst: "/usr/bin/app".into(), from: Some("build".into()), chown: Some("1000:1000".into()) }
+            one("COPY --from=build --chown=1000:1000 --chmod=0755 --link /out/app /usr/bin/app"),
+            Instruction::Copy(CopySpec {
+                from: Some("build".into()),
+                chown: Some("1000:1000".into()),
+                chmod: Some("0755".into()),
+                ..cp(&["/out/app"], "/usr/bin/app")
+            })
         );
-        assert_eq!(one("ADD --chown=u f /f"), Instruction::Copy { srcs: vec!["f".into()], dst: "/f".into(), from: None, chown: Some("u".into()) });
+        assert_eq!(one("ADD --chown=u --chmod=644 f /f"), Instruction::Copy(CopySpec { chown: Some("u".into()), chmod: Some("644".into()), add: true, ..cp(&["f"], "/f") }));
+        assert_eq!(one("ADD http://x/y.tgz a.tar /z/"), Instruction::Copy(CopySpec { add: true, ..cp(&["http://x/y.tgz", "a.tar"], "/z/") }));
         assert_eq!(one("ARG V=1.2"), Instruction::Arg { name: "V".into(), default: Some("1.2".into()) });
         assert_eq!(one("ARG V"), Instruction::Arg { name: "V".into(), default: None });
         assert_eq!(one("WORKDIR /app"), Instruction::Workdir("/app".into()));
@@ -448,7 +690,7 @@ mod tests {
 
     #[test]
     fn exec_form_falls_back_to_shell_on_bad_json() {
-        assert_eq!(one("RUN [not json"), Instruction::Run(Cmd::Shell("[not json".into())));
+        assert_eq!(one("RUN [not json"), Instruction::Run { cmd: Cmd::Shell("[not json".into()), mounts: vec![] });
     }
 
     #[test]
@@ -467,10 +709,69 @@ mod tests {
     }
 
     #[test]
+    fn new_instructions() {
+        assert_eq!(one("SHELL [\"/bin/bash\", \"-c\"]"), Instruction::Shell(vec!["/bin/bash".into(), "-c".into()]));
+        assert_eq!(one("ONBUILD RUN echo hi"), Instruction::Onbuild("RUN echo hi".into()));
+        assert_eq!(one("VOLUME [\"/a\", \"/b\"]"), Instruction::Volume(vec!["/a".into(), "/b".into()]));
+        assert_eq!(one("VOLUME /a /b"), Instruction::Volume(vec!["/a".into(), "/b".into()]));
+        assert_eq!(one("STOPSIGNAL SIGINT"), Instruction::StopSignal("SIGINT".into()));
+        assert_eq!(
+            one("FROM --platform=linux/amd64 alpine AS a"),
+            Instruction::From { image: "alpine".into(), alias: Some("a".into()), platform: Some("linux/amd64".into()) }
+        );
+        assert_eq!(parse_signal("SIGTERM"), Some(15));
+        assert_eq!(parse_signal("kill"), Some(9));
+        assert_eq!(parse_signal("10"), Some(10));
+        assert_eq!(parse_signal("NOPE"), None);
+    }
+
+    #[test]
+    fn label_forms() {
+        let l = |s: &str| match one(s) {
+            Instruction::Label(p) => p,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(l("LABEL a=b c=\"d e\""), [("a".into(), "b".into()), ("c".into(), "d e".into())]);
+        assert_eq!(l("LABEL \"com.x y\"=\"v 1\""), [("com.x y".into(), "v 1".into())]);
+        assert_eq!(l("LABEL legacy key with spaces"), [("legacy".into(), "key with spaces".into())]);
+        assert_eq!(l("LABEL a=b=c"), [("a".into(), "b=c".into())]);
+    }
+
+    #[test]
+    fn run_mounts() {
+        let Instruction::Run { mounts, cmd } = one("RUN --mount=type=cache,target=/c,id=x --mount=type=secret,id=tok,required --mount=type=bind,source=src,target=/s,rw --mount=type=tmpfs,target=/t --network=none echo hi") else { panic!() };
+        assert_eq!(cmd, Cmd::Shell("echo hi".into()));
+        assert_eq!(
+            mounts,
+            [
+                Mount::Cache { target: "/c".into(), id: Some("x".into()) },
+                Mount::Secret { id: "tok".into(), target: None, required: true },
+                Mount::Bind { source: "src".into(), target: "/s".into(), rw: true },
+                Mount::Tmpfs { target: "/t".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn heredocs() {
+        let steps = parse("FROM a\nRUN <<EOF\nset -e\n# not a comment line\necho $X\nEOF\nRUN cat <<-'END' > /f\n\tkeep\n\tEND\nCOPY <<EOF /etc/conf\nk=$V\nEOF\nCMD x\n").unwrap();
+        assert_eq!(steps.len(), 5);
+        assert_eq!(steps[1].inst, Instruction::Run { cmd: Cmd::Shell("set -e\n# not a comment line\necho $X\n".into()), mounts: vec![] });
+        assert_eq!(steps[2].inst, Instruction::Run { cmd: Cmd::Shell("cat <<-'END' > /f\nkeep\nEND".into()), mounts: vec![] });
+        let Instruction::Copy(c) = &steps[3].inst else { panic!() };
+        assert_eq!((c.srcs.as_slice(), c.dst.as_str()), (&["EOF".to_string()][..], "/etc/conf"));
+        assert_eq!(c.heredocs, [Heredoc { name: "EOF".into(), body: "k=$V\n".into(), expand: true }]);
+        assert!(parse("RUN <<EOF\nnever ends\n").is_err());
+        // arithmetic and here-strings are not heredocs
+        assert_eq!(one("RUN echo $((1<<2)) <<< x"), Instruction::Run { cmd: Cmd::Shell("echo $((1<<2)) <<< x".into()), mounts: vec![] });
+    }
+
+    #[test]
     fn rejects_what_it_cannot_do() {
         for bad in [
-            "FROMM x", "RUN", "COPY a", "COPY --from= a /b", "COPY --chmod=755 a /b", "ADD --from=b a /b", "RUN --mount=type=cache x", "ONBUILD RUN x",
-            "FROM a b c", "ENV A", "ADD http://x/y /z", "LABEL novalue",
+            "FROMM x", "RUN", "COPY a", "COPY --from= a /b", "COPY --chmod=abc a /b", "ADD --from=b a /b", "RUN --mount=type=nfs,target=/x y",
+            "RUN --mount=type=cache y", "ONBUILD", "ONBUILD FROM x", "ONBUILD ONBUILD RUN x", "SHELL bash", "STOPSIGNAL NOPE", "FROM --bogus=1 a",
+            "FROM a b c", "ENV A", "LABEL novalue",
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }

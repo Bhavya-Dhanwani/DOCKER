@@ -255,6 +255,14 @@ pub struct BuildArgs {
     pub no_cache: bool,
     /// Stop after this build stage (`--target`).
     pub target: Option<String>,
+    /// `--label k=v`: added to the image config.
+    pub labels: Vec<(String, String)>,
+    /// `--secret id=<id>,src=<file>`: (id, file) pairs for `RUN --mount=type=secret`.
+    pub secrets: Vec<(String, String)>,
+    /// `--platform os/arch`: only the host platform can be built.
+    pub platform: Option<String>,
+    /// `-q`: print only the image id.
+    pub quiet: bool,
     pub context: String,
 }
 
@@ -748,6 +756,23 @@ fn parse_build(args: Vec<String>) -> Result<BuildArgs> {
             "-f" | "--file" => b.file = Some(value("a Dockerfile path")?),
             "--no-cache" => b.no_cache = true,
             "--target" => b.target = Some(value("a stage name")?),
+            "--platform" => b.platform = Some(value("os/arch")?),
+            "-q" | "--quiet" => b.quiet = true,
+            "--pull" | "--rm" | "--force-rm" | "--load" => {} // accepted, nothing to do
+            "--progress" | "--provenance" | "--sbom" => drop(value("a value")?), // accepted, ignored
+            "--label" => {
+                let kv = value("KEY=VALUE")?;
+                let (k, v) = kv.split_once('=').filter(|(k, _)| !k.is_empty()).ok_or_else(|| usage("--label needs KEY=VALUE"))?;
+                b.labels.push((k.into(), v.into()));
+            }
+            "--secret" => {
+                let spec = value("id=<id>,src=<file>")?;
+                let get = |name: &str| spec.split(',').find_map(|p| p.strip_prefix(name)?.strip_prefix('=')).map(String::from);
+                match (get("id"), get("src").or_else(|| get("source"))) {
+                    (Some(id), Some(src)) => b.secrets.push((id, src)),
+                    _ => return Err(usage("--secret needs id=<id>,src=<file>")),
+                }
+            }
             "--build-arg" => {
                 let kv = value("KEY=VALUE")?;
                 let (k, v) = kv.split_once('=').filter(|(k, _)| !k.is_empty()).ok_or_else(|| usage("--build-arg needs KEY=VALUE"))?;
@@ -1287,9 +1312,18 @@ mod tests {
                 args: vec![("A".into(), "1".into())],
                 no_cache: true,
                 target: None,
+                labels: vec![],
+                secrets: vec![],
+                platform: None,
+                quiet: false,
                 context: ".".into()
             })
         );
+        let Command::Build(b) = p("build -q --label k=v --label a=b=c --secret id=tok,src=/f --platform linux/arm64 --pull --progress plain -t x .").unwrap() else { panic!() };
+        assert_eq!((b.quiet, b.platform.as_deref()), (true, Some("linux/arm64")));
+        assert_eq!(b.labels, [("k".to_string(), "v".to_string()), ("a".to_string(), "b=c".to_string())]);
+        assert_eq!(b.secrets, [("tok".to_string(), "/f".to_string())]);
+        assert!(p("build -t x --secret id=only .").is_err() && p("build -t x --label novalue .").is_err());
         assert_eq!(p("prune").unwrap(), Command::Prune);
         for bad in ["build .", "build -t x", "build -t x . .", "build -t x --build-arg A .", "build -t x --nope ."] {
             assert!(p(bad).is_err(), "{bad}");

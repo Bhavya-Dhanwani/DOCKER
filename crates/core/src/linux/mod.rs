@@ -125,12 +125,21 @@ fn plan(cfg: &Config) -> Result<Plan> {
         return Err(Error::Usage(format!("image {} has no default command; pass one", meta.name)));
     }
     let workdir = cfg.workdir.clone().unwrap_or_else(|| if meta.working_dir.is_empty() { "/".into() } else { meta.working_dir.clone() });
+    let mut volumes = resolve_volumes(cfg)?;
+    // `VOLUME /x` in the image: an anonymous volume (seeded from the image's content) unless -v already covers the path
+    for path in &meta.volumes {
+        if !volumes.iter().any(|v| v.container.trim_end_matches('/') == path.trim_end_matches('/')) {
+            let dir = crate::volumes::ensure(&registry::new_id())?;
+            build::seed_volume(&layers, path, &dir);
+            volumes.push(Volume { host: dir.to_string_lossy().into_owned(), container: path.clone(), ro: false });
+        }
+    }
     Ok(Plan {
         source: Source::Image(layers),
         cmd,
         env: with_term(env::merge(&with_default_path(meta.env.clone()), &cfg.env, host), cfg.tty),
         workdir,
-        volumes: resolve_volumes(cfg)?,
+        volumes,
         user: cfg.user.clone().unwrap_or_else(|| meta.user.clone()),
         security: security::resolve(cfg)?,
         health: if cfg.no_healthcheck { None } else { cfg.health.clone().or_else(|| meta.healthcheck.clone()) },
@@ -182,6 +191,8 @@ pub struct Step<'a> {
     pub env: &'a [String],
     pub workdir: &'a str,
     pub user: &'a str,
+    /// Extra bind mounts (`RUN --mount`).
+    pub volumes: &'a [Volume],
 }
 
 pub fn run_step(s: &Step) -> Result<i32> {
@@ -191,7 +202,7 @@ pub fn run_step(s: &Step) -> Result<i32> {
         cmd: s.cmd.to_vec(),
         env: with_default_path(s.env.to_vec()),
         workdir: s.workdir.into(),
-        volumes: vec![],
+        volumes: s.volumes.to_vec(),
         user: s.user.into(),
         security: Security::default(),
         health: None,

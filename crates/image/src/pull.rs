@@ -23,6 +23,10 @@ struct RunConfig {
     exposed_ports: Option<std::collections::BTreeMap<String, serde_json::Value>>,
     labels: Option<std::collections::BTreeMap<String, String>>,
     healthcheck: Option<HealthConfig>,
+    on_build: Option<Vec<String>>,
+    volumes: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    stop_signal: Option<String>,
+    shell: Option<Vec<String>>,
 }
 
 /// Durations in image configs are nanoseconds.
@@ -107,5 +111,9 @@ pub(crate) fn meta_from_config(name: &str, layers: Vec<LayerRef>, config: &[u8])
         exposed: rc.exposed_ports.unwrap_or_default().into_keys().collect(),
         labels: rc.labels.unwrap_or_default(),
         healthcheck: rc.healthcheck.and_then(health_from),
+        onbuild: rc.on_build.unwrap_or_default(),
+        volumes: rc.volumes.unwrap_or_default().into_keys().collect(),
+        stop_signal: rc.stop_signal.unwrap_or_default(),
+        shell: rc.shell.unwrap_or_default(),
     })
 }

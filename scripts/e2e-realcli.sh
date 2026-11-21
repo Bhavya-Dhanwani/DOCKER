@@ -58,6 +58,27 @@ t $R update --memory 32m tt >/dev/null
 check "update changes the memory limit" "33554432" "$(cat /sys/fs/cgroup/rust-docker-$($R inspect -f '{{.Id}}' tt)/memory.max 2>&1)"
 $R rm -f tt >/dev/null 2>&1
 
+# engine API completeness: stdin without a terminal, top, stats, diff, cp, commit, export, save/load, prune
+check "run -i --rm feeds stdin to a container without a terminal" "typed-in" "$(echo typed-in | t $R run -i --rm alpine cat)"
+$R run -d --name fs1 --label tier=web alpine sh -c 'echo hi > /marker; sleep 120' >/dev/null 2>&1; sleep 1.5
+check "top lists the container's processes" "sleep" "$(t $R top fs1)"
+check "stats --no-stream shows usage" "fs1" "$(t $R stats --no-stream fs1)"
+check "diff shows the added file" "A /marker" "$(t $R diff fs1)"
+check "ps --filter label finds it" "fs1" "$(t $R ps --filter label=tier=web --format '{{.Names}}')"
+t $R cp fs1:/marker /root/marker.$$ >/dev/null
+check "cp out of the container copies the file" "hi" "$(cat /root/marker.$$ 2>&1)"; rm -f /root/marker.$$
+echo from-host > /root/up.$$; t $R cp /root/up.$$ fs1:/tmp/up >/dev/null
+check "cp into the container works" "from-host" "$(t $R exec fs1 cat /tmp/up)"; rm -f /root/up.$$
+check "commit makes an image" "sha256:" "$(t $R commit fs1 realcommitted:1)"
+check "the committed image has the file" "hi" "$(t $R run --rm realcommitted:1 cat /marker)"
+check "export is a tar with the file" "marker" "$(t $R export fs1 | tar -t 2>&1)"
+t $R save -o /root/img.$$.tar realcommitted:1 >/dev/null; t $R rmi realcommitted:1 >/dev/null
+t $R load -i /root/img.$$.tar >/dev/null; rm -f /root/img.$$.tar   # the CLI loads quietly: check the result
+check "load brings the saved image back" "realcommitted" "$(t $R images)"
+$R rm -f fs1 >/dev/null 2>&1
+check "container prune answers" "Total reclaimed space" "$(t $R container prune -f)"
+check "system df lists images" "Images" "$(t $R system df)"
+
 echo "== cleanup"
 for c in $($D ps -a | awk 'NR>1{print $1}'); do $D rm -f $c >/dev/null 2>&1; done
 [ "$fails" = 0 ] && echo "ALL PASSED" || echo "$fails FAILED"

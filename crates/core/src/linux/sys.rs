@@ -160,3 +160,7 @@ pub fn become_user(uid: u32, gid: u32) -> Result<()> {
     check(unsafe { libc::setgid(gid) } as i64, || "setgid".into())?;
     check(unsafe { libc::setuid(uid) } as i64, || "setuid".into())
 }
+
+pub fn dup2(from: RawFd, to: RawFd) -> Result<()> {
+    check(unsafe { libc::dup2(from, to) } as i64, || format!("dup2 -> {to}"))
+}

@@ -1309,6 +1309,11 @@ mod tests {
                 context: ".".into()
             })
         );
+        let Command::Build(b) = p("build -q --label k=v --label a=b=c --secret id=tok,src=/f --platform linux/arm64 --pull --progress plain -t x .").unwrap() else { panic!() };
+        assert_eq!((b.quiet, b.platform.as_deref()), (true, Some("linux/arm64")));
+        assert_eq!(b.labels, [("k".to_string(), "v".to_string()), ("a".to_string(), "b=c".to_string())]);
+        assert_eq!(b.secrets, [("tok".to_string(), "/f".to_string())]);
+        assert!(p("build -t x --secret id=only .").is_err() && p("build -t x --label novalue .").is_err());
         assert_eq!(p("prune").unwrap(), Command::Prune);
         for bad in ["build .", "build -t x", "build -t x . .", "build -t x --build-arg A .", "build -t x --nope ."] {
             assert!(p(bad).is_err(), "{bad}");

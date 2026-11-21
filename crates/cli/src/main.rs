@@ -1,0 +1,82 @@
+mod api;
+mod commands;
+mod compose;
+mod vm;
+
+use docker_core::cli::{self, Command};
+use docker_core::platform;
+use std::{error::Error, process::ExitCode};
+
+/// Commands that end with the container's own exit code.
+fn exit_with(r: Result<i32, Box<dyn Error>>) -> Result<ExitCode, Box<dyn Error>> {
+    r.map(|c| ExitCode::from(c as u8))
+}
+
+fn main() -> ExitCode {
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // `docker --native ...`: use the Windows Job Object backend instead of the Linux VM
+    let native = args.first().is_some_and(|a| a == "--native");
+    if native {
+        args.remove(0);
+        if !cfg!(windows) {
+            eprintln!("docker: --native is only available on Windows");
+            return ExitCode::from(2);
+        }
+    }
+    let cmd = match cli::parse(args) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("docker: {e}\n\n{}", cli::USAGE);
+            return ExitCode::from(2);
+        }
+    };
+    let ok = |r: Result<(), Box<dyn Error>>| r.map(|()| ExitCode::SUCCESS);
+    let result = match cmd {
+        Command::Vm(v) => ok(vm::manage(&v)),
+        Command::Version => ok(commands::version()),
+        // Windows and macOS run Linux containers inside the VM
+        cmd if !cfg!(target_os = "linux") && !native => exit_with(vm::forward(cmd)),
+        Command::Run(cfg) => exit_with(platform::run(&cfg).map_err(Into::into)),
+        Command::Exec { id, cmd, tty } => exit_with(commands::exec(&id, &cmd, tty)),
+        Command::Ps { all } => ok(commands::ps(all)),
+        Command::Logs { follow, id } => ok(commands::logs(follow, &id)),
+        Command::Stop { id, timeout } => ok(commands::stop(&id, timeout)),
+        Command::Restart { id, timeout } => ok(commands::restart(&id, timeout)),
+        Command::Start(id) => ok(commands::start(&id)),
+        Command::Kill(id) => ok(commands::kill(&id)),
+        Command::Update { id, mem_mb, cpu, procs } => ok(commands::update(&id, mem_mb, cpu, procs)),
+        Command::Pause(id) => ok(commands::pause(&id, true)),
+        Command::Unpause(id) => ok(commands::pause(&id, false)),
+        Command::Wait(id) => ok(commands::wait(&id)),
+        Command::Top(id) => ok(commands::top(&id)),
+        Command::Rename { old, new } => ok(commands::rename(&old, &new)),
+        Command::Stats { no_stream, ids } => ok(commands::stats(no_stream, &ids)),
+        Command::Cp { src, dst } => ok(commands::cp(&src, &dst)),
+        Command::Volume(v) => ok(commands::volume(&v)),
+        Command::Network(n) => ok(commands::network(&n)),
+        Command::Compose(c) => ok(compose::run(&c)),
+        Command::Daemon { host } => ok(api::serve(host.as_deref())),
+        Command::SystemDf => ok(commands::system_df()),
+        Command::ContainerPrune => ok(commands::container_prune()),
+        Command::Rm { force, id } => ok(commands::rm(force, &id)),
+        Command::Inspect(id) => ok(commands::inspect(&id)),
+        Command::Login { server, user, password } => ok(commands::login(server.as_deref(), &user, password)),
+        Command::Logout(server) => ok(commands::logout(server.as_deref())),
+        Command::Push(n) => ok(commands::push(&n)),
+        Command::Tag { src, dst } => ok(commands::tag(&src, &dst)),
+        Command::Build(args) => ok(commands::build(&args)),
+        Command::Save { out, images } => ok(commands::save(&out, &images)),
+        Command::Load { input } => ok(commands::load(&input)),
+        Command::Prune => ok(commands::prune()),
+        Command::Pull(n) => ok(commands::pull(&n)),
+        Command::Images => ok(commands::images()),
+        Command::Rmi(n) => ok(commands::rmi(&n)),
+    };
+    match result {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("docker: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}

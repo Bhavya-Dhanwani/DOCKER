@@ -9,6 +9,7 @@ mod net;
 mod netlink;
 mod pty;
 mod rootfs;
+mod stdin;
 mod sys;
 
 use crate::{
@@ -22,10 +23,11 @@ use crate::{
 use cgroup::Cgroup;
 use docker_image::{Reference, Store};
 use rootfs::Source;
-use std::{fs, io::{Read, Write}, os::fd::OwnedFd, path::Path, process};
+use std::{fs, io::{Read, Write}, os::fd::{AsRawFd, OwnedFd}, path::Path, process};
 
 pub use build::build;
-pub use cp::cp;
+pub use cp::{cp, secure_join};
+pub use stdin::stdin_sock;
 pub use exec::exec;
 
 const DEFAULT_PATH: &str = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -275,6 +277,13 @@ fn run_container(cfg: &Config, mut plan: Plan) -> Result<i32> {
     let mut reg: Option<registry::Registration> = None;
     let mut helpers: Vec<i32> = vec![];
     let mut restarts = 0u32;
+    // stdin for a detached container without a terminal: a pipe a helper feeds from the `<id>.in` socket
+    let (stdin_rd, mut stdin_wr) = if cfg.detach && cfg.interactive && !cfg.tty && !cfg.ephemeral {
+        let (r, w) = sys::pipe()?;
+        (Some(r), Some(w))
+    } else {
+        (None, None)
+    };
     let code = loop {
         let cgroup = Cgroup::create(&id, cfg)?;
         let (rd, wr) = sys::pipe()?; // parent -> child: "you are in the cgroup, go"
@@ -288,6 +297,11 @@ fn run_container(cfg: &Config, mut plan: Plan) -> Result<i32> {
         let code = match sys::fork_newpid()? {
             sys::Fork::Child => {
                 drop((wr, nr_r, nd_w, ready));
+                if let Some(r) = &stdin_rd
+                    && sys::dup2(r.as_raw_fd(), 0).is_err()
+                {
+                    process::exit(127);
+                }
                 let link = tty.map(|(_, c)| c);
                 let net = ChildNet { mode, ip, ready: nr_w, go: nd_r };
                 let err = child(&plan, &id, cfg.rw, rd, net, link).unwrap_err();
@@ -329,6 +343,10 @@ fn run_container(cfg: &Config, mut plan: Plan) -> Result<i32> {
                     }
                     if let (Some(l), Some(ip)) = (listeners.take(), ip) {
                         helpers.push(sys::spawn_helper(move || l.serve_forever(ip))?);
+                    }
+                    if let Some(w) = stdin_wr.take() {
+                        let sid = id.clone();
+                        helpers.push(sys::spawn_helper(move || stdin::serve(&sid, w))?);
                     }
                     if let (Some(h), false) = (&health, cfg.ephemeral) {
                         let (hid, hc) = (id.clone(), h.clone());
@@ -407,6 +425,7 @@ impl Drop for RunDirs {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(Path::new("/run/rust-docker").join(&self.0));
         let _ = fs::remove_dir_all(Self::etc(&self.0));
+        let _ = fs::remove_file(stdin::stdin_sock(&self.0));
     }
 }
 

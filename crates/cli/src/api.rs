@@ -1,7 +1,8 @@
 //! `docker daemon`: a subset of the Docker Engine API (HTTP over a unix socket or TCP), so SDKs, IDE plugins and
 //! scripts that speak Docker can drive this engine. Covered: /_ping /version /info, containers (list, create,
-//! inspect, start, stop, restart, kill, pause, unpause, wait, logs, remove), images (list, inspect, pull, tag,
-//! remove), volumes and networks. Not covered: exec, attach, build, events, stats streams, swarm.
+//! inspect, start, stop, restart, kill, pause, unpause, wait, logs, attach (with stdin), exec, top, stats, changes,
+//! export, archive, commit, prune, remove), images (list, inspect, history, pull, tag, load, save, prune, build,
+//! remove), volumes, networks, events, system/df. Not covered: swarm, image search (always empty).
 //!
 //! The daemon is multi-threaded, so it never forks containers itself: start/stop/pull/remove run this same binary
 //! as a subprocess (`docker start <id>` ...), whose detached supervisor then lives on independently.
@@ -14,7 +15,7 @@ use docker_core::{
 use docker_image::{Health, Reference, Store};
 use serde_json::{json, Map, Value};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     error::Error,
     sync::{mpsc, Mutex, OnceLock},
     fs,
@@ -53,16 +54,24 @@ pub struct Request {
 /// A connection we can read from on a second thread while we write to it.
 pub trait Duplex: Read + Write {
     fn reader(&self) -> Option<Box<dyn Read + Send>>;
+    /// Shut the connection down for everybody holding a clone of it (a stdin-forwarding thread would keep it open).
+    fn close(&self);
 }
 impl Duplex for std::net::TcpStream {
     fn reader(&self) -> Option<Box<dyn Read + Send>> {
         self.try_clone().ok().map(|c| Box::new(c) as _)
+    }
+    fn close(&self) {
+        let _ = self.shutdown(std::net::Shutdown::Both);
     }
 }
 #[cfg(unix)]
 impl Duplex for std::os::unix::net::UnixStream {
     fn reader(&self) -> Option<Box<dyn Read + Send>> {
         self.try_clone().ok().map(|c| Box::new(c) as _)
+    }
+    fn close(&self) {
+        let _ = self.shutdown(std::net::Shutdown::Both);
     }
 }
 
@@ -88,7 +97,21 @@ pub fn pct_decode(s: &str) -> String {
 }
 
 fn parse_query(q: &str) -> HashMap<String, String> {
-    q.split('&').filter(|p| !p.is_empty()).map(|p| p.split_once('=').map_or((pct_decode(p), String::new()), |(k, v)| (pct_decode(k), pct_decode(v)))).collect()
+    let mut m: HashMap<String, String> = HashMap::new();
+    for p in q.split('&').filter(|p| !p.is_empty()) {
+        let (k, v) = p.split_once('=').map_or((pct_decode(p), String::new()), |(k, v)| (pct_decode(k), pct_decode(v)));
+        match m.get_mut(&k) {
+            // `names` (images/get) repeats; joined by newlines. Every other repeated key keeps its last value.
+            Some(old) if k == "names" => {
+                old.push('\n');
+                old.push_str(&v);
+            }
+            _ => {
+                m.insert(k, v);
+            }
+        }
+    }
+    m
 }
 
 /// `/v1.43/containers/json?all=1` -> ("/containers/json", {all: 1})
@@ -179,7 +202,12 @@ fn status_text(code: u16) -> &'static str {
 }
 
 fn head(w: &mut dyn Write, code: u16, ctype: &str, len: Option<usize>) -> io::Result<()> {
-    write!(w, "HTTP/1.1 {code} {}\r\nApi-Version: {API_VERSION}\r\nServer: Sasta Docker\r\nDocker-Experimental: false\r\nContent-Type: {ctype}\r\n", status_text(code))?;
+    head_with(w, code, ctype, len, "")
+}
+
+/// `extra` is zero or more complete header lines (each ending in CRLF).
+fn head_with(w: &mut dyn Write, code: u16, ctype: &str, len: Option<usize>, extra: &str) -> io::Result<()> {
+    write!(w, "HTTP/1.1 {code} {}\r\nApi-Version: {API_VERSION}\r\nServer: Sasta Docker\r\nDocker-Experimental: false\r\nContent-Type: {ctype}\r\n{extra}", status_text(code))?;
     match len {
         Some(n) => write!(w, "Content-Length: {n}\r\n\r\n"),
         None => write!(w, "Transfer-Encoding: chunked\r\n\r\n"),
@@ -301,7 +329,7 @@ fn container_summary(e: &Entry) -> Value {
     json!({
         "Id": e.id, "Names": names_of(e), "Image": e.image, "ImageID": fake_id(&e.image),
         "Command": e.cmd.join(" "), "Created": e.started_unix, "State": state_of(e), "Status": status_of(e),
-        "Ports": port_list(e), "Labels": {}, "HostConfig": { "NetworkMode": e.config.as_ref().and_then(|c| c.network_name.clone()).unwrap_or_else(|| "bridge".into()) },
+        "Ports": port_list(e), "Labels": labels_of(&e.id), "HostConfig": { "NetworkMode": e.config.as_ref().and_then(|c| c.network_name.clone()).unwrap_or_else(|| "bridge".into()) },
     })
 }
 
@@ -333,7 +361,7 @@ fn container_inspect(e: &Entry) -> Value {
         "Mounts": c.volumes.iter().map(|v| json!({ "Type": "bind", "Source": v.host, "Destination": v.container, "RW": !v.ro })).collect::<Vec<_>>(),
         "Config": {
             "Hostname": "container", "User": c.user, "Tty": c.tty, "Env": if e.env.is_empty() { &c.env } else { &e.env }, "Cmd": e.cmd, "Image": e.image,
-            "WorkingDir": e.workdir, "Entrypoint": c.entrypoint, "ExposedPorts": exposed, "Labels": {},
+            "WorkingDir": e.workdir, "Entrypoint": c.entrypoint, "ExposedPorts": exposed, "Labels": labels_of(&e.id), "OpenStdin": c.interactive,
         },
         "NetworkSettings": { "IPAddress": e.ip.clone().unwrap_or_default(), "Networks": nets, "Ports": {} },
     })
@@ -384,6 +412,7 @@ pub fn config_from_create(body: &Value, ncpu: u64) -> Result<Config, String> {
     cfg.workdir = body.get("WorkingDir").and_then(Value::as_str).filter(|s| !s.is_empty()).map(String::from);
     cfg.user = body.get("User").and_then(Value::as_str).filter(|s| !s.is_empty()).map(String::from);
     cfg.tty = body.get("Tty").and_then(Value::as_bool).unwrap_or(false);
+    cfg.interactive = body.get("OpenStdin").and_then(Value::as_bool).unwrap_or(false);
 
     for b in strings(host.get("Binds")) {
         // "src:dst" or "src:dst:opts" (opts are comma-separated: ro, rw, z, ...)
@@ -505,7 +534,10 @@ fn create_container(r: &Request) -> Reply {
         }
     }
     match registry::create(&cfg) {
-        Ok(e) => Reply::Json(201, json!({ "Id": e.id, "Warnings": [] })),
+        Ok(e) => {
+            save_meta(&e.id, &body);
+            Reply::Json(201, json!({ "Id": e.id, "Warnings": [] }))
+        }
         Err(e) => fail(500, e.to_string()),
     }
 }
@@ -574,6 +606,10 @@ fn logs(r: &Request, e: &Entry, w: &mut dyn Write, attach: bool) -> io::Result<R
     #[cfg(target_os = "linux")]
     if attach && tty && r.upgrade {
         return attach_tty(r, e, w);
+    }
+    #[cfg(target_os = "linux")]
+    if attach && !tty && r.upgrade && e.config.as_ref().is_some_and(|c| c.interactive) {
+        forward_stdin(r, e);
     }
     let upgrade = attach && r.upgrade;
     start_stream(w, upgrade, if tty { "application/vnd.docker.raw-stream" } else { "application/vnd.docker.multiplexed-stream" })?;
@@ -709,9 +745,13 @@ fn route(r: &Request, w: &mut dyn Write) -> io::Result<Reply> {
         ("GET", ["info"]) => Reply::Json(200, info()),
 
         ("GET", ["containers", "json"]) => {
-            let all = q_flag(r, "all");
-            let mut v: Vec<Entry> = registry::list().into_iter().filter(|e| all || state_of(e) == "running" || state_of(e) == "restarting").collect();
+            let f = query_filters(r);
+            let all = q_flag(r, "all") || !filter_values(&f, "status").is_empty();
+            let mut v: Vec<Entry> = registry::list().into_iter().filter(|e| (all || state_of(e) == "running" || state_of(e) == "restarting") && container_matches(&f, e, &labels_of(&e.id))).collect();
             v.reverse(); // newest first, like Docker
+            if let Some(n) = r.query.get("limit").and_then(|l| l.parse::<usize>().ok()).filter(|n| *n > 0) {
+                v.truncate(n);
+            }
             Reply::Json(200, Value::Array(v.iter().map(container_summary).collect()))
         }
         ("POST", ["containers", "create"]) => create_container(r),
@@ -777,7 +817,10 @@ fn route(r: &Request, w: &mut dyn Write) -> io::Result<Reply> {
             Ok(e) => {
                 let args: Vec<&str> = if q_flag(r, "force") { vec!["rm", "-f", e.id.as_str()] } else { vec!["rm", e.id.as_str()] };
                 match cli(&args) {
-                    Ok(_) => Reply::Empty(204),
+                    Ok(_) => {
+                        let _ = fs::remove_file(meta_path(&e.id));
+                        Reply::Empty(204)
+                    }
                     Err(m) => fail(500, m),
                 }
             }
@@ -785,6 +828,47 @@ fn route(r: &Request, w: &mut dyn Write) -> io::Result<Reply> {
         },
         ("POST", ["containers", id, "attach"]) => match container(id) {
             Ok(e) => return logs(r, &e, w, true),
+            Err(rep) => rep,
+        },
+        ("GET", ["containers", id, "top"]) => match container(id) {
+            Ok(e) => top(&e),
+            Err(rep) => rep,
+        },
+        ("GET", ["containers", id, "stats"]) => match container(id) {
+            Ok(e) => return stats(r, &e, w),
+            Err(rep) => rep,
+        },
+        ("GET", ["containers", id, "changes"]) => match container(id) {
+            Ok(e) => fsapi::changes(&e),
+            Err(rep) => rep,
+        },
+        ("GET", ["containers", id, "export"]) => match container(id) {
+            Ok(e) => return fsapi::export(&e, w),
+            Err(rep) => rep,
+        },
+        ("GET" | "HEAD", ["containers", id, "archive"]) => match container(id) {
+            Ok(e) => return fsapi::archive(r, &e, w),
+            Err(rep) => rep,
+        },
+        ("PUT", ["containers", id, "archive"]) => match container(id) {
+            Ok(e) => fsapi::put_archive(r, &e),
+            Err(rep) => rep,
+        },
+        ("POST", ["commit"]) => fsapi::commit(r),
+        ("POST", ["containers", "prune"]) => prune_containers(),
+        ("POST", ["images", "prune"]) => prune_images(r),
+        ("POST", ["volumes", "prune"]) => {
+            let (names, freed) = volumes::prune();
+            Reply::Json(200, json!({ "VolumesDeleted": names, "SpaceReclaimed": freed }))
+        }
+        ("POST", ["networks", "prune"]) => prune_networks(),
+        ("GET", ["system", "df"]) => system_df(),
+        ("GET", ["images", "search"]) => Reply::Json(200, json!([])), // no registry search: always empty
+        ("POST", ["images", "load"]) => return images_load(r, w),
+        ("GET", ["images", "get"]) => return images_get(&r.query.get("names").map(|n| n.split('\n').map(String::from).collect::<Vec<_>>()).unwrap_or_default(), w),
+        ("GET", _) if image_name(&r.path, "/get").is_some() => return images_get(&[image_name(&r.path, "/get").unwrap_or("").to_string()], w),
+        ("GET", _) if image_name(&r.path, "/history").is_some() => match find_image(image_name(&r.path, "/history").unwrap_or("")) {
+            Ok(m) => Reply::Json(200, history(&m)),
             Err(rep) => rep,
         },
         ("POST", ["containers", id, "exec"]) => exec_create(r, id),
@@ -813,7 +897,13 @@ fn route(r: &Request, w: &mut dyn Write) -> io::Result<Reply> {
             Reply::Empty(200)
         }
         ("POST", ["containers", id, "resize"]) | ("POST", ["exec", id, "resize"]) => match container(id) {
-            Ok(_) => Reply::Empty(200),
+            Ok(e) => {
+                let n = |k: &str| r.query.get(k).and_then(|v| v.parse::<u16>().ok()).unwrap_or(0);
+                if e.running() && e.config.as_ref().is_some_and(|c| c.tty) {
+                    fsapi::resize_tty(&e, n("h"), n("w"));
+                }
+                Reply::Empty(200)
+            }
             Err(_) if execs().lock().is_ok_and(|m| m.contains_key(*id)) => Reply::Empty(200),
             Err(rep) => rep,
         },
@@ -951,6 +1041,7 @@ fn serve_connection<S: Duplex>(stream: S) {
             Ok(Reply::Streamed) => Ok(()),
             Ok(Reply::Hijacked) => {
                 let _ = w.flush();
+                reader.get_ref().close();
                 break; // the client reads until we close
             }
             Err(e) => {
@@ -1203,8 +1294,8 @@ pub fn event_json(line: &str) -> Option<Value> {
 
 fn events(r: &Request, w: &mut dyn Write) -> io::Result<Reply> {
     head(w, 200, "application/json", None)?;
-    let until: Option<u64> = r.query.get("until").and_then(|u| u.parse().ok());
-    let since: Option<u64> = r.query.get("since").and_then(|u| u.parse().ok());
+    let secs = |k: &str| r.query.get(k).and_then(|u| u.parse::<f64>().ok()).map(|f| f as u64);
+    let (until, since, filters) = (secs("until"), secs("since"), query_filters(r));
     let path = registry::events_path();
     // by default only what happens from now on; `since` replays the log from that time
     let mut offset = if since.is_some() { 0 } else { fs::metadata(&path).map_or(0, |m| m.len()) };
@@ -1220,7 +1311,7 @@ fn events(r: &Request, w: &mut dyn Write) -> io::Result<Reply> {
             partial.push_str(&String::from_utf8_lossy(&buf));
             while let Some(i) = partial.find('\n') {
                 let l: String = partial.drain(..=i).collect();
-                if let Some(e) = event_json(&l).filter(|e| since.is_none_or(|s| e["time"].as_u64().unwrap_or(0) >= s)) {
+                if let Some(e) = event_json(&l).filter(|e| since.is_none_or(|s| e["time"].as_u64().unwrap_or(0) >= s) && event_matches(&filters, e)) {
                     chunk(w, format!("{e}\n").as_bytes())?;
                 }
             }
@@ -1302,6 +1393,853 @@ fn build(r: &Request, w: &mut dyn Write) -> io::Result<Reply> {
     }
     end_chunks(w)?;
     Ok(Reply::Streamed)
+}
+
+// ---- filters (containers/json, events)
+
+/// The values of one key of an API `filters` object: `{"status":["running"]}` or the legacy `{"status":{"running":true}}`.
+pub fn filter_values(filters: &Value, key: &str) -> Vec<String> {
+    match filters.get(key) {
+        Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+        Some(Value::Object(o)) => o.iter().filter(|(_, v)| v.as_bool().unwrap_or(true)).map(|(k, _)| k.clone()).collect(),
+        _ => vec![],
+    }
+}
+
+fn query_filters(r: &Request) -> Value {
+    r.query.get("filters").and_then(|f| serde_json::from_str(f).ok()).unwrap_or(Value::Null)
+}
+
+/// Docker matches `name` filters as regular expressions; `^`/`$` anchors and plain substrings cover what clients send.
+pub fn name_matches(pattern: &str, name: &str) -> bool {
+    let (start, p) = pattern.strip_prefix('^').map_or((false, pattern), |p| (true, p));
+    let (end, p) = p.strip_suffix('$').map_or((false, p), |p| (true, p));
+    let (p, n) = (p.trim_start_matches('/'), name.trim_start_matches('/'));
+    match (start, end) {
+        (true, true) => n == p,
+        (true, false) => n.starts_with(p),
+        (false, true) => n.ends_with(p),
+        _ => n.contains(p),
+    }
+}
+
+/// Does image `a` (a name as stored) mean the same as `b` (a name, or an id / id prefix as clients send)?
+fn same_image(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    if let (Ok(x), Ok(y)) = (Reference::parse(a), Reference::parse(b))
+        && x.display() == y.display()
+    {
+        return true;
+    }
+    let hex = b.strip_prefix("sha256:").unwrap_or(b);
+    hex.len() >= 4 && hex.chars().all(|c| c.is_ascii_hexdigit()) && fake_id(a).starts_with(hex)
+}
+
+/// Apply the `filters` of `GET /containers/json` (status, name, id, ancestor, exited, label).
+pub fn container_matches(f: &Value, e: &Entry, labels: &BTreeMap<String, String>) -> bool {
+    let any = |key: &str, test: &dyn Fn(&str) -> bool| {
+        let v = filter_values(f, key);
+        v.is_empty() || v.iter().any(|x| test(x))
+    };
+    any("status", &|s| state_of(e) == s)
+        && any("name", &|n| name_matches(n, e.name.as_deref().unwrap_or("")))
+        && any("id", &|i| e.id.starts_with(i))
+        && any("ancestor", &|a| same_image(&e.image, a))
+        && any("exited", &|c| state_of(e) == "exited" && e.exit_code.is_some_and(|x| x.to_string() == c))
+        && filter_values(f, "label").iter().all(|l| match l.split_once('=') {
+            Some((k, v)) => labels.get(k).is_some_and(|x| x == v),
+            None => labels.contains_key(l.as_str()),
+        })
+}
+
+/// Apply the `filters` of `GET /events` (type, event, container, image) to one event object.
+pub fn event_matches(f: &Value, ev: &Value) -> bool {
+    let s = |p: &str| ev.pointer(p).and_then(Value::as_str).unwrap_or("");
+    let any = |key: &str, test: &dyn Fn(&str) -> bool| {
+        let v = filter_values(f, key);
+        v.is_empty() || v.iter().any(|x| test(x))
+    };
+    any("type", &|t| t == s("/Type"))
+        && any("event", &|a| a == s("/Action"))
+        && any("container", &|c| s("/id").starts_with(c) || s("/Actor/Attributes/name") == c.trim_start_matches('/'))
+        && any("image", &|i| same_image(s("/Actor/Attributes/image"), i))
+}
+
+// ---- what the API keeps per container beyond the registry: labels and StdinOnce (a small sidecar file)
+
+fn meta_path(id: &str) -> std::path::PathBuf {
+    registry::data_dir().join("api-meta").join(format!("{id}.json"))
+}
+
+fn meta_of(id: &str) -> Value {
+    fs::read(meta_path(id)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null)
+}
+
+fn labels_from(meta: &Value) -> BTreeMap<String, String> {
+    meta.get("Labels").and_then(Value::as_object).map(|m| m.iter().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).collect()).unwrap_or_default()
+}
+
+fn labels_of(id: &str) -> BTreeMap<String, String> {
+    labels_from(&meta_of(id))
+}
+
+fn save_meta(id: &str, body: &Value) {
+    let meta = json!({ "Labels": body.get("Labels").cloned().unwrap_or(json!({})), "StdinOnce": body.get("StdinOnce").and_then(Value::as_bool).unwrap_or(false) });
+    let p = meta_path(id);
+    if let Some(d) = p.parent() {
+        let _ = fs::create_dir_all(d);
+    }
+    let _ = fs::write(p, meta.to_string());
+}
+
+// ---- top, stats
+
+fn top(e: &Entry) -> Reply {
+    if !e.running() {
+        return fail(409, format!("Container {} is not running", e.id));
+    }
+    let procs = docker_core::platform::top(&e.id).unwrap_or_default();
+    Reply::Json(200, json!({
+        "Titles": ["UID", "PID", "PPID", "CMD"],
+        "Processes": procs.iter().map(|p| [p.uid.to_string(), p.pid.to_string(), p.ppid.to_string(), p.cmd.clone()]).collect::<Vec<_>>(),
+    }))
+}
+
+/// Total CPU time of the whole host in ns: what clients divide a container's CPU time by.
+/// ponytail: assumes 100 ticks per second (true on every Linux we run on).
+fn host_cpu_ns() -> u64 {
+    let t = fs::read_to_string("/proc/stat").unwrap_or_default();
+    t.lines().next().map_or(0, |l| l.split_whitespace().skip(1).take(8).filter_map(|x| x.parse::<u64>().ok()).sum::<u64>() * 10_000_000)
+}
+
+#[derive(Clone, Copy, Default)]
+struct Sample {
+    at: u64,
+    cpu_ns: u64,
+    system_ns: u64,
+    mem: u64,
+    pids: u32,
+}
+
+fn sample(id: &str) -> Option<Sample> {
+    docker_core::platform::stats(id).map(|s| Sample { at: registry::now_unix(), cpu_ns: s.cpu_ms * 1_000_000, system_ns: host_cpu_ns(), mem: s.mem_bytes, pids: s.procs })
+}
+
+/// One `GET /containers/{id}/stats` object (`prev` is the sample before, all zero for the first).
+fn stats_json(e: &Entry, prev: &Sample, cur: &Sample, ncpu: u64, mem_limit: u64) -> Value {
+    let cpu = |s: &Sample| json!({
+        "cpu_usage": { "total_usage": s.cpu_ns, "usage_in_kernelmode": 0, "usage_in_usermode": s.cpu_ns },
+        "system_cpu_usage": s.system_ns, "online_cpus": ncpu,
+        "throttling_data": { "periods": 0, "throttled_periods": 0, "throttled_time": 0 },
+    });
+    let time = |s: &Sample| if s.at == 0 { "0001-01-01T00:00:00Z".to_string() } else { rfc3339(s.at) };
+    json!({
+        "read": time(cur), "preread": time(prev), "name": names_of(e)[0], "id": e.id,
+        "pids_stats": { "current": cur.pids },
+        "cpu_stats": cpu(cur), "precpu_stats": cpu(prev),
+        "memory_stats": { "usage": cur.mem, "max_usage": cur.mem, "limit": mem_limit, "stats": { "cache": 0 } },
+        "blkio_stats": {}, "storage_stats": {}, "networks": {},
+    })
+}
+
+fn stats(r: &Request, e: &Entry, w: &mut dyn Write) -> io::Result<Reply> {
+    let stream = r.query.get("stream").is_none_or(|v| !matches!(v.as_str(), "0" | "false"));
+    let ncpu = thread::available_parallelism().map_or(1, |n| n.get() as u64);
+    let limit = e.mem_bytes.unwrap_or_else(host_memory);
+    if !stream {
+        // one-shot calls have no previous sample; otherwise take two a moment apart so CPU usage can be computed
+        let first = if q_flag(r, "one-shot") { Sample::default() } else { sample(&e.id).unwrap_or_default() };
+        if first.at != 0 {
+            thread::sleep(Duration::from_millis(500));
+        }
+        return Ok(Reply::Json(200, stats_json(e, &first, &sample(&e.id).unwrap_or_default(), ncpu, limit)));
+    }
+    head(w, 200, "application/json", None)?;
+    let mut prev = Sample::default();
+    loop {
+        let cur = sample(&e.id);
+        chunk(w, format!("{}\n", stats_json(e, &prev, &cur.unwrap_or_default(), ncpu, limit)).as_bytes())?;
+        let Some(cur) = cur else { break }; // the container is gone: the zero frame above was the last
+        prev = cur;
+        thread::sleep(Duration::from_secs(1));
+    }
+    end_chunks(w)?;
+    Ok(Reply::Streamed)
+}
+
+// ---- images: history, load, save, prune; system df
+
+fn history(m: &docker_image::ImageMeta) -> Value {
+    // the store keeps no build history: one row per layer, newest first
+    let id = format!("sha256:{}", fake_id(&m.name));
+    Value::Array(
+        m.layers.iter().enumerate().rev().map(|(i, l)| json!({
+            "Id": if i + 1 == m.layers.len() { id.as_str() } else { "<missing>" }, "Created": 0, "CreatedBy": "",
+            "Tags": if i + 1 == m.layers.len() { json!([m.name]) } else { json!([]) }, "Size": l.size, "Comment": "",
+        })).collect(),
+    )
+}
+
+fn tmp_file(tag: &str) -> std::path::PathBuf {
+    let dir = registry::data_dir().join("tmp");
+    let _ = fs::create_dir_all(&dir);
+    dir.join(format!("api-{tag}-{}", registry::new_id()))
+}
+
+/// `POST /images/load`: the body is a `docker save` archive (plain or gzipped).
+fn images_load(r: &Request, w: &mut dyn Write) -> io::Result<Reply> {
+    let file = tmp_file("load.tar");
+    if r.body.starts_with(&[0x1f, 0x8b]) {
+        io::copy(&mut flate2::read::GzDecoder::new(&r.body[..]), &mut fs::File::create(&file)?)?;
+    } else {
+        fs::write(&file, &r.body)?;
+    }
+    let result = cli(&["load", "-i", &file.to_string_lossy()]);
+    let _ = fs::remove_file(&file);
+    head(w, 200, "application/json", None)?;
+    let line = |v: Value| format!("{v}\r\n").into_bytes();
+    match result {
+        Ok(out) if !q_flag(r, "quiet") => {
+            for l in out.lines() {
+                chunk(w, &line(json!({ "stream": format!("{l}\n") })))?;
+            }
+        }
+        Ok(_) => {}
+        Err(m) => chunk(w, &line(json!({ "errorDetail": { "message": m }, "error": m })))?,
+    }
+    end_chunks(w)?;
+    Ok(Reply::Streamed)
+}
+
+/// `GET /images/{name}/get` and `GET /images/get?names=a&names=b`: a `docker save` archive.
+fn images_get(names: &[String], w: &mut dyn Write) -> io::Result<Reply> {
+    let mut resolved = vec![];
+    for n in names {
+        match find_image(n) {
+            Ok(m) => resolved.push(m.name),
+            Err(rep) => return Ok(rep),
+        }
+    }
+    if resolved.is_empty() {
+        return Ok(fail(400, "names is required"));
+    }
+    let file = tmp_file("save.tar");
+    let mut args = vec!["save".to_string(), "-o".into(), file.to_string_lossy().into_owned()];
+    args.extend(resolved);
+    let a: Vec<&str> = args.iter().map(String::as_str).collect();
+    if let Err(m) = cli(&a) {
+        let _ = fs::remove_file(&file);
+        return Ok(fail(500, m));
+    }
+    let mut f = fs::File::open(&file)?;
+    let _ = fs::remove_file(&file); // the open handle keeps it readable
+    head(w, 200, "application/x-tar", None)?;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        chunk(w, &buf[..n])?;
+    }
+    end_chunks(w)?;
+    Ok(Reply::Streamed)
+}
+
+fn prune_containers() -> Reply {
+    let mut gone = vec![];
+    for e in registry::list().into_iter().filter(|e| !e.running() && !e.restarting) {
+        registry::delete(&e.id);
+        let _ = fs::remove_file(meta_path(&e.id));
+        gone.push(e.id);
+    }
+    Reply::Json(200, json!({ "ContainersDeleted": gone, "SpaceReclaimed": 0 }))
+}
+
+/// Images are all tagged here, so only `dangling=false` (every image no container uses) removes anything.
+fn prune_images(r: &Request) -> Reply {
+    let f = query_filters(r);
+    let (mut deleted, mut freed) = (vec![], 0);
+    if filter_values(&f, "dangling").iter().any(|v| v == "false" || v == "0") {
+        let used: Vec<String> = registry::list().into_iter().map(|e| e.image).collect();
+        for m in store().list() {
+            if used.iter().any(|u| same_image(u, &m.name)) {
+                continue;
+            }
+            if let Ok(rf) = Reference::parse(&m.name)
+                && let Ok(n) = store().remove(&rf)
+            {
+                freed += n;
+                deleted.push(json!({ "Untagged": m.name }));
+            }
+        }
+    }
+    Reply::Json(200, json!({ "ImagesDeleted": deleted, "SpaceReclaimed": freed }))
+}
+
+fn prune_networks() -> Reply {
+    let gone: Vec<String> = networks::list().into_iter().filter(|n| networks::members(Some(n), "").is_empty() && networks::remove(n).is_ok()).collect();
+    Reply::Json(200, json!({ "NetworksDeleted": gone }))
+}
+
+fn system_df() -> Reply {
+    let imgs = store().list();
+    let all = registry::list();
+    let layers: HashMap<&str, u64> = imgs.iter().flat_map(|m| m.layers.iter().map(|l| (l.digest.as_str(), l.size))).collect();
+    let images: Vec<Value> = imgs.iter().map(|m| {
+        let mut v = image_json(m);
+        v["SharedSize"] = json!(0);
+        v["Containers"] = json!(all.iter().filter(|e| same_image(&e.image, &m.name)).count());
+        v
+    }).collect();
+    let volumes: Vec<Value> = volumes::list().iter().map(|v| json!({
+        "Name": v.name, "Driver": "local", "Mountpoint": volumes::path(&v.name).to_string_lossy(), "Scope": "local", "Labels": {},
+        "UsageData": { "Size": v.size, "RefCount": volumes::used_by(&v.name).len() },
+    })).collect();
+    let containers: Vec<Value> = all.iter().map(|e| {
+        let mut v = container_summary(e);
+        v["SizeRw"] = json!(0);
+        v["SizeRootFs"] = json!(0);
+        v
+    }).collect();
+    Reply::Json(200, json!({ "LayersSize": layers.values().sum::<u64>(), "Images": images, "Containers": containers, "Volumes": volumes, "BuildCache": [] }))
+}
+
+// ---- base64 (the X-Docker-Container-Path-Stat header) and chunked tar output
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn base64(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for c in data.chunks(3) {
+        let n = (u32::from(c[0]) << 16) | (u32::from(*c.get(1).unwrap_or(&0)) << 8) | u32::from(*c.get(2).unwrap_or(&0));
+        for i in 0..4 {
+            out.push(if i <= c.len() { T[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+        }
+    }
+    out
+}
+
+/// A writer that sends everything as HTTP chunks.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct Chunked<'a>(&'a mut dyn Write);
+
+impl Write for Chunked<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        chunk(self.0, buf)?;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
+// ---- commit overrides: `changes=` instructions and the Config of the request body
+
+/// Apply one Dockerfile-style `--change` (CMD, ENTRYPOINT, ENV, WORKDIR, USER, LABEL, EXPOSE) to image metadata.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn apply_change(meta: &mut docker_image::ImageMeta, line: &str) -> Result<(), String> {
+    let line = line.trim();
+    let (kw, rest) = line.split_once(char::is_whitespace).map_or((line, ""), |(k, r)| (k, r.trim()));
+    let command = |rest: &str| serde_json::from_str::<Vec<String>>(rest).unwrap_or_else(|_| vec!["/bin/sh".into(), "-c".into(), rest.into()]);
+    // `K=V K2=V2` or the old `K V` form
+    let pairs = |rest: &str| -> Result<Vec<(String, String)>, String> {
+        if rest.split_whitespace().next().is_some_and(|w| w.contains('=')) {
+            docker_image::dockerfile::words(rest).map_err(|e| e.to_string())?.iter().map(|w| w.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())).ok_or_else(|| format!("bad key=value {w:?}"))).collect()
+        } else {
+            Ok(rest.split_once(char::is_whitespace).map(|(k, v)| vec![(k.to_string(), v.trim().to_string())]).unwrap_or_default())
+        }
+    };
+    match kw.to_ascii_uppercase().as_str() {
+        "CMD" => meta.cmd = command(rest),
+        "ENTRYPOINT" => meta.entrypoint = command(rest),
+        "WORKDIR" => meta.working_dir = rest.to_string(),
+        "USER" => meta.user = rest.to_string(),
+        "ENV" => set_env(&mut meta.env, pairs(rest)?.into_iter().map(|(k, v)| format!("{k}={v}"))),
+        "LABEL" => meta.labels.extend(pairs(rest)?),
+        "EXPOSE" => {
+            for p in rest.split_whitespace() {
+                let p = if p.contains('/') { p.to_string() } else { format!("{p}/tcp") };
+                if !meta.exposed.contains(&p) {
+                    meta.exposed.push(p);
+                }
+            }
+        }
+        other => return Err(format!("unsupported change instruction {other:?}")),
+    }
+    Ok(())
+}
+
+/// Add `K=V` entries, replacing earlier ones with the same key.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn set_env(env: &mut Vec<String>, new: impl Iterator<Item = String>) {
+    for kv in new {
+        let key = kv.split('=').next().unwrap_or("").to_string();
+        env.retain(|e| e.split('=').next() != Some(key.as_str()));
+        env.push(kv);
+    }
+}
+
+/// The container Config of a commit request overrides the image's own (Cmd, Entrypoint, Env, WorkingDir, User, Labels, ExposedPorts).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn apply_config(meta: &mut docker_image::ImageMeta, body: &Value) {
+    let list = |v: &Value| match v {
+        Value::String(s) => Some(vec![s.clone()]),
+        Value::Array(_) => Some(strings(Some(v))),
+        _ => None,
+    };
+    if let Some(c) = body.get("Cmd").and_then(list) {
+        meta.cmd = c;
+    }
+    if let Some(c) = body.get("Entrypoint").and_then(list) {
+        meta.entrypoint = c;
+    }
+    set_env(&mut meta.env, strings(body.get("Env")).into_iter());
+    if let Some(d) = body.get("WorkingDir").and_then(Value::as_str).filter(|d| !d.is_empty()) {
+        meta.working_dir = d.into();
+    }
+    if let Some(u) = body.get("User").and_then(Value::as_str).filter(|u| !u.is_empty()) {
+        meta.user = u.into();
+    }
+    meta.labels.extend(labels_from(body));
+    if let Some(Value::Object(p)) = body.get("ExposedPorts") {
+        for k in p.keys() {
+            if !meta.exposed.contains(k) {
+                meta.exposed.push(k.clone());
+            }
+        }
+    }
+}
+
+// ---- the container's filesystem (Linux: through /proc/<pid>/root, the root as the host sees it)
+
+#[cfg(target_os = "linux")]
+mod fsapi {
+    use super::*;
+    use docker_core::platform::secure_join;
+    use docker_image::LayerRef;
+    use std::{
+        collections::HashSet,
+        os::unix::fs::{lchown, symlink, FileTypeExt, MetadataExt, PermissionsExt},
+        path::PathBuf,
+    };
+
+    /// What `diff` compares: copy-up keeps mtime, so an untouched file is identical in the merged view and its lower layer.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    pub struct Meta {
+        kind: char, // d dir, f file, l symlink, w overlay whiteout, o other
+        size: u64,
+        mtime: (i64, i64),
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    }
+
+    fn meta(md: &fs::Metadata) -> Meta {
+        let ft = md.file_type();
+        let kind = if ft.is_dir() {
+            'd'
+        } else if ft.is_symlink() {
+            'l'
+        } else if ft.is_file() {
+            'f'
+        } else if ft.is_char_device() && md.rdev() == 0 {
+            'w'
+        } else {
+            'o'
+        };
+        Meta { kind, size: if kind == 'f' { md.len() } else { 0 }, mtime: (md.mtime(), md.mtime_nsec()), mode: md.mode() & 0o7777, uid: md.uid(), gid: md.gid() }
+    }
+
+    /// mountinfo writes space, tab, newline and backslash as `\040` `\011` `\012` `\134`.
+    pub fn unescape(s: &str) -> String {
+        let b = s.as_bytes();
+        let (mut out, mut i) = (vec![], 0);
+        while i < b.len() {
+            let oct = (b[i] == b'\\').then(|| s.get(i + 1..i + 4).and_then(|o| u8::from_str_radix(o, 8).ok())).flatten();
+            match oct {
+                Some(v) => {
+                    out.push(v);
+                    i += 4;
+                }
+                None => {
+                    out.push(b[i]);
+                    i += 1;
+                }
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// Mount points inside the container (its /proc, /dev, volumes ...) other than "/".
+    fn mounts(pid: u32) -> HashSet<String> {
+        fs::read_to_string(format!("/proc/{pid}/mountinfo")).unwrap_or_default().lines().filter_map(|l| l.split(' ').nth(4)).filter(|m| *m != "/").map(unescape).collect()
+    }
+
+    /// Every path under `root` ("/a/b" style) with its metadata; mount points are listed but not entered.
+    fn scan(root: &Path, mounts: &HashSet<String>) -> BTreeMap<String, Meta> {
+        fn walk(root: &Path, rel: &str, mounts: &HashSet<String>, out: &mut BTreeMap<String, Meta>) {
+            let Ok(rd) = fs::read_dir(root.join(rel.trim_start_matches('/'))) else { return };
+            for e in rd.flatten() {
+                let p = format!("{rel}/{}", e.file_name().to_string_lossy());
+                let Ok(md) = e.metadata() else { continue };
+                let m = meta(&md);
+                out.insert(p.clone(), m);
+                if m.kind == 'd' && !mounts.contains(&p) {
+                    walk(root, &p, mounts, out);
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(root, "", mounts, &mut out);
+        out
+    }
+
+    /// What the image's layers show together (bottom first; whiteouts delete, opaque dirs are not honoured).
+    fn lower_view(layers: &[PathBuf]) -> BTreeMap<String, Meta> {
+        let mut view = BTreeMap::new();
+        for dir in layers {
+            for (p, m) in scan(dir, &HashSet::new()) {
+                if m.kind == 'w' {
+                    let below = format!("{p}/");
+                    view.retain(|k: &String, _| *k != p && !k.starts_with(&below));
+                } else {
+                    view.insert(p, m);
+                }
+            }
+        }
+        view
+    }
+
+    /// ('A'dded | 'C'hanged | 'D'eleted, path), sorted by path. Mount points and what is under them are ignored.
+    pub fn diff(lower: &BTreeMap<String, Meta>, merged: &BTreeMap<String, Meta>, mounts: &HashSet<String>) -> Vec<(char, String)> {
+        let ignored = |p: &str| mounts.iter().any(|m| p == m || p.strip_prefix(m.as_str()).is_some_and(|r| r.starts_with('/')));
+        let mut out = vec![];
+        for (p, m) in merged.iter().filter(|(p, _)| !ignored(p)) {
+            match lower.get(p) {
+                None => out.push(('A', p.clone())),
+                Some(l) if l != m => out.push(('C', p.clone())),
+                _ => {}
+            }
+        }
+        let mut gone: Option<String> = None;
+        for p in lower.keys().filter(|p| !ignored(p) && !merged.contains_key(*p)) {
+            if gone.as_ref().is_some_and(|g| p.starts_with(&format!("{g}/"))) {
+                continue; // inside a directory that is already reported deleted
+            }
+            gone = Some(p.clone());
+            out.push(('D', p.clone()));
+        }
+        out.sort_by(|a, b| a.1.cmp(&b.1));
+        out
+    }
+
+    fn live(e: &Entry) -> Result<PathBuf, Reply> {
+        if e.running() {
+            Ok(PathBuf::from(format!("/proc/{}/root", e.pid)))
+        } else {
+            Err(fail(409, format!("Container {} is not running (this engine reads the filesystem of a live container)", e.id)))
+        }
+    }
+
+    fn lower_layers(e: &Entry) -> Result<Vec<PathBuf>, Reply> {
+        let s = store();
+        let missing = || fail(409, format!("the image {} of container {} is not in the store", e.image, e.id));
+        let m = Reference::parse(&e.image).ok().and_then(|r| s.get(&r).ok().flatten()).ok_or_else(missing)?;
+        m.layers.iter().map(|l| s.layer_path(&l.digest).map_err(|_| missing())).collect()
+    }
+
+    fn changes_of(e: &Entry) -> Result<(PathBuf, Vec<(char, String)>), Reply> {
+        let root = live(e)?;
+        let mounts = mounts(e.pid);
+        let changes = diff(&lower_view(&lower_layers(e)?), &scan(&root, &mounts), &mounts);
+        Ok((root, changes))
+    }
+
+    pub fn changes(e: &Entry) -> Reply {
+        match changes_of(e) {
+            Ok((_, c)) => Reply::Json(200, Value::Array(c.iter().map(|(k, p)| json!({ "Path": p, "Kind": match k { 'C' => 0, 'A' => 1, _ => 2 } })).collect())),
+            Err(rep) => rep,
+        }
+    }
+
+    /// `GET /containers/{id}/export`: the whole filesystem as a tar.
+    pub fn export(e: &Entry, w: &mut dyn Write) -> io::Result<Reply> {
+        let root = match live(e) {
+            Ok(r) => r,
+            Err(rep) => return Ok(rep),
+        };
+        let all = scan(&root, &mounts(e.pid));
+        head(w, 200, "application/x-tar", None)?;
+        let mut b = tar::Builder::new(io::BufWriter::new(Chunked(&mut *w)));
+        b.follow_symlinks(false);
+        for (p, m) in &all {
+            if matches!(m.kind, 'o' | 'w') {
+                continue; // sockets, devices and fifos are not part of an image
+            }
+            let rel = p.trim_start_matches('/');
+            b.append_path_with_name(root.join(rel), rel)?;
+        }
+        b.into_inner()?.flush()?;
+        end_chunks(w)?;
+        Ok(Reply::Streamed)
+    }
+
+    /// Go's os.FileMode bits, as the stat header wants them.
+    fn go_mode(md: &fs::Metadata) -> u32 {
+        (md.mode() & 0o777) | if md.is_dir() { 1 << 31 } else { 0 } | if md.file_type().is_symlink() { 1 << 27 } else { 0 }
+    }
+
+    /// `GET`/`HEAD /containers/{id}/archive?path=`: a tar of that file or directory (what `docker cp` out reads).
+    pub fn archive(r: &Request, e: &Entry, w: &mut dyn Write) -> io::Result<Reply> {
+        let root = match live(e) {
+            Ok(r) => r,
+            Err(rep) => return Ok(rep),
+        };
+        let Some(path) = r.query.get("path").filter(|p| !p.is_empty()) else { return Ok(fail(400, "path is required")) };
+        let inside = match secure_join(&root, path) {
+            Ok(p) => p,
+            Err(er) => return Ok(fail(400, er.to_string())),
+        };
+        if inside == root {
+            return Ok(fail(400, "use /export for the whole filesystem"));
+        }
+        let Ok(md) = fs::symlink_metadata(&inside) else { return Ok(fail(404, format!("Could not find the file {path} in container {}", e.id))) };
+        let name = path.trim_end_matches('/').rsplit('/').next().unwrap_or("").to_string();
+        let stat = json!({ "name": name, "size": md.len(), "mode": go_mode(&md), "mtime": rfc3339(md.mtime().max(0) as u64), "linkTarget": "" });
+        let extra = format!("X-Docker-Container-Path-Stat: {}\r\n", base64(stat.to_string().as_bytes()));
+        if r.method == "HEAD" {
+            head_with(w, 200, "application/x-tar", Some(0), &extra)?;
+            return Ok(Reply::Streamed);
+        }
+        head_with(w, 200, "application/x-tar", None, &extra)?;
+        let mut b = tar::Builder::new(io::BufWriter::new(Chunked(&mut *w)));
+        b.follow_symlinks(false);
+        if md.is_dir() {
+            b.append_dir_all(&name, &inside)?;
+        } else {
+            b.append_path_with_name(&inside, &name)?;
+        }
+        b.into_inner()?.flush()?;
+        end_chunks(w)?;
+        Ok(Reply::Streamed)
+    }
+
+    /// `PUT /containers/{id}/archive?path=`: unpack the tar next to us, then `docker cp` each top-level entry in.
+    pub fn put_archive(r: &Request, e: &Entry) -> Reply {
+        let root = match live(e) {
+            Ok(r) => r,
+            Err(rep) => return rep,
+        };
+        let Some(path) = r.query.get("path").filter(|p| !p.is_empty()) else { return fail(400, "path is required") };
+        match secure_join(&root, path) {
+            Ok(p) if p.is_dir() => {}
+            Ok(_) => return fail(404, format!("the destination {path} is not a directory in container {}", e.id)),
+            Err(er) => return fail(400, er.to_string()),
+        }
+        let stage = tmp_file("put");
+        let result = (|| -> Result<(), String> {
+            fs::create_dir_all(&stage).map_err(|er| er.to_string())?;
+            unpack_context(&r.body, &stage).map_err(|er| format!("cannot read the archive: {er}"))?;
+            for ent in fs::read_dir(&stage).map_err(|er| er.to_string())?.flatten() {
+                cli(&["cp", &ent.path().to_string_lossy(), &format!("{}:{path}", e.id)])?;
+            }
+            Ok(())
+        })();
+        let _ = fs::remove_dir_all(&stage);
+        match result {
+            Ok(()) => Reply::Empty(200),
+            Err(m) => fail(500, m),
+        }
+    }
+
+    fn copy_owner(from: &fs::Metadata, to: &Path) -> io::Result<()> {
+        lchown(to, Some(from.uid()), Some(from.gid()))?; // before the mode: chown clears setuid bits
+        if !from.file_type().is_symlink() {
+            fs::set_permissions(to, fs::Permissions::from_mode(from.mode() & 0o7777))?;
+        }
+        Ok(())
+    }
+
+    /// Directories above `rel` that the layer needs, with the metadata they have in the container.
+    fn ensure_parents(root: &Path, dest: &Path, rel: &str) -> io::Result<()> {
+        let mut at = String::new();
+        let parts: Vec<&str> = rel.split('/').collect();
+        for part in &parts[..parts.len() - 1] {
+            at = if at.is_empty() { part.to_string() } else { format!("{at}/{part}") };
+            if !dest.join(&at).exists() {
+                fs::create_dir(dest.join(&at))?;
+                copy_owner(&fs::symlink_metadata(root.join(&at))?, &dest.join(&at))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Write the changes as an unpacked layer directory: files copied, deletions as overlay whiteouts.
+    /// ponytail: no xattrs or capabilities, and a directory replaced by another is not made opaque.
+    fn stage_layer(root: &Path, changes: &[(char, String)], dest: &Path) -> io::Result<()> {
+        for (kind, p) in changes {
+            let rel = p.trim_start_matches('/');
+            ensure_parents(root, dest, rel)?;
+            let to = dest.join(rel);
+            if *kind == 'D' {
+                let c = std::ffi::CString::new(to.as_os_str().as_encoded_bytes()).map_err(|_| io::Error::other("NUL in path"))?;
+                // SAFETY: plain mknod of a 0/0 character device, which overlayfs reads as a whiteout.
+                if unsafe { libc::mknod(c.as_ptr(), libc::S_IFCHR, 0) } != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                continue;
+            }
+            let from = root.join(rel);
+            let md = match fs::symlink_metadata(&from) {
+                Ok(md) => md,
+                Err(er) if er.kind() == io::ErrorKind::NotFound => continue, // vanished while we worked
+                Err(er) => return Err(er),
+            };
+            if md.is_dir() {
+                if !to.is_dir() {
+                    fs::create_dir(&to)?;
+                }
+            } else if md.file_type().is_symlink() {
+                let _ = fs::remove_file(&to);
+                symlink(fs::read_link(&from)?, &to)?;
+            } else if md.is_file() {
+                fs::copy(&from, &to)?;
+            } else {
+                continue;
+            }
+            copy_owner(&md, &to)?;
+        }
+        Ok(())
+    }
+
+    /// `POST /commit?container=&repo=&tag=&changes=` (body: Config overrides): the container's changes become a new layer.
+    pub fn commit(r: &Request) -> Reply {
+        let Some(cid) = r.query.get("container") else { return fail(400, "container is required") };
+        let e = match container(cid) {
+            Ok(e) => e,
+            Err(rep) => return rep,
+        };
+        let (root, changes) = match changes_of(&e) {
+            Ok(x) => x,
+            Err(rep) => return rep,
+        };
+        let s = store();
+        let Some(mut meta) = Reference::parse(&e.image).ok().and_then(|rf| s.get(&rf).ok().flatten()) else { return fail(409, "the image of this container is not in the store") };
+        let body: Value = serde_json::from_slice(&r.body).unwrap_or(Value::Null);
+        apply_config(&mut meta, &body);
+        for c in r.query.get("changes").into_iter().flat_map(|c| c.split('\n')).filter(|c| !c.trim().is_empty()) {
+            if let Err(m) = apply_change(&mut meta, c) {
+                return fail(400, m);
+            }
+        }
+        let digest = format!("sha256:{}", fake_id(&format!("commit-{}-{}", e.id, registry::new_id())));
+        let name = match (r.query.get("repo").filter(|x| !x.is_empty()), r.query.get("tag").filter(|x| !x.is_empty())) {
+            (Some(repo), Some(t)) => format!("{repo}:{t}"),
+            (Some(repo), None) => repo.clone(),
+            _ => format!("commit-{}", &digest[7..19]), // Docker would leave it untagged; this store keys images by name
+        };
+        let Ok(rf) = Reference::parse(&name) else { return fail(400, format!("invalid reference format: {name}")) };
+        let stage = s.tmp_dir().join(format!("api-commit-{}", registry::new_id()));
+        let made = fs::create_dir_all(&stage).and_then(|()| stage_layer(&root, &changes, &stage));
+        let layer = made.map_err(|er| er.to_string()).and_then(|()| s.adopt_layer(&digest, &stage).map_err(|er| er.to_string()));
+        let _ = fs::remove_dir_all(&stage);
+        let dir = match layer {
+            Ok(d) => d,
+            Err(m) => return fail(500, format!("commit failed: {m}")),
+        };
+        meta.layers.push(LayerRef { digest, media_type: "application/vnd.rustdocker.layer.v1+dir".into(), size: docker_image::dir_size(&dir) });
+        meta.name = rf.display();
+        if let Err(er) = s.save(&rf, &meta) {
+            return fail(500, er.to_string());
+        }
+        Reply::Json(201, json!({ "Id": format!("sha256:{}", fake_id(&meta.name)) }))
+    }
+
+    /// `POST /containers/{id}/resize`: set the size on the container's terminal (the slave end is in its own devpts).
+    pub fn resize_tty(e: &Entry, rows: u16, cols: u16) {
+        use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+        if let Ok(f) = fs::OpenOptions::new().read(true).write(true).custom_flags(libc::O_NOCTTY).open(format!("/proc/{}/root/dev/pts/0", e.pid)) {
+            super::set_winsize(f.as_raw_fd(), rows, cols);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn m(kind: char, size: u64) -> Meta {
+            Meta { kind, size, mtime: (1, 0), mode: 0o644, uid: 0, gid: 0 }
+        }
+
+        #[test]
+        fn diff_reports_added_changed_and_deleted_ignoring_mounts() {
+            let lower: BTreeMap<_, _> = [("/etc", m('d', 0)), ("/etc/a", m('f', 1)), ("/etc/b", m('f', 2)), ("/gone", m('d', 0)), ("/gone/x", m('f', 1)), ("/proc", m('d', 0))]
+                .into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+            let merged: BTreeMap<_, _> = [("/etc", m('d', 0)), ("/etc/a", m('f', 9)), ("/etc/c", m('f', 3)), ("/dev", m('d', 0)), ("/dev/null", m('o', 0))]
+                .into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+            let mounts: HashSet<String> = ["/proc", "/dev"].map(String::from).into();
+            let d = diff(&lower, &merged, &mounts);
+            let d: Vec<(char, &str)> = d.iter().map(|(k, p)| (*k, p.as_str())).collect();
+            assert_eq!(d, [('C', "/etc/a"), ('D', "/etc/b"), ('A', "/etc/c"), ('D', "/gone")]);
+        }
+
+        #[test]
+        fn mountinfo_paths_are_unescaped() {
+            assert_eq!(unescape("/a\\040b/c"), "/a b/c");
+            assert_eq!(unescape("/plain"), "/plain");
+            assert_eq!(unescape("/end\\"), "/end\\");
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+mod fsapi {
+    use super::*;
+
+    fn no() -> Reply {
+        fail(501, "this needs a Linux engine")
+    }
+    pub fn changes(_: &Entry) -> Reply {
+        no()
+    }
+    pub fn export(_: &Entry, _: &mut dyn Write) -> io::Result<Reply> {
+        Ok(no())
+    }
+    pub fn archive(_: &Request, _: &Entry, _: &mut dyn Write) -> io::Result<Reply> {
+        Ok(no())
+    }
+    pub fn put_archive(_: &Request, _: &Entry) -> Reply {
+        no()
+    }
+    pub fn commit(_: &Request) -> Reply {
+        no()
+    }
+    pub fn resize_tty(_: &Entry, _: u16, _: u16) {}
+}
+
+/// Forward the attached client's input to the container's stdin socket (containers without a terminal).
+#[cfg(target_os = "linux")]
+fn forward_stdin(r: &Request, e: &Entry) {
+    let Some(mut input) = r.stdin.lock().unwrap().take() else { return };
+    let (id, once) = (e.id.clone(), meta_of(&e.id).get("StdinOnce").and_then(Value::as_bool).unwrap_or(false));
+    thread::spawn(move || {
+        let path = docker_core::platform::stdin_sock(&id);
+        // `docker run` attaches before it starts the container: give the supervisor up to 30s to open the socket
+        let mut sock = None;
+        for _ in 0..200 {
+            if let Ok(s) = std::os::unix::net::UnixStream::connect(&path) {
+                sock = Some(s);
+                break;
+            }
+            thread::sleep(Duration::from_millis(150));
+        }
+        let Some(mut sock) = sock else { return };
+        let _ = sock.write_all(&[if once { b'O' } else { b'K' }]);
+        let _ = io::copy(&mut input, &mut sock); // ends when the client half-closes; dropping `sock` then ends its input
+    });
 }
 
 /// Listen on `host` (`unix:///var/run/docker.sock` by default, or `tcp://127.0.0.1:2375`) and serve forever.
@@ -1460,5 +2398,71 @@ mod tests {
         assert!(config_from_create(&json!({}), 1).is_err());
         assert!(config_from_create(&json!({"Image": "a", "HostConfig": {"PortBindings": {"53/udp": [{"HostPort": "53"}]}}}), 1).is_err());
         assert!(config_from_create(&json!({"Image": "a", "HostConfig": {"NetworkMode": "container:abc"}}), 1).is_err());
+    }
+
+    #[test]
+    fn repeated_names_are_joined_and_base64_works() {
+        let q = parse_query("names=a&names=b%3A1&x=1&x=2");
+        assert_eq!((q["names"].as_str(), q["x"].as_str()), ("a
+b:1", "2"));
+        assert_eq!(base64(b"hello"), "aGVsbG8=");
+        assert_eq!(base64(b"ab"), "YWI=");
+        assert_eq!(base64(b"abc"), "YWJj");
+    }
+
+    #[test]
+    fn filters_select_containers_and_events() {
+        assert_eq!(filter_values(&json!({"status": ["running"]}), "status"), ["running"]);
+        assert_eq!(filter_values(&json!({"status": {"exited": true, "x": false}}), "status"), ["exited"]);
+        assert!(name_matches("web", "/my-web-1") && name_matches("^/web$", "web") && !name_matches("^web$", "web2") && name_matches("^we", "web2") && name_matches("b2$", "web2"));
+        let cfg = Config { target: "alpine".into(), ..Config::default() };
+        let mut e = Entry::new("abc123", &cfg, 1);
+        e.name = Some("web".into());
+        e.image = "alpine".into();
+        e.exit_code = Some(3);
+        let labels: BTreeMap<String, String> = [("app".to_string(), "x".to_string())].into();
+        let m = |f: Value| container_matches(&f, &e, &labels);
+        assert!(m(json!({})) && m(json!({"status": ["exited"], "name": ["web"], "ancestor": ["alpine:latest"], "exited": ["3"]})));
+        assert!(!m(json!({"status": ["running"]})) && !m(json!({"name": ["db"]})) && !m(json!({"ancestor": ["busybox"]})));
+        assert!(m(json!({"label": ["app", "app=x"]})) && !m(json!({"label": ["app=y"]})) && !m(json!({"label": ["nope"]})));
+        let ev = event_json(r#"{"time":5,"action":"die","id":"c1ffee","name":"web","image":"alpine","exitCode":3}"#).unwrap();
+        assert!(event_matches(&json!({}), &ev) && event_matches(&json!({"type": ["container"], "event": ["die"], "container": ["web"], "image": ["alpine"]}), &ev));
+        assert!(!event_matches(&json!({"type": ["image"]}), &ev) && !event_matches(&json!({"event": ["start"]}), &ev) && !event_matches(&json!({"container": ["db"]}), &ev));
+        assert!(event_matches(&json!({"container": ["c1ff"]}), &ev));
+    }
+
+    #[test]
+    fn commit_changes_and_config_edit_image_metadata() {
+        let mut m = docker_image::ImageMeta { name: "a:latest".into(), layers: vec![], entrypoint: vec![], cmd: vec!["sh".into()], env: vec!["A=1".into()], working_dir: String::new(), user: String::new(), exposed: vec![], labels: Default::default(), healthcheck: None };
+        apply_change(&mut m, r#"CMD ["echo", "hi"]"#).unwrap();
+        assert_eq!(m.cmd, ["echo", "hi"]);
+        apply_change(&mut m, "CMD echo hi").unwrap();
+        assert_eq!(m.cmd, ["/bin/sh", "-c", "echo hi"]);
+        apply_change(&mut m, "ENV A=2 B=3").unwrap();
+        apply_change(&mut m, "ENV C d e").unwrap();
+        assert_eq!(m.env, ["A=2", "B=3", "C=d e"]);
+        apply_change(&mut m, "EXPOSE 80 53/udp").unwrap();
+        apply_change(&mut m, "LABEL k=v").unwrap();
+        apply_change(&mut m, "WORKDIR /srv").unwrap();
+        assert_eq!((m.exposed.as_slice(), m.labels["k"].as_str(), m.working_dir.as_str()), (["80/tcp".to_string(), "53/udp".to_string()].as_slice(), "v", "/srv"));
+        assert!(apply_change(&mut m, "RUN true").is_err());
+        apply_config(&mut m, &json!({"Cmd": ["x"], "Env": ["A=9"], "User": "1", "Labels": {"l": "m"}, "ExposedPorts": {"8080/tcp": {}}}));
+        assert_eq!((m.cmd.as_slice(), m.env[0].as_str(), m.user.as_str(), m.labels["l"].as_str(), m.exposed.len()), (["x".to_string()].as_slice(), "B=3", "1", "m", 3));
+    }
+
+    #[test]
+    fn stats_math_inputs_and_history_order() {
+        let cfg = Config { target: "alpine".into(), ..Config::default() };
+        let e = Entry::new("abc123", &cfg, 1);
+        let a = Sample { at: 10, cpu_ns: 1_000, system_ns: 10_000, mem: 5, pids: 2 };
+        let b = Sample { at: 11, cpu_ns: 3_000, system_ns: 20_000, mem: 6, pids: 2 };
+        let j = stats_json(&e, &a, &b, 4, 100);
+        assert_eq!((j["cpu_stats"]["cpu_usage"]["total_usage"].as_u64(), j["precpu_stats"]["cpu_usage"]["total_usage"].as_u64(), j["cpu_stats"]["online_cpus"].as_u64()), (Some(3_000), Some(1_000), Some(4)));
+        assert_eq!(stats_json(&e, &Sample::default(), &b, 1, 1)["preread"], "0001-01-01T00:00:00Z");
+        assert_eq!((j["memory_stats"]["usage"].as_u64(), j["memory_stats"]["limit"].as_u64(), j["pids_stats"]["current"].as_u64()), (Some(6), Some(100), Some(2)));
+        let mut m = docker_image::ImageMeta { name: "a:latest".into(), layers: vec![], entrypoint: vec![], cmd: vec![], env: vec![], working_dir: String::new(), user: String::new(), exposed: vec![], labels: Default::default(), healthcheck: None };
+        m.layers = ["1", "2"].iter().map(|c| docker_image::LayerRef { digest: c.repeat(64), media_type: String::new(), size: 7 }).collect();
+        let h = history(&m);
+        assert_eq!((h[0]["Tags"][0].as_str(), h[1]["Id"].as_str(), h.as_array().map(Vec::len)), (Some("a:latest"), Some("<missing>"), Some(2)));
     }
 }

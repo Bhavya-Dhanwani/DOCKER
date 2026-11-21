@@ -101,8 +101,8 @@ fn parse_query(q: &str) -> HashMap<String, String> {
     for p in q.split('&').filter(|p| !p.is_empty()) {
         let (k, v) = p.split_once('=').map_or((pct_decode(p), String::new()), |(k, v)| (pct_decode(k), pct_decode(v)));
         match m.get_mut(&k) {
-            // `names` (images/get) repeats; joined by newlines. Every other repeated key keeps its last value.
-            Some(old) if k == "names" => {
+            // `names` (images/get) and `changes` (commit) repeat; joined by newlines. Every other repeated key keeps its last value.
+            Some(old) if k == "names" || k == "changes" => {
                 old.push('\n');
                 old.push_str(&v);
             }

@@ -318,5 +318,210 @@ check("build without a tag is 400", st == 400)
 st, e = call("GET", "/containers/zzz/json")
 check("a missing container is 404 with a message", st == 404 and "No such container" in e["message"])
 
+# ---- engine API completeness: top, stats, changes, archive, export, commit, prune, df, history, load/get, stdin, filters
+import base64, urllib.parse
+
+def exec_in(cid, cmd):
+    st, e = call("POST", f"/containers/{cid}/exec", {"Cmd": cmd, "AttachStdout": True, "AttachStderr": True})
+    st, raw = call("POST", f"/exec/{e['Id']}/start", {"Detach": False}, raw=True)
+    return frames(raw)
+
+def tar_members(data):
+    with tarfile.open(fileobj=io.BytesIO(data)) as t:
+        return {m.name: (t.extractfile(m).read() if m.isfile() else None) for m in t.getmembers()}
+
+st, c = call("POST", "/containers/create?name=apifs", {"Image": "alpine", "Cmd": ["sleep", "300"], "Labels": {"suite": "api", "tier": "t1"}, "HostConfig": {"NetworkMode": "none"}})
+fid = c["Id"]
+st, e = call("GET", f"/containers/{fid}/top")
+check("top on a stopped container is 409", st == 409)
+st, e = call("GET", f"/containers/{fid}/changes")
+check("changes on a stopped container is 409", st == 409)
+call("POST", f"/containers/{fid}/start")
+wait_state(fid, "running")
+
+st, t = call("GET", f"/containers/{fid}/top")
+check("top lists the processes with titles", st == 200 and t["Titles"][:2] == ["UID", "PID"] and any("sleep" in p[-1] for p in t["Processes"]))
+st, s1 = call("GET", f"/containers/{fid}/stats?stream=false")
+check("stats?stream=false returns one object with cpu, memory and pids", st == 200 and s1["memory_stats"]["usage"] > 0 and s1["cpu_stats"]["online_cpus"] >= 1 and s1["pids_stats"]["current"] >= 1 and s1["name"] == "/apifs" and s1["cpu_stats"]["system_cpu_usage"] > 0)
+st, s2 = call("GET", f"/containers/{fid}/stats?stream=false&one-shot=true")
+check("one-shot stats have no previous sample", st == 200 and s2["precpu_stats"]["cpu_usage"]["total_usage"] == 0)
+c1 = Conn()
+c1.request("GET", f"/v1.43/containers/{fid}/stats")
+r1 = c1.getresponse()
+buf, objs = b"", []
+while len(objs) < 2:
+    d = r1.fp.readline()
+    if not d:
+        break
+    d = d.strip()
+    if d.startswith(b"{"):
+        objs.append(json.loads(d))
+c1.close()
+check("streaming stats keep sending objects (one per second)", len(objs) == 2 and objs[1]["read"] >= objs[0]["read"] and objs[1]["precpu_stats"]["cpu_usage"]["total_usage"] == objs[0]["cpu_stats"]["cpu_usage"]["total_usage"])
+
+# filesystem changes, then archive / export / commit
+exec_in(fid, ["sh", "-c", "echo changed > /newfile && mkdir -p /srv/d && echo deep > /srv/d/f && rm /etc/motd; echo more >> /etc/hostname-extra"])
+st, ch = call("GET", f"/containers/{fid}/changes")
+kinds = {x["Path"]: x["Kind"] for x in ch} if st == 200 else {}
+check("changes reports added (1), and deleted (2) files, no runtime mounts", kinds.get("/newfile") == 1 and kinds.get("/srv/d/f") == 1 and kinds.get("/etc/motd") == 2 and "/proc" not in kinds and "/etc/resolv.conf" not in kinds and "/dev" not in kinds)
+c2 = Conn()
+c2.request("HEAD", f"/v1.43/containers/{fid}/archive?path=/newfile")
+r2 = c2.getresponse(); r2.read()
+stat = json.loads(base64.b64decode(r2.getheader("X-Docker-Container-Path-Stat", "e30=")))
+check("HEAD archive returns the path stat header", r2.status == 200 and stat.get("name") == "newfile" and stat.get("size") == 8)
+c2.close()
+st, raw = call("GET", f"/containers/{fid}/archive?path=/newfile", raw=True)
+check("GET archive of a file is a tar with it", st == 200 and tar_members(raw).get("newfile") == b"changed\n")
+st, raw = call("GET", f"/containers/{fid}/archive?path=/srv", raw=True)
+mem = tar_members(raw) if st == 200 else {}
+check("GET archive of a directory has its contents under the dir name", mem.get("srv/d/f") == b"deep\n")
+st, e = call("GET", f"/containers/{fid}/archive?path=/no/such/file")
+check("GET archive of a missing path is 404", st == 404)
+put = tar_of({"hello.txt": b"put-in\n"})
+st, _ = call("PUT", f"/containers/{fid}/archive?path=/srv", put)
+check("PUT archive extracts into the container", st == 200 and exec_in(fid, ["cat", "/srv/hello.txt"]).strip() == "put-in")
+st, e = call("PUT", f"/containers/{fid}/archive?path=/newfile", put)
+check("PUT archive to a non-directory is 404", st == 404)
+st, raw = call("GET", f"/containers/{fid}/export", raw=True)
+mem = tar_members(raw) if st == 200 else {}
+check("export is the whole filesystem as a tar", st == 200 and mem.get("newfile") == b"changed\n" and any(n.startswith("bin/") or n == "bin" for n in mem) and "etc/motd" not in mem)
+
+st, r = call("POST", f"/commit?container={fid}&repo=apicommitted&tag=v1&changes=" + urllib.parse.quote("CMD [\"cat\", \"/newfile\"]") + "&changes=" + urllib.parse.quote("ENV K=V"), {"Labels": {"made": "by-commit"}})
+check("commit returns 201 and an image id", st == 201 and r.get("Id", "").startswith("sha256:"))
+st, img = call("GET", "/images/apicommitted:v1/json")
+check("the committed image exists and has the config changes", st == 200 and img["Config"]["Cmd"] == ["cat", "/newfile"] and "K=V" in img["Config"]["Env"] and img["Config"]["Labels"].get("made") == "by-commit" and len(img["RootFS"]["Layers"]) >= 2)
+st, h = call("GET", "/images/apicommitted:v1/history")
+check("history lists one row per layer, newest first with the tag", st == 200 and len(h) == len(img["RootFS"]["Layers"]) and h[0]["Tags"] == ["apicommitted:v1"])
+st, cc = call("POST", "/containers/create", {"Image": "apicommitted:v1", "HostConfig": {"NetworkMode": "none"}})
+cc_id = cc["Id"]
+call("POST", f"/containers/{cc_id}/start")
+call("POST", f"/containers/{cc_id}/wait")
+st, raw = call("GET", f"/containers/{cc_id}/logs?stdout=1", raw=True)
+check("a container from the committed image sees the committed file", "changed" in frames(raw))
+call("DELETE", f"/containers/{cc_id}?force=1")
+st, cc = call("POST", "/containers/create", {"Image": "apicommitted:v1", "Cmd": ["sh", "-c", "ls /srv/d /etc/motd 2>&1; cat /srv/d/f"], "HostConfig": {"NetworkMode": "none"}})
+call("POST", f"/containers/{cc['Id']}/start")
+call("POST", f"/containers/{cc['Id']}/wait")
+st, raw = call("GET", f"/containers/{cc['Id']}/logs?stdout=1&stderr=1", raw=True)
+out = frames(raw)
+check("the committed layer keeps nested files and applies deletions (whiteout)", "deep" in out and "No such file" in out)
+call("DELETE", f"/containers/{cc['Id']}?force=1")
+st, e = call("POST", "/commit?container=nosuch&repo=x")
+check("commit of a missing container is 404", st == 404)
+
+# save / load round trip through /images/{name}/get and /images/load
+st, tarball = call("GET", "/images/apicommitted:v1/get", raw=True)
+check("images/{name}/get returns a tar archive", st == 200 and len(tarball) > 1000 and "index.json" in tar_members(tarball))
+st, tarball2 = call("GET", "/images/get?names=apicommitted:v1&names=alpine:latest", raw=True)
+check("images/get with several names", st == 200 and len(tarball2) > len(tarball) // 2)
+call("DELETE", "/images/apicommitted:v1")
+check("image gone before load", call("GET", "/images/apicommitted:v1/json")[0] == 404)
+st, raw = call("POST", "/images/load", tarball, raw=True)
+check("images/load reports Loaded image", st == 200 and b"Loaded image" in raw)
+check("the loaded image is back", call("GET", "/images/apicommitted:v1/json")[0] == 200)
+st, e = call("GET", "/images/nosuch:1/get")
+check("get of a missing image is 404", st == 404)
+st, e = call("GET", "/images/nosuch:1/history")
+check("history of a missing image is 404", st == 404)
+st, r = call("GET", "/images/search?term=alpine")
+check("images/search answers with an (empty) list", st == 200 and r == [])
+
+# filters on containers/json, labels, df
+st, l = call("GET", "/containers/json?filters=" + urllib.parse.quote(json.dumps({"label": ["suite=api"]})))
+check("containers/json filters by label", st == 200 and [x["Id"] for x in l] == [fid] and l[0]["Labels"]["tier"] == "t1")
+st, l = call("GET", "/containers/json?filters=" + urllib.parse.quote(json.dumps({"label": ["suite=other"]})))
+check("a label filter that matches nothing is empty", l == [])
+st, l = call("GET", "/containers/json?filters=" + urllib.parse.quote(json.dumps({"name": ["apifs"], "status": ["running"], "ancestor": ["alpine"]})))
+check("containers/json filters by name, status and ancestor", [x["Id"] for x in l] == [fid])
+st, l = call("GET", "/containers/json?filters=" + urllib.parse.quote(json.dumps({"status": ["exited"], "name": ["apifs"]})))
+check("a status filter that does not match is empty", l == [])
+st, j = call("GET", f"/containers/{fid}/json")
+check("inspect shows the labels", j["Config"]["Labels"].get("suite") == "api")
+st, d = call("GET", "/system/df")
+check("system/df has images, containers, volumes and sizes", st == 200 and d["Images"] and d["LayersSize"] > 0 and any(x["Id"] == fid for x in d["Containers"]) and "Volumes" in d and "BuildCache" in d)
+
+# resize of a terminal container: the shell asks its own terminal for the size
+st, c = call("POST", "/containers/create?name=apitty", {"Image": "alpine", "Cmd": ["sh", "-c", "sleep 3; stty size"], "Tty": True, "OpenStdin": True, "HostConfig": {"NetworkMode": "none"}})
+tid = c["Id"]
+call("POST", f"/containers/{tid}/start")
+wait_state(tid, "running")
+time.sleep(1)
+st, _ = call("POST", f"/containers/{tid}/resize?h=33&w=101")
+call("POST", f"/containers/{tid}/wait")
+st2, raw = call("GET", f"/containers/{tid}/logs?stdout=1", raw=True)
+call("DELETE", f"/containers/{tid}?force=1")
+check("resize sets the size of the container's terminal", st == 200 and "33 101" in raw.decode(errors="replace"))
+
+# stdin for a container started without a terminal (what `docker run -i` does): attach before start, send input, half-close
+def attach_stdin(once):
+    st, c = call("POST", "/containers/create", {"Image": "alpine", "Cmd": ["sh", "-c", "cat; echo cat-finished"], "OpenStdin": True, "StdinOnce": once, "AttachStdin": True, "AttachStdout": True, "HostConfig": {"NetworkMode": "none"}})
+    sid = c["Id"]
+    a = socket.socket(socket.AF_UNIX); a.connect(SOCK); a.settimeout(20)
+    a.sendall(b"POST /v1.43/containers/" + sid.encode() + b"/attach?stream=1&stdin=1&stdout=1&stderr=1 HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: tcp\r\nContent-Length: 0\r\n\r\n")
+    got = a.recv(4096)
+    call("POST", f"/containers/{sid}/start")
+    time.sleep(1.5)
+    a.sendall(b"typed-into-stdin\n")
+    time.sleep(0.5)
+    a.shutdown(socket.SHUT_WR)  # the client is done typing
+    try:
+        while True:
+            d = a.recv(4096)
+            if not d:
+                break
+            got += d
+    except socket.timeout:
+        pass
+    a.close()
+    return sid, got
+sid, got = attach_stdin(True)
+check("attach stdin: input reaches a container without a terminal, EOF ends cat, and the stream closes", b"101" in got and b"typed-into-stdin" in got and b"cat-finished" in got and wait_state(sid, "exited", 10))
+st, j = call("GET", f"/containers/{sid}/json")
+check("OpenStdin shows in inspect", j["Config"].get("OpenStdin") is True)
+call("DELETE", f"/containers/{sid}?force=1")
+st, c = call("POST", "/containers/create", {"Image": "alpine", "Cmd": ["cat"], "OpenStdin": True, "HostConfig": {"NetworkMode": "none"}})
+kid = c["Id"]
+call("POST", f"/containers/{kid}/start")
+time.sleep(2)
+check("a container with OpenStdin and nobody attached keeps running (stdin is open, not /dev/null)", wait_state(kid, "running", 3))
+call("DELETE", f"/containers/{kid}?force=1")
+
+# events filters
+seen2 = []
+def watch2():
+    c = Conn()
+    c.request("GET", f"/v1.43/events?until={int(time.time()) + 6}&filters=" + urllib.parse.quote(json.dumps({"type": ["container"], "event": ["die"], "container": ["apiefilter"]})))
+    r = c.getresponse()
+    for line in r.read().decode().splitlines():
+        if line.strip():
+            seen2.append(json.loads(line))
+t2 = threading.Thread(target=watch2)
+t2.start()
+time.sleep(1)
+for nm in ("apiefilter", "apiother"):
+    st, c = call("POST", f"/containers/create?name={nm}", {"Image": "alpine", "Cmd": ["true"], "HostConfig": {"NetworkMode": "none"}})
+    call("POST", f"/containers/{c['Id']}/start")
+    call("POST", f"/containers/{c['Id']}/wait")
+t2.join()
+check("events filters (type, event, container) pass only the matching events", len(seen2) == 1 and seen2[0]["Action"] == "die" and seen2[0]["Actor"]["Attributes"]["name"] == "apiefilter")
+st, ev = call("GET", f"/events?until={int(time.time())}&since=0&filters=" + urllib.parse.quote(json.dumps({"type": ["network"]})))
+check("an events filter on another type yields nothing", st == 200 and ev == "")
+
+# prune endpoints
+call("DELETE", f"/containers/{fid}?force=1")
+st, r = call("POST", "/containers/prune")
+check("containers/prune removes stopped containers", st == 200 and len(r["ContainersDeleted"]) >= 2 and call("GET", "/containers/json?all=1")[1] == [])
+call("POST", "/volumes/create", {"Name": "apiprunevol"})
+st, r = call("POST", "/volumes/prune")
+check("volumes/prune removes unused volumes", st == 200 and "apiprunevol" in r["VolumesDeleted"])
+call("POST", "/networks/create", {"Name": "apiprunenet"})
+st, r = call("POST", "/networks/prune")
+check("networks/prune removes unused networks", st == 200 and "apiprunenet" in r["NetworksDeleted"])
+st, r = call("POST", "/images/prune")
+check("images/prune (dangling) removes nothing here", st == 200 and r["ImagesDeleted"] == [])
+st, r = call("POST", "/images/prune?filters=" + urllib.parse.quote(json.dumps({"dangling": ["false"]})))
+names_left = [t for x in call("GET", "/images/json")[1] for t in x["RepoTags"]]
+check("images/prune with dangling=false removes unused images", st == 200 and any(x["Untagged"] == "apicommitted:v1" for x in r["ImagesDeleted"]) and names_left == [])
+
 print("ALL PASSED" if fails == 0 else f"{fails} FAILED")
 sys.exit(1 if fails else 0)

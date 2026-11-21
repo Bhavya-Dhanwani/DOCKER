@@ -29,7 +29,7 @@ impl Health {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ImageMeta {
     pub name: String,
     /// Bottom layer first.
@@ -47,6 +47,18 @@ pub struct ImageMeta {
     pub labels: BTreeMap<String, String>,
     #[serde(default)]
     pub healthcheck: Option<Health>,
+    /// `ONBUILD` triggers (instruction text), run when this image is the `FROM` of another build.
+    #[serde(default)]
+    pub onbuild: Vec<String>,
+    /// `VOLUME` paths: each gets an anonymous volume at run time unless `-v` covers it.
+    #[serde(default)]
+    pub volumes: Vec<String>,
+    /// `STOPSIGNAL` (name or number); empty means SIGTERM.
+    #[serde(default)]
+    pub stop_signal: String,
+    /// `SHELL` (empty means `/bin/sh -c`).
+    #[serde(default)]
+    pub shell: Vec<String>,
 }
 
 /// Total size of regular files under `p` (does not follow symlinks).
@@ -230,6 +242,7 @@ mod tests {
             exposed: vec![],
             labels: BTreeMap::new(),
             healthcheck: None,
+            ..Default::default()
         }
     }
 

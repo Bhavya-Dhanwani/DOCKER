@@ -34,6 +34,17 @@ pub fn config_json(meta: &ImageMeta, diff_ids: &[String]) -> Value {
     if !meta.labels.is_empty() {
         c.insert("Labels".into(), json!(meta.labels));
     }
+    if !meta.volumes.is_empty() {
+        c.insert("Volumes".into(), meta.volumes.iter().map(|v| (v.clone(), json!({}))).collect::<Map<_, _>>().into());
+    }
+    for (key, list) in [("OnBuild", &meta.onbuild), ("Shell", &meta.shell)] {
+        if !list.is_empty() {
+            c.insert(key.into(), json!(list));
+        }
+    }
+    if !meta.stop_signal.is_empty() {
+        c.insert("StopSignal".into(), json!(meta.stop_signal));
+    }
     if let Some(h) = &meta.healthcheck {
         let ns = |s: u64| s * 1_000_000_000;
         let test: Vec<String> = std::iter::once("CMD".to_string()).chain(h.test.iter().cloned()).collect();
@@ -131,6 +142,10 @@ mod tests {
             exposed: vec!["80/tcp".into()],
             labels: BTreeMap::from([("k".to_string(), "v".to_string())]),
             healthcheck: Some(crate::store::Health::new(vec!["/bin/check".into()])),
+            onbuild: vec!["RUN x".into()],
+            volumes: vec!["/data".into()],
+            stop_signal: "SIGINT".into(),
+            shell: vec!["/bin/bash".into(), "-c".into()],
         };
         let v = config_json(&meta, &["sha256:d1".into()]);
         assert_eq!(v["os"], "linux");
@@ -138,6 +153,10 @@ mod tests {
         assert_eq!(v["config"]["WorkingDir"], "/app");
         assert!(v["config"]["ExposedPorts"]["80/tcp"].is_object());
         assert_eq!(v["config"]["Labels"]["k"], "v");
+        assert_eq!(v["config"]["Volumes"]["/data"], json!({}));
+        assert_eq!(v["config"]["OnBuild"][0], "RUN x");
+        assert_eq!(v["config"]["StopSignal"], "SIGINT");
+        assert_eq!(v["config"]["Shell"][0], "/bin/bash");
         assert_eq!(v["rootfs"]["diff_ids"][0], "sha256:d1");
         assert_eq!(v["config"]["Healthcheck"]["Test"][1], "/bin/check");
         assert_eq!(v["config"]["Healthcheck"]["Interval"], 30_000_000_000u64);
@@ -156,6 +175,7 @@ mod tests {
             exposed: vec![],
             labels: BTreeMap::new(),
             healthcheck: None,
+            ..Default::default()
         };
         assert!(config_json(&meta, &[])["config"].as_object().unwrap().is_empty());
     }

@@ -13,12 +13,47 @@ struct Rule {
     negate: bool,
 }
 
+/// Parse the inside of a `[...]` class: (negated, members, pattern after the `]`).
+fn class(p: &[char]) -> Option<(bool, Vec<char>, &[char])> {
+    let (negate, p) = match p.first() {
+        Some('^' | '!') => (true, &p[1..]),
+        _ => (false, p),
+    };
+    let end = p.iter().skip(1).position(|&c| c == ']')? + 1; // a leading `]` is a member
+    Some((negate, p[..end].to_vec(), &p[end + 1..]))
+}
+
+fn class_has(set: &[char], c: char) -> bool {
+    let mut i = 0;
+    while i < set.len() {
+        if set.get(i + 1) == Some(&'-') && i + 2 < set.len() {
+            if (set[i]..=set[i + 2]).contains(&c) {
+                return true;
+            }
+            i += 3;
+        } else {
+            if set[i] == c {
+                return true;
+            }
+            i += 1;
+        }
+    }
+    false
+}
+
 fn glob(pat: &str, s: &str) -> bool {
     fn go(p: &[char], t: &[char]) -> bool {
         match p.split_first() {
             None => t.is_empty(),
             Some(('*', rest)) => (0..=t.len()).any(|k| go(rest, &t[k..])),
             Some(('?', rest)) => !t.is_empty() && go(rest, &t[1..]),
+            // `[a-z]`, `[^abc]`: one character of the class (an unclosed `[` is a literal)
+            Some(('[', rest)) => match class(rest) {
+                Some((negate, set, after)) => t.first().is_some_and(|&c| class_has(&set, c) != negate) && go(after, &t[1..]),
+                None => t.first() == Some(&'[') && go(rest, &t[1..]),
+            },
+            // `*`: the next character literally
+            Some(('\\', rest)) if !rest.is_empty() => t.first() == Some(&rest[0]) && go(&rest[1..], &t[1..]),
             Some((c, rest)) => t.first() == Some(c) && go(rest, &t[1..]),
         }
     }
@@ -28,6 +63,8 @@ fn glob(pat: &str, s: &str) -> bool {
 fn segs_match(pat: &[String], path: &[&str]) -> bool {
     match pat.split_first() {
         None => path.is_empty(),
+        // a trailing `**` needs at least one more segment (`a/**` does not match `a` itself, like Docker)
+        Some((first, rest)) if first == "**" && rest.is_empty() => !path.is_empty(),
         Some((first, rest)) if first == "**" => (0..=path.len()).any(|k| segs_match(rest, &path[k..])),
         Some((first, rest)) => !path.is_empty() && glob(first, path[0]) && segs_match(rest, &path[1..]),
     }
@@ -92,6 +129,15 @@ mod tests {
         assert!(i.is_ignored("CHANGELOG.md") && !i.is_ignored("README.md"));
         assert!(i.is_ignored("vendor/other") && !i.is_ignored("vendor/keep.txt"));
         assert!(i.has_negations() && !ig("a\nb").has_negations());
+    }
+
+    #[test]
+    fn classes_escapes_and_trailing_doublestar() {
+        let i = ig("file[0-9].txt\n[^a-c]x\n\\*star\nout/**\n!out/keep\n");
+        assert!(i.is_ignored("file3.txt") && !i.is_ignored("filex.txt"));
+        assert!(i.is_ignored("dx") && !i.is_ignored("bx"));
+        assert!(i.is_ignored("*star") && !i.is_ignored("zstar"));
+        assert!(i.is_ignored("out/a/b") && !i.is_ignored("out") && !i.is_ignored("out/keep"));
     }
 
     #[test]

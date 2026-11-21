@@ -399,6 +399,7 @@ fn run_container(cfg: &Config, mut plan: Plan) -> Result<i32> {
     if let Some(n) = &cfg.network_name {
         net::refresh_hosts(n); // ... and that we are gone
     }
+    drop(_cleanup); // run dirs first: tearing the bridge down can take a moment
     drop(presence); // we no longer use the bridge: remove it (and the NAT rules) if nobody else does
     if mode == Network::Bridge {
         net::teardown_if_idle();

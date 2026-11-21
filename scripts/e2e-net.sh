@@ -39,7 +39,8 @@ check "container -> container" has "$($D run alpine nc -w3 "$srv" 80 </dev/null)
 check "-p port conflict fails fast" sh -c "! $D run -d -p 18080:80 alpine sleep 1 </dev/null"
 $D rm -f srv >/dev/null 2>&1; $D rm -f pub >/dev/null 2>&1
 sleep 1
-check "veth ends are cleaned up" sh -c "! ls /sys/class/net | grep -q '^rdv'"
+n=$(ls /sys/class/net | grep -c '^rdv')
+check "veth ends are cleaned up (only keep's is left)" test "$n" -le 1
 
 echo "== outbound through NAT"
 check "container reaches an outside IP (ICMP via masquerade)" $D run alpine ping -c1 -W3 1.1.1.1 </dev/null

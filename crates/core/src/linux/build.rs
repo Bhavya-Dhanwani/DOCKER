@@ -8,10 +8,10 @@
 //!   build cache: if the layer directory exists, the step is skipped.
 //! * A Dockerfile may have several stages (`FROM x AS name`); the last one (or `--target`) is the image.
 use super::{run_step, Step};
-use crate::{cli::BuildArgs, error::{Error, Result}, registry, user};
+use crate::{cli::{BuildArgs, Volume}, error::{Error, Result}, registry, user};
 use docker_image::{
     dir_size,
-    dockerfile::{self, Cmd, Instruction},
+    dockerfile::{self, Cmd, CopySpec, Instruction, Mount},
     Health, Ignore, ImageMeta, LayerRef, Reference, Store,
 };
 use sha2::{Digest, Sha256};
@@ -67,9 +67,14 @@ fn join_in(root: &Path, abs: &str) -> PathBuf {
     root.join(abs.trim_start_matches('/'))
 }
 
-fn argv(c: &Cmd) -> Vec<String> {
+/// The command line: shell form goes through `shell` (the `SHELL` instruction, default `/bin/sh -c`).
+fn argv(c: &Cmd, shell: &[String]) -> Vec<String> {
     match c {
-        Cmd::Shell(s) => vec!["/bin/sh".into(), "-c".into(), s.clone()],
+        Cmd::Shell(s) => {
+            let mut v = if shell.is_empty() { vec!["/bin/sh".to_string(), "-c".to_string()] } else { shell.to_vec() };
+            v.push(s.clone());
+            v
+        }
         Cmd::Exec(v) => v.clone(),
     }
 }
@@ -96,6 +101,11 @@ struct State {
     labels: BTreeMap<String, String>,
     args: BTreeMap<String, String>,
     health: Option<Health>,
+    /// `ONBUILD` triggers: declared by this stage, or (right after `FROM`) inherited and about to run.
+    onbuild: Vec<String>,
+    volumes: Vec<String>,
+    stop_signal: String,
+    shell: Vec<String>,
 }
 
 impl State {
@@ -142,6 +152,10 @@ fn from(store: &Store, image: &str, say: &mut dyn FnMut(String)) -> Result<State
             labels: BTreeMap::new(),
             args: BTreeMap::new(),
             health: None,
+            onbuild: vec![],
+            volumes: vec![],
+            stop_signal: String::new(),
+            shell: vec![],
         });
     }
     let r = Reference::parse(image).map_err(img)?;
@@ -168,6 +182,10 @@ fn from(store: &Store, image: &str, say: &mut dyn FnMut(String)) -> Result<State
         labels: meta.labels.clone(),
         args: BTreeMap::new(),
         health: meta.healthcheck.clone(),
+        onbuild: meta.onbuild.clone(),
+        volumes: meta.volumes.clone(),
+        stop_signal: meta.stop_signal.clone(),
+        shell: meta.shell.clone(),
     })
 }
 
@@ -370,11 +388,14 @@ fn hash_tree(h: &mut Sha256, ctx: &Path, ig: &Ignore, path: &Path, rel: &str) ->
 }
 
 /// Content hash of everything a COPY will read, so changed files invalidate the cache.
-fn hash_sources(ctx: &Path, ig: &Ignore, srcs: &[String]) -> Result<String> {
+fn hash_sources(ctx: &Path, ig: &Ignore, srcs: &[String], extra: Option<&HashMap<String, PathBuf>>) -> Result<String> {
     let mut h = Sha256::new();
     for s in srcs {
         h.update(s.as_bytes());
-        hash_tree(&mut h, ctx, ig, &resolve_src(ctx, s)?, "")?;
+        match extra.and_then(|m| m.get(s)) {
+            Some(p) => hash_tree(&mut h, ctx, &Ignore::default(), p, "")?, // a downloaded file or heredoc
+            None => hash_tree(&mut h, ctx, ig, &resolve_src(ctx, s)?, "")?,
+        }
     }
     Ok(format!("{:x}", h.finalize()))
 }
@@ -421,13 +442,39 @@ fn is_dir_in_image(lowers: &[PathBuf], path: &str) -> bool {
     Merged { layers: lowers }.is_dir(Path::new(path.trim_start_matches('/')))
 }
 
+/// First use of an anonymous `VOLUME`: fill `dst` with what the image has at `path` (like Docker does).
+pub(super) fn seed_volume(layers: &[PathBuf], path: &str, dst: &Path) {
+    let rel = Path::new(path.trim_start_matches('/'));
+    let m = Merged { layers };
+    if m.is_dir(rel) {
+        let _ = m.copy(rel, dst); // best effort: an empty volume is still a working volume
+    }
+}
+
+/// COPY/ADD sources read from the build context.
+struct Local<'a> {
+    ctx: &'a Path,
+    ig: &'a Ignore,
+    /// Sources that are not context paths: downloaded URLs and heredoc files (source string -> file).
+    extra: Option<&'a HashMap<String, PathBuf>>,
+    /// `ADD`: a local tar archive is unpacked instead of copied.
+    add: bool,
+}
+
+impl<'a> Local<'a> {
+    #[cfg(test)]
+    fn new(ctx: &'a Path, ig: &'a Ignore) -> Self {
+        Local { ctx, ig, extra: None, add: false }
+    }
+}
+
 /// Where COPY reads from.
 enum Src<'a> {
-    Context(&'a Path, &'a Ignore),
+    Context(Local<'a>),
     Layers(Vec<PathBuf>),
 }
 
-/// Fill a new layer. Returns the layer directory and the top-level destinations written (for `--chown`).
+/// Fill a new layer. Returns the layer directory and the top-level destinations written (for `--chown`/`--chmod`).
 fn copy_layer(stage: &Path, src: &Src, srcs: &[String], dst: &str, workdir: &str, lowers: &[PathBuf]) -> Result<(PathBuf, Vec<PathBuf>)> {
     let out = stage.join("layer");
     fs::create_dir_all(&out).map_err(io_err("mkdir layer"))?;
@@ -436,16 +483,28 @@ fn copy_layer(stage: &Path, src: &Src, srcs: &[String], dst: &str, workdir: &str
     let mut targets = vec![];
     for s in srcs {
         match src {
-            Src::Context(ctx, ig) => {
-                let p = resolve_src(ctx, s)?;
-                if p != **ctx && ig.is_ignored(&ctx_rel(ctx, &p)) {
+            Src::Context(l) => {
+                let injected = l.extra.and_then(|m| m.get(s));
+                let p = match injected {
+                    Some(p) => p.clone(),
+                    None => resolve_src(l.ctx, s)?,
+                };
+                if injected.is_none() && p != l.ctx && l.ig.is_ignored(&ctx_rel(l.ctx, &p)) {
                     return Err(Error::Usage(format!("COPY failed: {s} is excluded by .dockerignore")));
                 }
                 let is_dir = fs::symlink_metadata(&p).map_err(io_err("stat"))?.is_dir();
+                if l.add && injected.is_none() && !is_dir {
+                    // ADD <local archive> <dir>: the archive's contents land in <dir>
+                    let target = join_in(&out, &dst_abs);
+                    if docker_image::extract_archive(&p, &target, &stage.join("untar.tmp")).map_err(img)? {
+                        targets.push(target);
+                        continue;
+                    }
+                }
                 let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 let target = if is_dir { join_in(&out, &dst_abs) } else if into_dir { join_in(&out, &format!("{dst_abs}/{name}")) } else { join_in(&out, &dst_abs) };
                 if is_dir {
-                    copy_tree(&p, &target, ctx, ig, true)?;
+                    copy_tree(&p, &target, l.ctx, l.ig, true)?;
                 } else {
                     copy_entry(&p, &target)?;
                 }
@@ -463,6 +522,23 @@ fn copy_layer(stage: &Path, src: &Src, srcs: &[String], dst: &str, workdir: &str
         }
     }
     Ok((out, targets))
+}
+
+/// `--chmod=<octal>`: applied to every file and directory written (symlinks keep theirs).
+fn chmod_tree(p: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(md) = fs::symlink_metadata(p) else { return };
+    if md.file_type().is_symlink() {
+        return;
+    }
+    let _ = fs::set_permissions(p, fs::Permissions::from_mode(mode));
+    if md.is_dir()
+        && let Ok(rd) = fs::read_dir(p)
+    {
+        for e in rd.flatten() {
+            chmod_tree(&e.path(), mode);
+        }
+    }
 }
 
 fn chown_tree(p: &Path, uid: u32, gid: u32) {
@@ -545,14 +621,14 @@ fn apply(
             }
         }
         Instruction::User(u) => st.user = dockerfile::subst(u, &st.vars()),
-        Instruction::Cmd(c) => st.cmd = argv(c),
+        Instruction::Cmd(c) => st.cmd = argv(c, &st.shell),
         Instruction::Entrypoint(c) => {
-            st.entrypoint = argv(c).into_iter().filter(|_| !matches!(c, Cmd::Exec(v) if v.is_empty())).collect();
+            st.entrypoint = argv(c, &st.shell).into_iter().filter(|_| !matches!(c, Cmd::Exec(v) if v.is_empty())).collect();
             st.cmd.clear(); // like Docker: a new ENTRYPOINT drops the base image's CMD
         }
         Instruction::Healthcheck(spec) => {
             st.health = spec.as_ref().map(|h| {
-                let mut hc = Health::new(argv(&h.cmd));
+                let mut hc = Health::new(argv(&h.cmd, &st.shell));
                 hc.interval_s = h.interval_s.unwrap_or(hc.interval_s);
                 hc.timeout_s = h.timeout_s.unwrap_or(hc.timeout_s);
                 hc.start_period_s = h.start_period_s.unwrap_or(0);
@@ -561,6 +637,17 @@ fn apply(
             });
         }
         Instruction::Ignored(kw) => say(format!(" ---> (ignoring {kw}: not supported yet)")),
+        Instruction::Shell(v) => st.shell = v.clone(),
+        Instruction::Volume(paths) => {
+            for p in paths {
+                let p = norm(&st.workdir, &dockerfile::subst(p, &st.vars()));
+                if !st.volumes.contains(&p) {
+                    st.volumes.push(p);
+                }
+            }
+        }
+        Instruction::StopSignal(s) => st.stop_signal = dockerfile::subst(s, &st.vars()),
+        Instruction::Onbuild(t) => st.onbuild.push(t.clone()),
         Instruction::Workdir(p) => {
             let path = norm(&st.workdir, &dockerfile::subst(p, &st.vars()));
             let k = key(&[&st.chain, "workdir", &path]);
@@ -571,50 +658,192 @@ fn apply(
             })?;
             st.workdir = path;
         }
-        Instruction::Copy { srcs, dst, from: from_ref, chown } => {
-            let vars = st.vars();
-            let srcs: Vec<String> = srcs.iter().map(|s| dockerfile::subst(s, &vars)).collect();
-            let dst = dockerfile::subst(dst, &vars);
-            let chown = chown.as_ref().map(|c| dockerfile::subst(c, &vars));
-            let (source, content) = match from_ref {
-                None => (Src::Context(ctx, ig), hash_sources(ctx, ig, &srcs)?),
-                Some(f) => {
-                    let (layers, id) = copy_source(store, stages, f, say)?;
-                    let content = key(&["from", &id, &srcs.join("\u{1}")]);
-                    (Src::Layers(layers), content)
-                }
-            };
-            let k = key(&[&st.chain, "copy", &content, &dst, &st.workdir, chown.as_deref().unwrap_or("")]);
-            let (lowers, workdir) = (st.layer_paths(store)?, st.workdir.clone());
-            commit(store, st, k, a.no_cache, say, |stage| {
-                let (out, targets) = copy_layer(stage, &source, &srcs, &dst, &workdir, &lowers)?;
-                if let Some(c) = &chown {
-                    apply_chown(c, &targets, &lowers)?;
-                }
-                Ok(out)
-            })?;
+        Instruction::Copy(spec) => copy_step(store, ctx, ig, a, stages, st, spec, say)?,
+        Instruction::Run { cmd, mounts } => run_instruction(store, ctx, ig, a, st, cmd, mounts, &step.text, say)?,
+    }
+    Ok(())
+}
+
+/// `COPY` / `ADD`: gather what is not a context path (heredoc files, downloaded URLs), then build the layer.
+#[allow(clippy::too_many_arguments)]
+fn copy_step(store: &Store, ctx: &Path, ig: &Ignore, a: &BuildArgs, stages: &Stages, st: &mut State, spec: &CopySpec, say: &mut dyn FnMut(String)) -> Result<()> {
+    let vars = st.vars();
+    let srcs: Vec<String> = spec.srcs.iter().map(|s| dockerfile::subst(s, &vars)).collect();
+    let dst = dockerfile::subst(&spec.dst, &vars);
+    let chown = spec.chown.as_ref().map(|c| dockerfile::subst(c, &vars));
+    let chmod = spec.chmod.as_deref().and_then(|m| u32::from_str_radix(m, 8).ok());
+    let pre = store.new_staging_dir("add").map_err(img)?;
+    let result = (|| {
+        // sources that are not paths of the build context
+        let mut extra: HashMap<String, PathBuf> = HashMap::new();
+        for h in &spec.heredocs {
+            let dir = pre.join(format!("inline-{}", extra.len()));
+            fs::create_dir_all(&dir).map_err(io_err("mkdir"))?;
+            let body = if h.expand { dockerfile::subst(&h.body, &vars) } else { h.body.clone() };
+            fs::write(dir.join(&h.name), body).map_err(io_err("write heredoc"))?;
+            extra.insert(h.name.clone(), dir.join(&h.name));
         }
-        Instruction::Run(c) => {
-            let argv = argv(c);
-            if argv.is_empty() {
-                return Err(Error::Usage("RUN needs a command".into()));
+        for s in srcs.iter().filter(|s| spec.add && docker_image::is_url(s)) {
+            let dir = pre.join(format!("url-{}", extra.len()));
+            fs::create_dir_all(&dir).map_err(io_err("mkdir"))?;
+            let name = Some(docker_image::url_filename(s)).filter(|n| !n.is_empty()).unwrap_or_else(|| "download".into());
+            say(format!(" ---> Downloading {s}"));
+            docker_image::fetch_url(s, &dir.join(&name)).map_err(img)?;
+            extra.insert(s.clone(), dir.join(name));
+        }
+        let (source, content) = match &spec.from {
+            None => (
+                Src::Context(Local { ctx, ig, extra: Some(&extra), add: spec.add }),
+                hash_sources(ctx, ig, &srcs, Some(&extra))?,
+            ),
+            Some(f) => {
+                let (layers, id) = copy_source(store, stages, f, say)?;
+                (Src::Layers(layers), key(&["from", &id, &srcs.join("\u{1}")]))
             }
-            let (lowers, env, workdir, user) = (st.layer_paths(store)?, st.run_env(), st.workdir.clone(), st.user.clone());
-            let k = key(&[&st.chain, "run", &argv.join("\u{1}"), &env.join("\u{1}"), &workdir, &user]);
-            let text = step.text.clone();
-            commit(store, st, k, a.no_cache, say, |stage| {
-                let (upper, work, empty) = (stage.join("upper"), stage.join("work"), stage.join("empty"));
-                for d in [&upper, &work, &empty] {
-                    fs::create_dir_all(d).map_err(io_err(format!("mkdir {}", d.display())))?;
+        };
+        let k = key(&[
+            &st.chain,
+            if spec.add { "add" } else { "copy" },
+            &content,
+            &dst,
+            &st.workdir,
+            chown.as_deref().unwrap_or(""),
+            spec.chmod.as_deref().unwrap_or(""),
+        ]);
+        let (lowers, workdir) = (st.layer_paths(store)?, st.workdir.clone());
+        commit(store, st, k, a.no_cache, say, |stage| {
+            let (out, targets) = copy_layer(stage, &source, &srcs, &dst, &workdir, &lowers)?;
+            if let Some(c) = &chown {
+                apply_chown(c, &targets, &lowers)?;
+            }
+            if let Some(mode) = chmod {
+                targets.iter().for_each(|t| chmod_tree(t, mode));
+            }
+            Ok(out)
+        })
+    })();
+    let _ = fs::remove_dir_all(&pre);
+    result
+}
+
+/// `RUN --mount=...` -> bind mounts for the build container, plus the in-image paths of secret
+/// mount points (the empty file the runtime creates there must not end up in the layer).
+fn prepare_mounts(store: &Store, ctx: &Path, ig: &Ignore, secrets: &[(String, String)], mounts: &[Mount], stage: &Path) -> Result<(Vec<Volume>, Vec<String>)> {
+    let (mut vols, mut secret_paths) = (vec![], vec![]);
+    for (i, m) in mounts.iter().enumerate() {
+        match m {
+            Mount::Cache { target, id } => {
+                let name: String = id.as_deref().unwrap_or(target).chars().map(|c| if c.is_ascii_alphanumeric() || "_.-".contains(c) { c } else { '_' }).collect();
+                let dir = store.root().join("buildcache").join(name);
+                fs::create_dir_all(&dir).map_err(io_err(format!("mkdir {}", dir.display())))?;
+                vols.push(Volume { host: dir.to_string_lossy().into_owned(), container: target.clone(), ro: false });
+            }
+            // ponytail: a plain directory, not memory backed; the contents vanish with the staging dir
+            Mount::Tmpfs { target } => {
+                let dir = stage.join(format!("tmpfs-{i}"));
+                fs::create_dir_all(&dir).map_err(io_err("mkdir tmpfs"))?;
+                vols.push(Volume { host: dir.to_string_lossy().into_owned(), container: target.clone(), ro: false });
+            }
+            Mount::Bind { source, target, rw } => {
+                let p = resolve_src(ctx, source)?;
+                let host = if *rw {
+                    // writes must not reach the context: work on a copy that is thrown away
+                    let copy = stage.join(format!("bind-{i}"));
+                    if fs::metadata(&p).map_err(io_err("stat"))?.is_dir() {
+                        copy_tree(&p, &copy, ctx, ig, true)?;
+                    } else {
+                        copy_entry(&p, &copy)?;
+                    }
+                    copy
+                } else {
+                    p
+                };
+                vols.push(Volume { host: host.to_string_lossy().into_owned(), container: target.clone(), ro: !*rw });
+            }
+            Mount::Secret { id, target, required } => match secrets.iter().find(|(k, _)| k == id) {
+                Some((_, src)) => {
+                    let p = fs::canonicalize(src).map_err(io_err(format!("secret {id}: {src}")))?;
+                    let target = target.clone().unwrap_or_else(|| format!("/run/secrets/{id}"));
+                    secret_paths.push(target.clone());
+                    vols.push(Volume { host: p.to_string_lossy().into_owned(), container: target, ro: true });
                 }
-                let lowers = if lowers.is_empty() { vec![empty] } else { lowers }; // FROM scratch
-                let code = run_step(&Step { layers: &lowers, upper: &upper, work: &work, cmd: &argv, env: &env, workdir: &workdir, user: &user })?;
-                if code != 0 {
-                    return Err(Error::Usage(format!("The command '{text}' returned a non-zero code: {code}")));
-                }
-                scrub(&upper);
-                Ok(upper)
-            })?;
+                None if *required => return Err(Error::Usage(format!("secret {id:?} is required but was not given (docker build --secret id={id},src=<file>)"))),
+                None => {}
+            },
+        }
+    }
+    Ok((vols, secret_paths))
+}
+
+/// Drop the empty file (and the empty directories above it) the runtime made as a secret's mount point.
+fn scrub_mountpoints(upper: &Path, paths: &[String]) {
+    for p in paths {
+        let mut f = join_in(upper, p);
+        if fs::symlink_metadata(&f).is_ok_and(|m| m.is_file() && m.len() == 0) {
+            let _ = fs::remove_file(&f);
+            while f.pop() && f != upper && fs::remove_dir(&f).is_ok() {}
+        }
+    }
+}
+
+/// What the cache key must know about the mounts: bind content, cache/secret identity (never secret content).
+fn mounts_key(ctx: &Path, ig: &Ignore, mounts: &[Mount]) -> Result<String> {
+    let mut parts = vec![];
+    for m in mounts {
+        parts.push(match m {
+            Mount::Bind { source, target, rw } => format!("bind:{target}:{rw}:{}", hash_sources(ctx, ig, std::slice::from_ref(source), None)?),
+            other => format!("{other:?}"),
+        });
+    }
+    Ok(parts.join("\u{1}"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_instruction(store: &Store, ctx: &Path, ig: &Ignore, a: &BuildArgs, st: &mut State, c: &Cmd, mounts: &[Mount], text: &str, say: &mut dyn FnMut(String)) -> Result<()> {
+    let argv = argv(c, &st.shell);
+    if argv.is_empty() || matches!(c, Cmd::Shell(s) if s.trim().is_empty()) {
+        return Err(Error::Usage("RUN needs a command".into()));
+    }
+    let (lowers, env, workdir, user) = (st.layer_paths(store)?, st.run_env(), st.workdir.clone(), st.user.clone());
+    let k = key(&[&st.chain, "run", &argv.join("\u{1}"), &env.join("\u{1}"), &workdir, &user, &mounts_key(ctx, ig, mounts)?]);
+    let text = text.to_string();
+    commit(store, st, k, a.no_cache, say, |stage| {
+        let (upper, work, empty) = (stage.join("upper"), stage.join("work"), stage.join("empty"));
+        for d in [&upper, &work, &empty] {
+            fs::create_dir_all(d).map_err(io_err(format!("mkdir {}", d.display())))?;
+        }
+        let lowers = if lowers.is_empty() { vec![empty] } else { lowers }; // FROM scratch
+        let (volumes, secret_paths) = prepare_mounts(store, ctx, ig, &a.secrets, mounts, stage)?;
+        let code = run_step(&Step { layers: &lowers, upper: &upper, work: &work, cmd: &argv, env: &env, workdir: &workdir, user: &user, volumes: &volumes })?;
+        if code != 0 {
+            return Err(Error::Usage(format!("The command '{text}' returned a non-zero code: {code}")));
+        }
+        scrub(&upper);
+        scrub_mountpoints(&upper, &secret_paths);
+        Ok(upper)
+    })
+}
+
+/// `linux/arm64` or `linux/amd64` for the machine we run on.
+fn host_platform() -> String {
+    let arch = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "amd64",
+        other => other,
+    };
+    format!("linux/{arch}")
+}
+
+/// Run the `ONBUILD` triggers a base image brought along (they are not inherited by this image).
+#[allow(clippy::too_many_arguments)]
+fn run_triggers(store: &Store, ctx: &Path, ig: &Ignore, a: &BuildArgs, globals: &HashMap<String, String>, stages: &Stages, st: &mut State, say: &mut dyn FnMut(String)) -> Result<()> {
+    let triggers = std::mem::take(&mut st.onbuild);
+    if !triggers.is_empty() {
+        say(format!(" ---> Executing {} build trigger(s)", triggers.len()));
+    }
+    for t in triggers {
+        for s in dockerfile::parse(&t).map_err(img)? {
+            apply(store, ctx, ig, a, globals, stages, st, &s, say)?;
         }
     }
     Ok(())
@@ -627,10 +856,23 @@ pub fn build(a: &BuildArgs, say: &mut dyn FnMut(String)) -> Result<ImageMeta> {
     let df = a.file.as_ref().map_or_else(|| ctx.join("Dockerfile"), PathBuf::from);
     let text = fs::read_to_string(&df).map_err(io_err(format!("read {}", df.display())))?;
     let steps = dockerfile::parse(&text).map_err(img)?;
-    let ignore = fs::read_to_string(ctx.join(".dockerignore")).map(|t| Ignore::parse(&t)).unwrap_or_default();
+    // BuildKit reads `<Dockerfile>.dockerignore` next to the Dockerfile in preference to the context's `.dockerignore`
+    let df_ignore = PathBuf::from(format!("{}.dockerignore", df.display()));
+    let ignore = fs::read_to_string(&df_ignore).or_else(|_| fs::read_to_string(ctx.join(".dockerignore"))).map(|t| Ignore::parse(&t)).unwrap_or_default();
+    let host = host_platform();
+    if let Some(p) = &a.platform
+        && p != &host
+    {
+        return Err(Error::Usage(format!("cannot build for platform {p}: only the host platform ({host}) is supported")));
+    }
 
     let total = steps.len();
-    let mut globals: HashMap<String, String> = HashMap::new(); // ARGs declared before the first FROM
+    // ARGs declared before the first FROM, plus the platform ones BuildKit predefines
+    let (os, arch) = host.split_once('/').unwrap_or(("linux", "arm64"));
+    let mut globals: HashMap<String, String> = [("BUILDPLATFORM", host.as_str()), ("TARGETPLATFORM", host.as_str()), ("BUILDOS", os), ("TARGETOS", os), ("BUILDARCH", arch), ("TARGETARCH", arch)]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
     let mut stages: Stages = vec![]; // finished stages
     let mut state: Option<State> = None;
     let mut alias: Option<String> = None;
@@ -643,7 +885,7 @@ pub fn build(a: &BuildArgs, say: &mut dyn FnMut(String)) -> Result<ImageMeta> {
                     globals.insert(name.clone(), v);
                 }
             }
-            Instruction::From { image, alias: next_alias } => {
+            Instruction::From { image, alias: next_alias, platform } => {
                 if let Some(done) = state.take() {
                     let reached = a.target.is_some() && alias == a.target;
                     stages.push((alias.take(), done));
@@ -653,10 +895,15 @@ pub fn build(a: &BuildArgs, say: &mut dyn FnMut(String)) -> Result<ImageMeta> {
                 }
                 alias = next_alias.clone();
                 let image = dockerfile::subst(image, &globals);
+                if let Some(p) = platform.as_ref().map(|p| dockerfile::subst(p, &globals)).filter(|p| *p != host) {
+                    say(format!(" ---> (FROM --platform={p}: only {host} is built, using the local image)"));
+                }
                 state = Some(match stages.iter().rev().find(|(al, _)| al.as_deref() == Some(image.as_str())) {
                     Some((_, prev)) => State { args: BTreeMap::new(), ..prev.clone() }, // FROM <earlier stage>
                     None => from(&store, &image, say)?,
                 });
+                let st = state.as_mut().expect("just set");
+                run_triggers(&store, &ctx, &ignore, a, &globals, &stages, st, say)?;
             }
             _ => {
                 let st = state.as_mut().ok_or_else(|| Error::Usage("the Dockerfile must start with FROM".into()))?;
@@ -671,7 +918,7 @@ pub fn build(a: &BuildArgs, say: &mut dyn FnMut(String)) -> Result<ImageMeta> {
         Some(t) => stages.iter().find(|(al, _)| al.as_deref() == Some(t.as_str())).map(|(_, s)| s.clone()).ok_or_else(|| Error::Usage(format!("target stage {t:?} not found")))?,
         None => stages.last().map(|(_, s)| s.clone()).ok_or_else(|| Error::Usage("the Dockerfile has no FROM".into()))?,
     };
-    let meta = ImageMeta {
+    let mut meta = ImageMeta {
         name: tag.display(),
         layers: st.layers,
         entrypoint: st.entrypoint,
@@ -682,7 +929,12 @@ pub fn build(a: &BuildArgs, say: &mut dyn FnMut(String)) -> Result<ImageMeta> {
         exposed: st.exposed,
         labels: st.labels,
         healthcheck: st.health,
+        onbuild: st.onbuild,
+        volumes: st.volumes,
+        stop_signal: st.stop_signal,
+        shell: st.shell,
     };
+    meta.labels.extend(a.labels.iter().cloned()); // --label wins over LABEL
     store.save(&tag, &meta).map_err(img)?;
     say(format!("Successfully built and tagged {}", meta.name));
     Ok(meta)
@@ -725,20 +977,20 @@ mod tests {
         let ctx = fs::canonicalize(tmp("hash")).unwrap();
         let none = Ignore::default();
         fs::write(ctx.join("f"), "one").unwrap();
-        let a = hash_sources(&ctx, &none, &["f".into()]).unwrap();
-        assert_eq!(a, hash_sources(&ctx, &none, &["f".into()]).unwrap());
+        let a = hash_sources(&ctx, &none, &["f".into()], None).unwrap();
+        assert_eq!(a, hash_sources(&ctx, &none, &["f".into()], None).unwrap());
         fs::write(ctx.join("f"), "two").unwrap();
-        assert_ne!(a, hash_sources(&ctx, &none, &["f".into()]).unwrap());
+        assert_ne!(a, hash_sources(&ctx, &none, &["f".into()], None).unwrap());
 
         // an ignored file does not influence the hash, a kept one does
         fs::create_dir_all(ctx.join("d")).unwrap();
         fs::write(ctx.join("d/keep"), "k").unwrap();
         let ig = Ignore::parse("d/skip\n");
-        let h1 = hash_sources(&ctx, &ig, &["d".into()]).unwrap();
+        let h1 = hash_sources(&ctx, &ig, &["d".into()], None).unwrap();
         fs::write(ctx.join("d/skip"), "noise").unwrap();
-        assert_eq!(h1, hash_sources(&ctx, &ig, &["d".into()]).unwrap());
+        assert_eq!(h1, hash_sources(&ctx, &ig, &["d".into()], None).unwrap());
         fs::write(ctx.join("d/keep"), "changed").unwrap();
-        assert_ne!(h1, hash_sources(&ctx, &ig, &["d".into()]).unwrap());
+        assert_ne!(h1, hash_sources(&ctx, &ig, &["d".into()], None).unwrap());
 
         let outside = ctx.parent().unwrap().join(format!("rd-outside-{}", std::process::id()));
         fs::write(&outside, "x").unwrap();
@@ -764,7 +1016,7 @@ mod tests {
         let ctx = fs::canonicalize(ctx).unwrap();
         let none: Vec<PathBuf> = vec![];
         let ig = Ignore::default();
-        let c = Src::Context(&ctx, &ig);
+        let c = Src::Context(Local::new(&ctx, &ig));
 
         let (out, _) = copy_layer(&stage, &c, &["a.txt".into()], "/etc/renamed", "/", &none).unwrap();
         assert!(out.join("etc/renamed").is_file());
@@ -777,18 +1029,18 @@ mod tests {
 
         let _ = fs::remove_dir_all(stage.join("layer")); // a real build gets a fresh staging dir per step
         let ig = Ignore::parse("**/cache\n*.log\n!d/debug.log\n");
-        let c = Src::Context(&ctx, &ig);
+        let c = Src::Context(Local::new(&ctx, &ig));
         let (out, _) = copy_layer(&stage, &c, &["d".into()], "/dst", "/", &none).unwrap();
         assert!(out.join("dst/inner/x").is_file(), "kept files are copied");
         assert!(!out.join("dst/cache").exists(), "ignored directory is skipped");
         assert!(out.join("dst/debug.log").is_file(), "! re-includes a file");
         let ig = Ignore::parse("a.txt\n");
-        let err = copy_layer(&stage, &Src::Context(&ctx, &ig), &["a.txt".into()], "/x", "/", &none).unwrap_err();
+        let err = copy_layer(&stage, &Src::Context(Local::new(&ctx, &ig)), &["a.txt".into()], "/x", "/", &none).unwrap_err();
         assert!(err.to_string().contains(".dockerignore"));
 
         let lower = tmp("copy-lower");
         fs::create_dir_all(lower.join("app")).unwrap();
-        let (out, _) = copy_layer(&stage, &Src::Context(&ctx, &Ignore::default()), &["a.txt".into()], "/app", "/", &[lower.clone()]).unwrap();
+        let (out, _) = copy_layer(&stage, &Src::Context(Local::new(&ctx, &Ignore::default())), &["a.txt".into()], "/app", "/", &[lower.clone()]).unwrap();
         assert!(out.join("app/a.txt").is_file(), "a file copied onto an existing image directory goes inside it");
         for d in [&ctx, &stage, &lower] {
             let _ = fs::remove_dir_all(d);

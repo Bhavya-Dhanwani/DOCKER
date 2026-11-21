@@ -159,7 +159,15 @@ pub fn exec(q: &str, cmd: &[String], tty: bool) -> Result<i32, Box<dyn Error>> {
 }
 
 pub fn build(args: &docker_core::cli::BuildArgs) -> Res {
-    platform::build(args, &mut |line| println!("{line}"))?;
+    let meta = platform::build(args, &mut |line| {
+        if !args.quiet {
+            println!("{line}");
+        }
+    })?;
+    if args.quiet {
+        // no separate image ids here: the top layer digest identifies the result
+        println!("{}", meta.layers.last().map_or(meta.name.as_str(), |l| l.digest.as_str()));
+    }
     Ok(())
 }
 
@@ -246,13 +254,19 @@ fn cancel_restart(q: &str) -> Result<Option<Entry>, Box<dyn Error>> {
     Ok(None)
 }
 
+/// The image's `STOPSIGNAL`, SIGTERM when it has none.
+fn stop_signal_of(e: &Entry) -> i32 {
+    let meta = Reference::parse(&e.image).ok().and_then(|r| store().get(&r).ok().flatten());
+    meta.and_then(|m| docker_image::dockerfile::parse_signal(&m.stop_signal)).unwrap_or(15)
+}
+
 pub fn stop(q: &str, timeout: u64) -> Res {
     if cancel_restart(q)?.is_some() {
         return Ok(());
     }
     let e = running(q)?;
     registry::request_stop(&e.id)?; // a restart policy must not revive it
-    let _ = platform::signal(&e, 15);
+    let _ = platform::signal(&e, stop_signal_of(&e));
     wait_until_gone(&e, timeout * 10);
     if e.running() {
         platform::stop(&e.id)?;

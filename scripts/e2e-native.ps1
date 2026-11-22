@@ -34,6 +34,7 @@ foreach ($c in @('ps', 'ps -a', 'images', 'volume ls', 'network ls', 'system df'
 $st = Run @('stats', '--no-stream', '--json')
 Check 'stats --json works (empty when nothing runs)' ($st.Code -eq 0)
 
+& $Docker container prune | Out-Null
 Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item Env:SASTA_NO_WSL
 if ($fails -eq 0) { 'ALL PASSED' } else { "$fails FAILED"; exit 1 }

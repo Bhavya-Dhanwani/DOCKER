@@ -1,14 +1,21 @@
 //! Desktop app for Sasta Docker: containers, images, volumes and networks.
 //! It talks to the engine only through the sibling `docker` CLI, on background threads.
 mod app;
+mod catalog;
+mod catalog_dialog;
+mod charts;
 mod console;
 mod dialogs;
+mod engine;
 mod format;
+mod group_dialog;
+mod groups;
 mod parse;
 mod spec;
 mod state;
 mod tabs;
 mod theme;
+mod usage;
 mod worker;
 
 use eframe::egui;

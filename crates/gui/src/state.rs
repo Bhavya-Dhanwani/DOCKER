@@ -8,6 +8,7 @@ pub enum Tab {
     Images,
     Volumes,
     Networks,
+    Live,
 }
 
 /// Something that can be refreshed from the CLI.
@@ -32,6 +33,11 @@ pub struct Data {
     /// last error per kind of data (shown as a banner instead of a toast so polling does not spam)
     pub errors: HashMap<Kind, String>,
     pub loaded: HashSet<Kind>,
+    pub usage: crate::usage::History,
+    pub groups: Vec<crate::groups::Group>,
+    /// Some(reason) in native Windows mode (no Linux engine)
+    pub native: Option<String>,
+    pub banner_dismissed: bool,
 }
 
 /// A mutating CLI call (one or more invocations) with a human label.
@@ -57,6 +63,11 @@ pub enum Cmd {
     RunDialog(String),
     BuildDialog,
     Copy(String),
+    /// copy `text`, tell the user `note`
+    CopyNote(String, String),
+    /// run these (ticked) images together as a group
+    GroupDialog(Vec<String>),
+    CatalogDialog,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

@@ -1,17 +1,23 @@
 //! The eframe app: owns the data, polls the background workers, lays out sidebar / tabs / status bar.
 use crate::{
     console::{self, Console, ConsoleAction, StatsView},
+    catalog_dialog::{self, CatalogDialog, CatalogOutcome},
+    engine,
     dialogs::{self, BuildDialog, Dialog, Outcome, RunDialog},
+    group_dialog::{self, GroupDialog, GroupOutcome},
+    groups::{self, GroupRun},
     format::fmt_bytes,
     parse,
     state::{Cmd, Data, Kind, Level, Tab, Task, Toast, prune_toasts},
-    tabs::{containers, images, resources},
+    tabs::{containers, images, live, resources},
+    usage,
     theme,
     worker::{self, Event, Worker, run_cli, run_steps},
 };
 use eframe::egui::{self, Color32, RichText};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
+    path::PathBuf,
     sync::mpsc::Receiver,
     time::{Duration, Instant},
 };
@@ -34,6 +40,17 @@ pub struct App {
     cui: containers::UiState,
     iui: images::UiState,
     rui: resources::UiState,
+    lui: live::UiState,
+    groups_path: Option<PathBuf>,
+    group_run: Option<GroupRun>,
+    /// no group pruning before this moment (new containers may not be in `ps` yet)
+    prune_after: Instant,
+    usage_pending: bool,
+    usage_started: Option<Instant>,
+    pull_queue: VecDeque<String>,
+    minimized: bool,
+    version_started: Option<Instant>,
+    version_pending: bool,
 }
 
 impl App {
@@ -41,12 +58,14 @@ impl App {
         let dark = cc.egui_ctx.style().visuals.dark_mode;
         theme::apply(&cc.egui_ctx, dark);
         let (w, rx) = Worker::new(cc.egui_ctx.clone());
+        let groups_path = groups::default_path();
+        let data = Data { groups: groups_path.as_deref().map(groups::load).unwrap_or_default(), ..Data::default() };
         App {
             w,
             rx,
-            tab: Tab::Containers,
+            tab: if std::env::var("SASTA_TAB").is_ok_and(|t| t == "live") { Tab::Live } else { Tab::Containers },
             dark,
-            data: Data::default(),
+            data,
             last: HashMap::new(),
             pending: HashSet::new(),
             busy: vec![],
@@ -59,6 +78,16 @@ impl App {
             cui: Default::default(),
             iui: Default::default(),
             rui: Default::default(),
+            lui: Default::default(),
+            groups_path,
+            group_run: None,
+            prune_after: Instant::now(),
+            usage_pending: false,
+            usage_started: None,
+            pull_queue: VecDeque::new(),
+            minimized: false,
+            version_started: None,
+            version_pending: false,
         }
     }
 
@@ -68,7 +97,7 @@ impl App {
 
     fn tab_kind(&self) -> Kind {
         match self.tab {
-            Tab::Containers => Kind::Containers,
+            Tab::Containers | Tab::Live => Kind::Containers,
             Tab::Images => Kind::Images,
             Tab::Volumes => Kind::Volumes,
             Tab::Networks => Kind::Networks,
@@ -112,7 +141,42 @@ impl App {
             let id = s.id.clone();
             self.w.spawn(move || Event::Stats(id.clone(), run_cli(&worker::args(&["stats", "--no-stream", &id])).and_then(|o| parse::parse_stats(&o).ok_or_else(|| "container is not running".to_string()))));
         }
+        self.poll_version(now);
+        self.poll_usage(now);
         prune_toasts(&mut self.toasts, now);
+    }
+
+    /// One `docker stats --no-stream --json` at a time, about once a second; slower when nothing runs.
+    fn poll_usage(&mut self, now: Instant) {
+        if self.usage_pending || self.minimized {
+            return;
+        }
+        let any_running = self.data.containers.iter().any(|c| c.state == parse::State::Running);
+        let every = if any_running || self.data.usage.err.is_some() || self.tab == Tab::Live { Duration::from_millis(1000) } else { Duration::from_secs(5) };
+        if self.usage_started.is_some_and(|t| now.duration_since(t) < every) {
+            return;
+        }
+        self.usage_pending = true;
+        self.usage_started = Some(now);
+        self.w.spawn(|| Event::Usage(run_cli(&worker::args(&["stats", "--no-stream", "--json"])).map(|o| usage::parse_json_lines(&o))));
+    }
+
+    /// `docker version` at startup and every ~30 s: tells native Windows mode from a Linux VM.
+    fn poll_version(&mut self, now: Instant) {
+        if self.version_pending || self.version_started.is_some_and(|t| now.duration_since(t) < Duration::from_secs(30)) {
+            return;
+        }
+        self.version_pending = true;
+        self.version_started = Some(now);
+        self.w.spawn(|| Event::Version(run_cli(&worker::args(&["version"]))));
+    }
+
+    fn save_groups(&mut self) {
+        if let Some(p) = &self.groups_path
+            && let Err(e) = groups::save(p, &self.data.groups)
+        {
+            self.toast(Level::Err, format!("Cannot save groups: {e}"));
+        }
     }
 
     fn store<T>(&mut self, kind: Kind, r: Result<T, String>, set: impl FnOnce(&mut Data, T)) {
@@ -134,6 +198,45 @@ impl App {
             Event::Containers(r) => {
                 self.store(Kind::Containers, r, |d, v| d.containers = v);
                 self.data.sync_paused();
+                if !self.data.errors.contains_key(&Kind::Containers) {
+                    let ids: Vec<&str> = self.data.containers.iter().map(|c| c.id.as_str()).collect();
+                    self.data.usage.retain_ids(&ids);
+                    let names: Vec<&str> = self.data.containers.iter().map(|c| c.name.as_str()).collect();
+                    if self.group_run.as_ref().is_none_or(|r| r.done) && Instant::now() >= self.prune_after && groups::prune(&mut self.data.groups, &names) {
+                        self.save_groups();
+                    }
+                }
+            }
+            Event::Version(r) => {
+                self.version_pending = false;
+                if let Ok(out) = r {
+                    self.data.native = engine::parse_native(&out);
+                }
+            }
+            Event::Usage(r) => {
+                self.usage_pending = false;
+                match r {
+                    Ok(v) => self.data.usage.ingest(v, Instant::now()),
+                    Err(e) => self.data.usage.fail(e.lines().next().unwrap_or("").to_string()),
+                }
+            }
+            Event::GroupStep { group, idx, result } => {
+                if let Some(r) = self.group_run.as_mut().filter(|r| r.name == group) {
+                    r.apply(idx, result);
+                }
+                self.invalidate();
+            }
+            Event::GroupDone(group) => {
+                if let Some(r) = self.group_run.as_mut().filter(|r| r.name == group) {
+                    r.finish();
+                    let ok = r.succeeded();
+                    if !ok.is_empty() {
+                        groups::upsert(&mut self.data.groups, &group, &ok);
+                        self.prune_after = Instant::now() + groups::PRUNE_GRACE;
+                        self.save_groups();
+                    }
+                }
+                self.invalidate();
             }
             Event::Images(r) => self.store(Kind::Images, r, |d, v| d.images = v),
             Event::Volumes(r) => self.store(Kind::Volumes, r, |d, v| d.volumes = v),
@@ -178,13 +281,23 @@ impl App {
                 c.running = false;
                 c.ok = Some(ok);
                 let (title, is_logs) = (c.title.clone(), c.logs_of.is_some());
+                if title.starts_with("Pull ")
+                    && let Some(next) = self.pull_queue.pop_front()
+                {
+                    let carry = self.console.take().map(|mut c| std::mem::take(&mut c.lines)).unwrap_or_default();
+                    self.start_pull(next, carry);
+                    self.invalidate();
+                    return;
+                }
                 if !is_logs {
                     self.toast(if ok { Level::Ok } else { Level::Err }, format!("{title}: {}", if ok { "finished" } else { "failed (see output)" }));
                 }
                 self.invalidate();
             }
             Event::Picked(path) => {
-                if let (false, Some(Dialog::Build(d))) = (path.is_empty(), &mut self.dialog) {
+                if let (false, Some(Dialog::Run(d))) = (path.is_empty(), &mut self.dialog) {
+                    d.folder.folder = path;
+                } else if let (false, Some(Dialog::Build(d))) = (path.is_empty(), &mut self.dialog) {
                     if d.spec.tag.trim().is_empty() {
                         d.spec.tag = dialogs::default_tag(&path);
                     }
@@ -212,6 +325,15 @@ impl App {
         self.console = Some(c); // dropping the old console stops its stream
     }
 
+    fn start_pull(&mut self, image: String, carry: Vec<String>) {
+        let left = self.pull_queue.len();
+        self.start_console(format!("Pull {image}"), worker::args(&["pull", &image]), None, true);
+        if let Some(c) = &mut self.console {
+            c.lines = carry;
+            c.push(format!("── pulling {image}{} ──", if left > 0 { format!(" ({left} more queued)") } else { String::new() }));
+        }
+    }
+
     fn start_logs(&mut self, id: String, name: String, follow: bool) {
         let args = if follow { worker::args(&["logs", "-f", &id]) } else { worker::args(&["logs", &id]) };
         self.start_console(format!("Logs: {name}"), args, Some((id, name)), follow);
@@ -224,8 +346,17 @@ impl App {
                 Cmd::Confirm(m, t) => self.confirm = Some((m, t)),
                 Cmd::Logs { id, name } => self.start_logs(id, name, true),
                 Cmd::Stats { id, name } => self.stats = Some(StatsView { id, name, last: None, err: None, pending: false, polled: None }),
-                Cmd::Pull(n) => self.start_console(format!("Pull {n}"), worker::args(&["pull", &n]), None, true),
-                Cmd::RunDialog(img) => self.dialog = Some(Dialog::Run(RunDialog::for_image(&img))),
+                Cmd::Pull(n) => {
+                    self.pull_queue.clear();
+                    self.start_pull(n, vec![]);
+                }
+                Cmd::GroupDialog(imgs) => self.dialog = Some(Dialog::Group(GroupDialog::new(&imgs))),
+                Cmd::CatalogDialog => self.dialog = Some(Dialog::Catalog(CatalogDialog::default())),
+                Cmd::CopyNote(text, note) => {
+                    ctx.copy_text(text);
+                    self.toast(Level::Ok, note);
+                }
+                Cmd::RunDialog(img) => self.dialog = Some(Dialog::Run(Box::new(RunDialog::for_image(&img)))),
                 Cmd::BuildDialog => self.dialog = Some(Dialog::Build(BuildDialog::default())),
                 Cmd::Copy(text) => {
                     ctx.copy_text(text.clone());
@@ -238,8 +369,30 @@ impl App {
     fn windows(&mut self, ctx: &egui::Context) {
         if let Some(mut d) = self.dialog.take() {
             let outcome = match &mut d {
-                Dialog::Run(r) => dialogs::show_run(ctx, r),
+                Dialog::Run(r) => dialogs::show_run(ctx, r, &self.w, self.data.native.is_some()),
                 Dialog::Build(b) => dialogs::show_build(ctx, b, &self.w),
+                Dialog::Group(g) => match group_dialog::show(ctx, g) {
+                    GroupOutcome::Open => Outcome::Open,
+                    GroupOutcome::Cancel => Outcome::Cancel,
+                    GroupOutcome::Run { group, network, runs, members } => {
+                        self.group_run = Some(GroupRun::new(&group, &members));
+                        self.w.run_group(group, network, runs);
+                        Outcome::Cancel
+                    }
+                },
+                Dialog::Catalog(c) => {
+                    let local: Vec<String> = self.data.images.iter().map(|i| i.name.clone()).collect();
+                    match catalog_dialog::show(ctx, c, &local) {
+                        CatalogOutcome::Open => Outcome::Open,
+                        CatalogOutcome::Cancel => Outcome::Cancel,
+                        CatalogOutcome::Pull(mut list) => {
+                            let first = list.remove(0);
+                            self.pull_queue = list.into();
+                            self.start_pull(first, vec![]);
+                            Outcome::Cancel
+                        }
+                    }
+                }
             };
             match outcome {
                 Outcome::Open => self.dialog = Some(d),
@@ -252,6 +405,9 @@ impl App {
                     }
                 }
             }
+        }
+        if self.group_run.as_ref().is_some_and(|r| !group_dialog::show_progress(ctx, r)) {
+            self.group_run = None;
         }
         if let Some((msg, task)) = self.confirm.take() {
             match dialogs::show_confirm(ctx, &msg) {
@@ -288,6 +444,7 @@ impl App {
             (Tab::Images, "🖼 Images", d.images.len().to_string()),
             (Tab::Volumes, "💾 Volumes", d.volumes.len().to_string()),
             (Tab::Networks, "🌐 Networks", d.networks.len().to_string()),
+            (Tab::Live, "📈 Live", running.to_string()),
         ];
         for (tab, label, count) in items {
             let text = RichText::new(format!("{label}   {count}")).size(15.0);
@@ -307,7 +464,7 @@ impl App {
 
     fn status_bar(&self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let engine_ok = !self.data.errors.contains_key(&Kind::Containers) && self.data.is_loaded(Kind::Containers);
+            let engine_ok = (self.data.native.is_some() || !self.data.errors.contains_key(&Kind::Containers)) && self.data.is_loaded(Kind::Containers);
             ui.label(RichText::new("●").color(if engine_ok { theme::GREEN } else { theme::RED }));
             let df = self.data.df.clone().unwrap_or_default();
             let disk = df.image_bytes + df.volume_bytes;
@@ -353,6 +510,7 @@ impl eframe::App for App {
         while let Ok(e) = self.rx.try_recv() {
             self.on_event(e);
         }
+        self.minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
         self.tick();
         ctx.request_repaint_after(Duration::from_millis(500));
 
@@ -362,7 +520,26 @@ impl eframe::App for App {
         let mut cmds = vec![];
         let mut retry = false;
         egui::CentralPanel::default().show(ctx, |ui| {
-            let err = self.data.errors.get(&Kind::Containers).or_else(|| self.data.errors.get(&self.tab_kind()));
+            if self.data.native.is_some() && !self.data.banner_dismissed {
+                egui::Frame::new().fill(theme::AMBER.gamma_multiply(0.3)).corner_radius(6).inner_margin(10).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(RichText::new(engine::BANNER).strong());
+                    if let Some(why) = self.data.native.as_deref().filter(|w| !w.is_empty()) {
+                        ui.label(RichText::new(format!("Reason: {why}")).weak().small());
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("📋 Copy command").clicked() {
+                            ui.ctx().copy_text(engine::INSTALL_COMMAND.to_string());
+                        }
+                        if ui.button("Dismiss").clicked() {
+                            self.data.banner_dismissed = true;
+                        }
+                    });
+                });
+                ui.add_space(6.0);
+            }
+            // native mode: empty lists are normal, the engine is not "unavailable"
+            let err = if self.data.native.is_some() { None } else { self.data.errors.get(&Kind::Containers).or_else(|| self.data.errors.get(&self.tab_kind())) };
             if let Some(e) = err {
                 egui::Frame::new().fill(theme::RED.gamma_multiply(0.25)).corner_radius(6).inner_margin(10).show(ui, |ui| {
                     ui.set_width(ui.available_width());
@@ -377,6 +554,7 @@ impl eframe::App for App {
                 Tab::Images => images::show(ui, &self.data, &mut self.iui, &mut cmds),
                 Tab::Volumes => resources::volumes(ui, &self.data, &mut self.rui, &mut cmds),
                 Tab::Networks => resources::networks(ui, &self.data, &mut self.rui, &mut cmds),
+                Tab::Live => live::show(ui, &self.data, &mut self.lui),
             }
         });
         if retry {

@@ -4,11 +4,14 @@ use crate::{
     state::{Cmd, Data, Kind, Task, effective_state},
     theme,
 };
+use super::usage_ui;
 use eframe::egui::{self, RichText, Ui};
+use std::collections::HashSet;
 
 #[derive(Default)]
 pub struct UiState {
     pub filter: String,
+    pub collapsed: HashSet<String>,
 }
 
 fn status_text(c: &Container, state: State) -> String {
@@ -77,13 +80,32 @@ pub fn show(ui: &mut Ui, data: &Data, st: &mut UiState, out: &mut Vec<Cmd>) {
         return;
     }
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-        for c in rows {
-            row(ui, c, effective_state(c, &data.paused), out);
+        let mut shown: HashSet<&str> = HashSet::new();
+        for g in &data.groups {
+            let members: Vec<&Container> = rows.iter().copied().filter(|c| g.members.contains(&c.name)).collect();
+            if members.is_empty() {
+                continue;
+            }
+            usage_ui::group_header(ui, g, data, &mut st.collapsed, out);
+            if !st.collapsed.contains(&g.name) {
+                for c in &members {
+                    ui.indent(("grp", &c.id), |ui| row(ui, c, data, out));
+                }
+            }
+            shown.extend(members.iter().map(|c| c.id.as_str()));
+        }
+        let rest: Vec<&Container> = rows.iter().copied().filter(|c| !shown.contains(c.id.as_str())).collect();
+        if !shown.is_empty() && !rest.is_empty() {
+            ui.label(RichText::new("Other containers").strong().size(15.0));
+        }
+        for c in rest {
+            row(ui, c, data, out);
         }
     });
 }
 
-fn row(ui: &mut Ui, c: &Container, state: State, out: &mut Vec<Cmd>) {
+fn row(ui: &mut Ui, c: &Container, data: &Data, out: &mut Vec<Cmd>) {
+    let state = effective_state(c, &data.paused);
     let color = theme::state_color(state, c.health.as_deref());
     let id = c.id.as_str();
     let name = c.label().to_string();
@@ -102,6 +124,7 @@ fn row(ui: &mut Ui, c: &Container, state: State, out: &mut Vec<Cmd>) {
                 ui.label(RichText::new(format!("·  {}", c.command)).weak().small().monospace());
             }
         });
+        usage_ui::card_block(ui, data.usage.get(&c.id), state == State::Running);
         ui.horizontal(|ui| {
             let live = c.is_live();
             let t = |label: &str, args: &[&str]| Cmd::Task(Task::new(format!("{label} {name}"), args));

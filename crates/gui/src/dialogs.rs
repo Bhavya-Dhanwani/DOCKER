@@ -1,19 +1,23 @@
 //! Modal-style windows: run container, build image, confirm.
 use crate::{
-    spec::{BuildSpec, Restart, RunSpec},
+    spec::{BuildSpec, FolderSpec, Restart, RunSpec},
     theme,
     worker::Worker,
 };
 use eframe::egui::{self, RichText, Ui};
 
 pub enum Dialog {
-    Run(RunDialog),
+    Run(Box<RunDialog>),
     Build(BuildDialog),
+    Group(crate::group_dialog::GroupDialog),
+    Catalog(crate::catalog_dialog::CatalogDialog),
 }
 
 #[derive(Default)]
 pub struct RunDialog {
     pub spec: RunSpec,
+    pub folder_mode: bool,
+    pub folder: FolderSpec,
     pub error: Option<String>,
 }
 
@@ -32,7 +36,7 @@ pub enum Outcome {
 
 impl RunDialog {
     pub fn for_image(image: &str) -> Self {
-        RunDialog { spec: RunSpec { image: image.into(), ..Default::default() }, error: None }
+        RunDialog { spec: RunSpec { image: image.into(), ..Default::default() }, folder_mode: false, folder: FolderSpec::default(), error: None }
     }
 }
 
@@ -66,10 +70,49 @@ fn footer(ui: &mut Ui, error: &Option<String>, ok: &str) -> Option<bool> {
     out
 }
 
-pub fn show_run(ctx: &egui::Context, d: &mut RunDialog) -> Outcome {
+pub fn show_run(ctx: &egui::Context, d: &mut RunDialog, w: &Worker, native: bool) -> Outcome {
+    if native {
+        d.folder_mode = true; // images cannot run without the Linux engine
+    }
     let mut open = true;
     let mut out = Outcome::Open;
     egui::Window::new("Run container").open(&mut open).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+        ui.add_enabled(!native, egui::Checkbox::new(&mut d.folder_mode, "Run a Windows folder (native program, no image)")).on_disabled_hover_text(crate::engine::WHY_DISABLED);
+        if d.folder_mode {
+            let f = &mut d.folder;
+            egui::Grid::new("runf").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                field(ui, "Folder", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut f.folder).hint_text("C:\\path\\to\\app").desired_width(280.0));
+                        if cfg!(windows) && ui.button("📁 Browse…").clicked() {
+                            w.pick_folder();
+                        }
+                    });
+                });
+                field(ui, "Program", |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut f.program).hint_text("node.exe").desired_width(340.0));
+                });
+                field(ui, "Arguments", |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut f.args).hint_text("optional, e.g. server.js --port 8080").desired_width(340.0));
+                });
+                field(ui, "Memory limit (MB)", |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut f.mem_mb).hint_text("no limit").desired_width(120.0));
+                });
+                field(ui, "CPU limit (%)", |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut f.cpu).hint_text("no limit").desired_width(120.0));
+                });
+            });
+            ui.add_space(4.0);
+            match footer(ui, &d.error, "▶ Run") {
+                Some(true) => match d.folder.args() {
+                    Ok(args) => out = Outcome::Submit { title: format!("Run {}", d.folder.program.trim()), args, detach: false },
+                    Err(e) => d.error = Some(e),
+                },
+                Some(false) => out = Outcome::Cancel,
+                None => {}
+            }
+            return;
+        }
         let s = &mut d.spec;
         egui::Grid::new("run").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
             field(ui, "Image", |ui| {

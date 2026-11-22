@@ -24,6 +24,11 @@ pub enum Event {
     Networks(Res<Vec<Network>>),
     Df(Res<Df>),
     Stats(String, Res<StatRow>),
+    Version(Res<String>),
+    Usage(Res<Vec<crate::usage::Sample>>),
+    /// progress of a group run; idx None = the network step
+    GroupStep { group: String, idx: Option<usize>, result: Res<String> },
+    GroupDone(String),
     Done { label: String, steps: Vec<Vec<String>>, result: Res<String> },
     Line(u64, String),
     End(u64, bool),
@@ -94,6 +99,23 @@ impl Worker {
     fn send(&self, e: Event) {
         let _ = self.tx.send(e);
         self.ctx.request_repaint();
+    }
+
+    /// Create the group network (an existing one is fine), then start every member in order,
+    /// reporting each step. A failing member never stops the others.
+    pub fn run_group(&self, group: String, network: Vec<String>, runs: Vec<Vec<String>>) {
+        let w = self.clone();
+        thread::spawn(move || {
+            let net = match run_cli(&network) {
+                Err(e) if crate::groups::network_error_is_benign(&e) => Ok(String::new()),
+                r => r,
+            };
+            w.send(Event::GroupStep { group: group.clone(), idx: None, result: net });
+            for (i, a) in runs.iter().enumerate() {
+                w.send(Event::GroupStep { group: group.clone(), idx: Some(i), result: run_cli(a) });
+            }
+            w.send(Event::GroupDone(group));
+        });
     }
 
     /// Run `f` on a thread and deliver its event.

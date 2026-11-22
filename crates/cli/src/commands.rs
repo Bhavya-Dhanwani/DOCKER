@@ -20,22 +20,50 @@ fn clip(s: String, n: usize) -> String {
     if s.chars().count() > n { s.chars().take(n - 1).collect::<String>() + "…" } else { s }
 }
 
+/// A registry answers 401/404 for a repository that does not exist or is private: say that, like Docker does.
+fn friendly_pull_error(image: &str, err: String) -> String {
+    if err.contains("HTTP 401") || err.contains("HTTP 404") {
+        format!("pull access denied for {image}: the repository does not exist or needs `docker login` ({err})")
+    } else {
+        err
+    }
+}
+
 pub fn pull(name: &str) -> Res {
     pull_platform(name, None)
 }
 
 pub fn pull_platform(name: &str, platform: Option<&str>) -> Res {
+    pull_inner(name, platform, false)
+}
+
+/// Like Docker, `run` fetches an image that is not in the store yet instead of failing. The progress goes to
+/// stderr so that the container's own output on stdout stays clean (`docker run img cmd > file`).
+pub fn ensure_image(name: &str) -> Res {
+    if std::path::Path::new(name).is_dir() {
+        return Ok(()); // a root filesystem folder, not an image
+    }
+    let Ok(r) = Reference::parse(name) else { return Ok(()) }; // `run` reports the bad name
+    if store().get(&r)?.is_some() {
+        return Ok(());
+    }
+    eprintln!("Unable to find image '{}' locally", r.display());
+    pull_inner(name, None, true)
+}
+
+fn pull_inner(name: &str, platform: Option<&str>, to_stderr: bool) -> Res {
+    let say = |s: &str| if to_stderr { eprintln!("{s}") } else { println!("{s}") };
     let r = Reference::parse(name)?;
     let store = store();
-    println!("Pulling {}", r.display());
-    let meta = docker_image::pull_for(&store, &r, platform, &mut |line| println!("{line}"))?;
+    say(&format!("Pulling {}", r.display()));
+    let meta = docker_image::pull_for(&store, &r, platform, &mut |line| say(&line)).map_err(|e| friendly_pull_error(&r.display(), e.to_string()))?;
     #[cfg(target_os = "linux")]
     for l in &meta.layers {
         store.ensure_layer(l)?; // unpack now so `run` starts instantly
     }
     #[cfg(not(target_os = "linux"))]
-    println!("Layers downloaded; unpacking and running need a Linux host.");
-    println!("Status: pulled {} ({})", meta.name, mb(meta.size()));
+    say("Layers downloaded; unpacking and running need a Linux host.");
+    say(&format!("Status: pulled {} ({})", meta.name, mb(meta.size())));
     Ok(())
 }
 

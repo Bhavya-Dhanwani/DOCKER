@@ -14,7 +14,7 @@ use docker_core::{
     cli::{is_volume_name, Command, Config, Network, Port, Restart},
     networks, platform, registry::{self, Entry},
 };
-use docker_image::{dockerfile::parse_duration, Health, Reference, Store};
+use docker_image::{dockerfile::parse_duration, Health};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -633,11 +633,8 @@ fn new_spec() -> Spec {
 }
 
 fn check_image(image: &str) -> Res {
-    let store = Store::open(registry::data_dir().join("store"));
-    if store.get(&Reference::parse(image)?)?.is_none() {
-        return Err(format!("image {image} not found locally; run `docker pull {image}`").into());
-    }
-    Ok(())
+    // like `docker run`: fetch the image if it is not here yet
+    commands::ensure_image(image)
 }
 
 fn add_service(spec: Spec) -> Res {

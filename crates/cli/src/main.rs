@@ -51,7 +51,15 @@ fn main() -> ExitCode {
             fallback.as_deref().unwrap_or("--native was given")
         )
         .into()),
-        Command::Run(cfg) => exit_with(platform::run(&cfg).map_err(Into::into)),
+        Command::Run(cfg) => {
+            if cfg!(target_os = "linux") {
+                if let Err(e) = commands::ensure_image(&cfg.target) {
+                    eprintln!("docker: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            exit_with(platform::run(&cfg).map_err(Into::into))
+        }
         Command::Exec { id, cmd, tty } => exit_with(commands::exec(&id, &cmd, tty)),
         Command::Ps { all } => ok(commands::ps(all)),
         Command::Logs { follow, id } => ok(commands::logs(follow, &id)),

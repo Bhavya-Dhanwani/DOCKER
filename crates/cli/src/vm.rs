@@ -137,8 +137,46 @@ pub fn forward(cmd: Command) -> Res<i32> {
     let cmd = d.translate(cmd)?;
     ensure_up(&d)?;
     let argv = d.docker_argv(&cmd.to_args());
-    let status = proc(&argv).status().map_err(|e| format!("cannot run {}: {e}", argv[0]))?;
+    let mut p = proc(&argv);
+    if matches!(d, Driver::Wsl { .. }) {
+        p.env("WSLENV", wslenv(std::env::vars().map(|(k, _)| k), std::env::var("WSLENV").ok().as_deref()));
+    }
+    let status = p.status().map_err(|e| format!("cannot run {}: {e}", argv[0]))?;
     Ok(status.code().unwrap_or(1))
+}
+
+/// Windows variables the forwarded command gets to see (`${TOKEN}` in a compose file, `docker run -e TOKEN`),
+/// like Docker on Windows. System variables that mean something else on Linux stay behind.
+fn wslenv(names: impl Iterator<Item = String>, existing: Option<&str>) -> String {
+    // the engine itself reads some of these (LOCALAPPDATA picks its image store, XDG_*/DOCKER_* its settings)
+    const SKIP: [&str; 36] = [
+        "PATH", "PATHEXT", "HOME", "USER", "SHELL", "PWD", "TMPDIR", "TEMP", "TMP", "LANG", "TERM", "HOSTNAME", "WSLENV", "OS",
+        "LOCALAPPDATA", "APPDATA", "USERPROFILE", "PROGRAMDATA", "PROGRAMFILES", "COMMONPROGRAMFILES", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR",
+        "COMPUTERNAME", "USERNAME", "USERDOMAIN", "HOMEDRIVE", "HOMEPATH", "LOGONSERVER", "COMSPEC", "ALLUSERSPROFILE", "PUBLIC",
+        "SESSIONNAME", "DRIVERDATA", "ONEDRIVE", "PSMODULEPATH",
+    ];
+    const SKIP_PREFIX: [&str; 6] = ["XDG_", "DOCKER_", "SASTA_", "PROCESSOR_", "NUMBER_OF_", "ONEDRIVE"];
+    let ok = |n: &str| n.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    let mut list: Vec<String> = existing.map(|e| e.split(':').filter(|s| !s.is_empty()).map(String::from).collect()).unwrap_or_default();
+    for n in names {
+        let up = n.to_ascii_uppercase();
+        let system = SKIP.contains(&up.as_str()) || SKIP_PREFIX.iter().any(|p| up.starts_with(p)) || up.starts_with("PROGRAMFILES") || up.starts_with("COMMONPROGRAMFILES") || up.starts_with("USERDOMAIN");
+        if ok(&n) && !system && !list.contains(&n) {
+            list.push(n);
+        }
+    }
+    list.join(":")
+}
+
+#[cfg(test)]
+mod wslenv_tests {
+    use super::wslenv;
+
+    #[test]
+    fn forwards_user_variables_but_not_system_ones() {
+        let names = ["ACCESS_TOKEN", "Path", "ProgramFiles(x86)", "HOME", "A1"].map(String::from);
+        assert_eq!(wslenv(names.into_iter(), Some("X:Y")), "X:Y:ACCESS_TOKEN:A1");
+    }
 }
 
 /// First line of the VM's `docker version`, if the VM is up.

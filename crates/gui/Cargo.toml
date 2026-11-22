@@ -11,5 +11,9 @@ eframe = { version = "0.31", default-features = false, features = ["glow", "defa
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# on Linux the window needs a display backend (macOS and Windows have theirs built in)
+eframe = { version = "0.31", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+
 [lints]
 workspace = true

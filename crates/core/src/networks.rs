@@ -99,6 +99,20 @@ pub fn members(network: Option<&str>, exclude: &str) -> Vec<Entry> {
 pub struct Host {
     pub ip: String,
     pub names: Vec<String>,
+    /// `--hostname`; the default is `container`.
+    pub hostname: Option<String>,
+    /// `--add-host` entries as (name, ip), `host-gateway` already resolved.
+    pub extra: Vec<(String, String)>,
+}
+
+/// `name:ip` entries of `--add-host`; `host-gateway` means the address of the host on the container's network.
+pub fn resolve_extra_hosts(specs: &[String], network: Option<&str>) -> Vec<(String, String)> {
+    let gateway = subnet_of(network).gateway().to_string();
+    specs
+        .iter()
+        .filter_map(|s| s.split_once(':'))
+        .map(|(n, ip)| (n.to_string(), if ip == "host-gateway" { gateway.clone() } else { ip.to_string() }))
+        .collect()
 }
 
 impl Host {
@@ -106,11 +120,15 @@ impl Host {
         let mut names: Vec<String> = e.name.iter().cloned().collect();
         names.push(e.id.chars().take(12).collect());
         names.extend(e.config.iter().flat_map(|c| c.aliases.iter().cloned()));
-        Some(Host { ip: e.ip.clone()?, names })
+        let (hostname, extra) = match &e.config {
+            Some(c) => (c.hostname.clone(), resolve_extra_hosts(&c.extra_hosts, c.network_name.as_deref())),
+            None => (None, vec![]),
+        };
+        Some(Host { ip: e.ip.clone()?, names, hostname, extra })
     }
 }
 
-/// /etc/hosts for the container `own` (its own line also answers to `container`, the fixed hostname).
+/// /etc/hosts for the container `own` (its own line also answers to its hostname, `container` unless `--hostname` says otherwise).
 pub fn hosts_file(own: &Host, others: &[Host]) -> String {
     let line = |ip: &str, names: &[String]| {
         let mut seen: Vec<&str> = vec![];
@@ -122,7 +140,7 @@ pub fn hosts_file(own: &Host, others: &[Host]) -> String {
         format!("{ip}\t{}\n", seen.join(" "))
     };
     let mut s = String::from("127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n");
-    let mut mine = vec!["container".to_string()];
+    let mut mine = vec![own.hostname.clone().unwrap_or_else(|| "container".to_string())];
     mine.extend(own.names.iter().cloned());
     s.push_str(&line(&own.ip, &mine));
     // its own IPv6 address too (peers stay IPv4-only: some tools take the first address they get and do not retry)
@@ -131,6 +149,9 @@ pub fn hosts_file(own: &Host, others: &[Host]) -> String {
     }
     for o in others.iter().filter(|o| o.ip != own.ip) {
         s.push_str(&line(&o.ip, &o.names));
+    }
+    for (name, ip) in &own.extra {
+        s.push_str(&line(ip, std::slice::from_ref(name)));
     }
     s
 }
@@ -286,7 +307,7 @@ mod tests {
     use super::*;
 
     fn host(ip: &str, names: &[&str]) -> Host {
-        Host { ip: ip.into(), names: names.iter().map(|s| s.to_string()).collect() }
+        Host { ip: ip.into(), names: names.iter().map(|s| s.to_string()).collect(), hostname: None, extra: vec![] }
     }
 
     #[test]

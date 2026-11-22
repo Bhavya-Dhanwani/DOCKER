@@ -115,7 +115,8 @@ impl Driver {
                 c.file = c.file.map(|f| self.path(&f)).transpose()?;
                 // without -f the VM looks in its own working directory, so pass the host's one explicitly
                 if c.file.is_none() {
-                    c.file = Some(self.path("compose.yaml").and_then(|p| if std::path::Path::new("compose.yaml").exists() { Ok(p) } else { self.path("docker-compose.yml") })?);
+                    let name = ["compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"].into_iter().find(|n| std::path::Path::new(n).exists()).unwrap_or("docker-compose.yml");
+                    c.file = Some(self.path(name)?);
                 }
                 Command::Compose(c)
             }

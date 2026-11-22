@@ -20,7 +20,7 @@ pub use error::{Error, Result};
 pub use add::{extract_archive, fetch_url, is_url, url_filename};
 pub use archive::{load, save};
 pub use auth::{login, logout};
-pub use ignore::Ignore;
+pub use ignore::{expand_glob, expand_with, Ignore};
 pub use info::{history, inspect, HistoryRow};
 pub use pull::{pull, pull_for};
 pub use search::{search, Hit};

@@ -6,17 +6,30 @@ low RAM and disk use.
 
 The command is still called `docker`, so existing scripts and tools keep working. The desktop app is `docker-gui`.
 
+## Install
+
+Installers are built by the `release` workflow (`.github/workflows/release.yml`: run it from the Actions tab, or push a tag like `v0.1.0` to publish a GitHub release):
+
+| OS | Installer | What you get |
+|---|---|---|
+| **Windows** (x64, arm64) | `SastaDocker-Setup-<arch>.exe` (Inno Setup, per-user, no admin) | `docker` and `docker-gui`, `docker` on your PATH, a Start menu shortcut, and an optional "set up the Linux engine now" step (`docker vm init`, needs WSL2) |
+| **Linux** (x86_64, aarch64) | `sasta-docker-<version>-linux-<arch>.tar.gz` | `sudo ./install.sh` puts `docker` and `docker-gui` in `/usr/local/bin` and adds a menu entry |
+| **macOS** (Intel, Apple silicon) | `SastaDocker-macos-<arch>.pkg` | `docker` and `docker-gui` in `/usr/local/bin`; needs Lima (`brew install lima`) for the Linux VM |
+
+The command is the same everywhere: `docker run`, `docker compose up`, `docker build`, ... See [Platforms](#platforms) for how each system runs containers.
+
 ## What it can do
 
 **Containers**
-- `run` (`-d`, `-it`, `--name`, `-e`, `-v`, `-p`, `--network`, `--mem`, `--cpu`, `--procs`, `--restart`, `--rm`, `--entrypoint`, `-w`, `-u`, `--health-*`, `--cap-add/--cap-drop`, `--security-opt`, `--privileged`)
+- `run` (`-d`, `-it`, `--name`, `-e`, `--env-file`, `-v` (also anonymous `-v /data`), `--mount`, `-p`, `--network`, `--hostname`/`-h`, `--add-host` (including `host-gateway`), `--mem`, `--cpu`, `--procs`, `--restart`, `--rm`, `--entrypoint`, `-w`, `-u`, `--health-*`, `--cap-add/--cap-drop`, `--security-opt`, `--privileged`). Flags that exist in Docker but are not applied by this engine yet (`--label`, `--dns`, `--init`, `--read-only`, `--ulimit`, `--shm-size`, `--tmpfs`, `--cpus`, ...) are accepted with a warning instead of failing.
+- Like Docker, containers get `HOME` and `PATH`, `/tmp` is ordinary container storage with no small size limit, and on Windows your own environment variables reach `${VAR}` in compose files and `-e VAR`
 - `exec` (also `-it`), `logs [-f]`, `ps [-a]`, `inspect`, `stop`, `start`, `restart`, `kill`, `pause`, `unpause`, `wait`, `top`, `rename`, `rm [-f]`, `cp`, `stats`
 - `update --mem/--cpu/--procs` changes the limits of a running container
 - Restart policies (`no`, `always`, `unless-stopped`, `on-failure[:n]`) and healthchecks
 
 **Images**
 - `pull` from Docker Hub and other registries, `push`, `login`/`logout`, `tag`, `images`, `rmi`, `save`/`load`, `prune`
-- `build` from a Dockerfile: multi-stage builds, `.dockerignore`, `--target`, `--build-arg`, `--no-cache`, `COPY --from`, `COPY --chown`, `HEALTHCHECK`, content-hash layer cache
+- `build` from a Dockerfile: multi-stage builds, `.dockerignore`, `--target`, `--build-arg`, `--no-cache`, `COPY --from`, `COPY --chown`, `HEALTHCHECK`, content-hash layer cache, wildcards in `COPY`/`ADD` (`COPY package*.json ./`, `COPY --from=build /app/dist/* ./`)
 - Also: `ADD` from a URL or a tar archive, `COPY --chmod`, `RUN --mount` (cache, bind, tmpfs, secret), heredocs, `SHELL`, `ONBUILD`, `VOLUME`, `STOPSIGNAL`, `--label`, `--secret`, `-q`
 - `buildx build` is accepted as an alias for `build`
 - Pull by digest, `pull --platform`, zstd-compressed layers; push with resumable chunked uploads, retries, and cross-repository layer reuse; credential helpers and `~/.docker/config.json` logins
@@ -40,6 +53,8 @@ The command is still called `docker`, so existing scripts and tools keep working
 
 **Compose**
 - `docker compose up|down|ps|logs|config|build` with services, networks, volumes, `depends_on` and healthchecks
+- `env_file` (one or several files, `required: false`), `${VAR:-default}` and `.env`, `$$` escapes, YAML anchors and `<<` merge keys, long-form volumes (`type: bind`), anonymous volumes (`- /app/node_modules`), `hostname`, `extra_hosts`, `restart`, `container_name`, `command`/`entrypoint`, `build` with `context`/`dockerfile`/`args`
+- Tested on real projects: Node apps with MongoDB, Postgres, Redis and OpenResty; Bun, pnpm and Prisma builds; multi-stage frontend builds; 33 of 42 Dockerfiles and compose files from existing projects build as written (the rest need a `.env` file that is not in the folder, or fail on their own for reasons in the project, such as a missing `python`); `scripts/build-all-projects.ps1` builds every Dockerfile and compose file under a folder and prints one PASS/FAIL line each. Database data in named volumes survives `compose down` and `up`
 
 **Security (Linux)**
 - Docker's default capability set, a seccomp denylist, `no_new_privs`, `USER` honoured, hardening re-applied by `exec`
@@ -52,7 +67,7 @@ The command is still called `docker`, so existing scripts and tools keep working
 - `docker stats [--no-stream] [--json]` shows RAM, CPU, process count and the writable-layer size of every running container (container writes live in RAM by default)
 
 **Desktop GUI (`docker-gui`)**
-- Containers (start, stop, restart, pause, kill, remove, logs) with live RAM, disk and CPU bars and a two-minute history chart per container, a Live tab with all containers side by side, images (pull, remove, prune, run, build), running several images together as a group on a shared network, an image catalog, volumes and networks, run and build dialogs, dark and light themes
+- Containers (start, stop, restart, pause, kill, remove, logs) with live RAM, disk and CPU bars and a two-minute history chart per container, a Live tab with all containers side by side, images (pull, remove, prune, run, build), running several images together as a group on a shared network, an image catalog, volumes and networks, run and build dialogs, dark and light themes. Every tab, dialog and button was clicked through on Windows (run, group run, pull, build, volumes, networks, confirm dialogs, theme)
 
 **Any image works.** `docker run <image>` pulls it automatically if it is not on the machine yet, from Docker Hub or any other registry. Intel-only (x86-64) images run on ARM64 machines through built-in emulation (`docker emulation enable|disable|status`, switched on by itself when needed; slower than native).
 
@@ -66,6 +81,8 @@ The command is still called `docker`, so existing scripts and tools keep working
 - CI and dev: jenkins, gitea
 
 `scripts/live-images.sh` pulls and runs each of them again and records the result.
+
+**Programming languages checked (compile and run a program in each):** Python, Node.js, Bun, Deno, Go, Rust, Java, PHP, Ruby, Perl, C, C++, Lua, Elixir, .NET (C#), R, Haskell, and Kotlin (an Intel image, run through emulation). `scripts/live-languages.sh` repeats the check.
 
 ## Platforms
 

@@ -45,6 +45,8 @@ struct Plan {
     user: String,
     security: Security,
     health: Option<docker_image::Health>,
+    /// `--hostname` (default `container`).
+    hostname: Option<String>,
 }
 
 fn img(e: docker_image::Error) -> Error {
@@ -100,6 +102,7 @@ fn plan(cfg: &Config) -> Result<Plan> {
             user: cfg.user.clone().unwrap_or_default(),
             security: security::resolve(cfg)?,
             health: cfg.health.clone(),
+            hostname: cfg.hostname.clone(),
         });
     }
 
@@ -151,6 +154,7 @@ fn plan(cfg: &Config) -> Result<Plan> {
         user: cfg.user.clone().unwrap_or_else(|| meta.user.clone()),
         security: security::resolve(cfg)?,
         health: if cfg.no_healthcheck { None } else { cfg.health.clone().or_else(|| meta.healthcheck.clone()) },
+        hostname: cfg.hostname.clone(),
     })
 }
 
@@ -214,6 +218,7 @@ pub fn run_step(s: &Step) -> Result<i32> {
         user: s.user.into(),
         security: Security::default(),
         health: None,
+        hostname: None,
     };
     run_with_plan(&cfg, plan)
 }
@@ -315,7 +320,12 @@ fn run_container(cfg: &Config, mut plan: Plan) -> Result<i32> {
         let mut own_names: Vec<String> = cfg.name.iter().cloned().collect();
         own_names.push(id.chars().take(12).collect());
         own_names.extend(cfg.aliases.iter().cloned());
-        let own = crate::networks::Host { ip: ip.to_string(), names: own_names };
+        let own = crate::networks::Host {
+            ip: ip.to_string(),
+            names: own_names,
+            hostname: cfg.hostname.clone(),
+            extra: crate::networks::resolve_extra_hosts(&cfg.extra_hosts, cfg.network_name.as_deref()),
+        };
         let peers: Vec<_> = crate::networks::members(cfg.network_name.as_deref(), &id).iter().filter_map(crate::networks::Host::of).collect();
         let file = RunDirs::etc(&id).join("hosts");
         fs::write(&file, crate::networks::hosts_file(&own, &peers)).map_err(|e| Error::io("write hosts", e))?;
@@ -548,6 +558,9 @@ fn child(plan: &Plan, id: &str, rw: bool, gate: OwnedFd, net: ChildNet, tty: Opt
         _ => {}
     }
     rootfs::enter(&plan.source, id, rw, &plan.volumes)?;
+    if let Some(h) = &plan.hostname {
+        sys::set_hostname(h)?;
+    }
     std::env::set_current_dir(&plan.workdir).map_err(|e| Error::io(format!("workdir {}", plan.workdir), e))?;
     apply_env(&plan.env);
     if let Some(link) = tty {

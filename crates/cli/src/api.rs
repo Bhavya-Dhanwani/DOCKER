@@ -415,6 +415,8 @@ pub fn config_from_create(body: &Value, ncpu: u64) -> Result<Config, String> {
     cfg.user = body.get("User").and_then(Value::as_str).filter(|s| !s.is_empty()).map(String::from);
     cfg.tty = body.get("Tty").and_then(Value::as_bool).unwrap_or(false);
     cfg.interactive = body.get("OpenStdin").and_then(Value::as_bool).unwrap_or(false);
+    cfg.hostname = body.get("Hostname").and_then(Value::as_str).filter(|h| !h.is_empty() && is_volume_name(h)).map(String::from);
+    cfg.extra_hosts = strings(host.get("ExtraHosts"));
 
     for b in strings(host.get("Binds")) {
         // "src:dst" or "src:dst:opts" (opts are comma-separated: ro, rw, z, ...)

@@ -58,11 +58,14 @@ pub fn group_header(ui: &mut Ui, g: &Group, data: &Data, collapsed: &mut HashSet
                 if ui.button(RichText::new("🗑 Remove group").color(theme::RED)).clicked() {
                     out.push(Cmd::Confirm(format!("Remove group “{}”? Its {} container(s) are stopped and deleted, and the network is removed.", g.name, g.members.len()), Task { label: format!("Remove group {}", g.name), steps: groups::remove_steps(g) }));
                 }
+                // only the members that can be stopped / started: `docker stop` on an exited one is an error that would abort the rest
+                let running = |m: &String| data.containers.iter().any(|c| c.name == *m && c.state != crate::parse::State::Exited && c.state != crate::parse::State::Created);
+                let only = |keep_running: bool| Group { name: g.name.clone(), members: g.members.iter().filter(|m| running(m) == keep_running).cloned().collect() };
                 if ui.button("■ Stop all").clicked() {
-                    out.push(Cmd::Task(Task { label: format!("Stop group {}", g.name), steps: groups::stop_steps(g) }));
+                    out.push(Cmd::Task(Task { label: format!("Stop group {}", g.name), steps: groups::stop_steps(&only(true)) }));
                 }
                 if ui.button("▶ Start all").clicked() {
-                    out.push(Cmd::Task(Task { label: format!("Start group {}", g.name), steps: groups::start_steps(g) }));
+                    out.push(Cmd::Task(Task { label: format!("Start group {}", g.name), steps: groups::start_steps(&only(false)) }));
                 }
             });
         });

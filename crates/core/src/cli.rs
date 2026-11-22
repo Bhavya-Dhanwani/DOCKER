@@ -365,6 +365,10 @@ pub struct Config {
     /// A user-defined network (implies the bridge).
     pub network_name: Option<String>,
     pub aliases: Vec<String>,
+    /// `--hostname`: what the container calls itself (default `container`).
+    pub hostname: Option<String>,
+    /// `--add-host name:ip` (`ip` may be `host-gateway`): extra lines of /etc/hosts.
+    pub extra_hosts: Vec<String>,
     pub ports: Vec<Port>,
     pub mem_bytes: Option<u64>,
     pub cpu_percent: Option<u32>,
@@ -936,8 +940,34 @@ type HealthOpts = (Option<String>, Option<u64>, Option<u64>, Option<u64>, Option
 const RUN_VALUE_FLAGS: &[&str] = &[
     "--name", "-e", "--env", "-v", "--volume", "--network", "--net", "-p", "--publish", "--cap-add", "--cap-drop",
     "--security-opt", "--network-alias", "--entrypoint", "-w", "--workdir", "-u", "--user", "--mem", "--cpu", "--procs", "--restart", "--health-cmd", "--health-interval", "--health-timeout",
-    "--health-retries", "--health-start-period",
+    "--health-retries", "--health-start-period", "--env-file", "--mount", "--hostname", "-h", "--add-host", "--label", "-l", "--dns", "--log-driver",
+    "--shm-size", "--ulimit", "--stop-timeout", "--stop-signal", "--pull", "--platform", "--tmpfs", "--cpus", "--memory-swap", "--ipc", "--pid",
 ];
+
+/// Name of the volume behind an anonymous mount (`-v /data`, compose `- /data`): one per container path.
+pub fn anon_volume_name(dst: &str) -> String {
+    format!("anon-{:x}", dst.bytes().fold(0u64, |a, b| a.wrapping_mul(31).wrapping_add(u64::from(b))))
+}
+
+/// `--mount type=bind|volume,source=...,target=...[,readonly]` as the `source:target[:ro]` form of `-v`.
+fn mount_spec(s: &str) -> Result<String> {
+    let (mut kind, mut src, mut dst, mut ro) = ("volume", "", "", false);
+    for part in s.split(',') {
+        match part.split_once('=').unwrap_or((part, "true")) {
+            ("type", v) => kind = if v == "bind" { "bind" } else if v == "volume" { "volume" } else { return Err(usage("--mount type must be bind or volume")) },
+            ("source" | "src", v) => src = v,
+            ("target" | "destination" | "dst", v) => dst = v,
+            ("readonly" | "ro", v) => ro = v != "false",
+            (other, _) => return Err(usage(&format!("--mount: unsupported option {other}"))),
+        }
+    }
+    if dst.is_empty() || (src.is_empty() && kind == "bind") {
+        return Err(usage("--mount needs target= (and source= for a bind mount)"));
+    }
+    // an anonymous volume has no source: give it a name of its own
+    let src = if src.is_empty() { anon_volume_name(dst) } else { src.to_string() };
+    Ok(format!("{src}:{dst}{}", if ro { ":ro" } else { "" }))
+}
 
 /// `-dit` -> `-d -i -t` (only for the single-letter boolean flags d, i, t), in the leading flag region.
 fn expand_short_flags(args: Vec<String>, value_flags: &[&str]) -> Vec<String> {
@@ -1030,8 +1060,40 @@ fn parse_run(args: Vec<String>) -> Result<Config> {
                 }
                 cfg.aliases.push(a);
             }
+            "--env-file" => {
+                let path = value("a file")?;
+                let text = std::fs::read_to_string(&path).map_err(|e| usage(&format!("--env-file {path}: {e}")))?;
+                cfg.env.extend(crate::env::parse_env_file(&text));
+            }
+            "--mount" => cfg.volumes.push(Volume::parse(&mount_spec(&value("type=...,source=...,target=...")?)?)?),
+            // accepted so existing commands keep working; the engine does not apply them yet
+            "--hostname" | "-h" => {
+                let h = value("a name")?;
+                if !valid_name(&h) {
+                    return Err(usage("--hostname must match [a-zA-Z0-9][a-zA-Z0-9_.-]*"));
+                }
+                cfg.hostname = Some(h);
+            }
+            "--add-host" => {
+                let h = value("name:ip")?;
+                match h.split_once(':').or_else(|| h.split_once('=')) {
+                    Some((n, ip)) if !n.is_empty() && !ip.is_empty() => cfg.extra_hosts.push(format!("{n}:{ip}")),
+                    _ => return Err(usage("--add-host needs name:ip (ip can be host-gateway)")),
+                }
+            }
+            "--label" | "-l" | "--dns" | "--log-driver" | "--shm-size" | "--ulimit" | "--stop-timeout" | "--stop-signal"
+            | "--pull" | "--platform" | "--tmpfs" | "--cpus" | "--memory-swap" | "--ipc" | "--pid" => {
+                let v = value("a value")?;
+                eprintln!("warning: {flag} {v} is accepted but not applied by this engine yet");
+            }
+            "--init" | "--read-only" | "--oom-kill-disable" => eprintln!("warning: {flag} is accepted but not applied by this engine yet"),
             "-p" | "--publish" => cfg.ports.extend(Port::parse_all(&value("[ip:]host:container[/udp]")?)?),
-            "-v" | "--volume" => cfg.volumes.push(Volume::parse(&value("host:container[:ro]")?)?),
+            "-v" | "--volume" => {
+                let v = value("host:container[:ro]")?;
+                // `-v /data`: an anonymous volume
+                let v = if v.starts_with('/') && !v.contains(':') { format!("{}:{v}", anon_volume_name(&v)) } else { v };
+                cfg.volumes.push(Volume::parse(&v)?);
+            }
             "--mem" => {
                 let mb: u64 = value("a number of MB")?
                     .parse()
@@ -1148,6 +1210,12 @@ impl Command {
                 }
                 for a in &c.aliases {
                     flag("--network-alias", Some(a.clone()));
+                }
+                if let Some(h) = &c.hostname {
+                    flag("--hostname", Some(h.clone()));
+                }
+                for h in &c.extra_hosts {
+                    flag("--add-host", Some(h.clone()));
                 }
                 for p in &c.ports {
                     flag("-p", Some(p.to_arg()));

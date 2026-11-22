@@ -60,6 +60,42 @@ fn glob(pat: &str, s: &str) -> bool {
     go(&pat.chars().collect::<Vec<_>>(), &s.chars().collect::<Vec<_>>())
 }
 
+/// Expand a `COPY` source with wildcards (`package*.json`, `src/*.rs`) against the build context.
+/// Returns the matching paths relative to `ctx`, sorted; a pattern without wildcards is returned as is.
+pub fn expand_glob(ctx: &std::path::Path, pattern: &str) -> Vec<String> {
+    expand_with(
+        pattern,
+        |dir| std::fs::read_dir(ctx.join(dir)).map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default(),
+        |p| ctx.join(p).symlink_metadata().is_ok(),
+    )
+}
+
+/// The same for any file tree: `list(dir)` gives the names inside a directory, `exists(path)` tests a plain path
+/// (both relative, `""` is the root). Used for `COPY --from=<stage>`, where the tree is a set of image layers.
+pub fn expand_with(pattern: &str, list: impl Fn(&str) -> Vec<String>, exists: impl Fn(&str) -> bool) -> Vec<String> {
+    let pat = pattern.trim_start_matches('/');
+    if !pat.contains(['*', '?', '[']) {
+        return vec![pattern.to_string()];
+    }
+    let mut found = vec![String::new()];
+    for seg in pat.split('/').filter(|s| !s.is_empty() && *s != ".") {
+        let mut next = vec![];
+        for base in &found {
+            let join = |n: &str| if base.is_empty() { n.to_string() } else { format!("{base}/{n}") };
+            if !seg.contains(['*', '?', '[']) {
+                if exists(&join(seg)) {
+                    next.push(join(seg));
+                }
+                continue;
+            }
+            next.extend(list(base).into_iter().filter(|n| glob(seg, n)).map(|n| join(&n)));
+        }
+        found = next;
+    }
+    found.sort();
+    found
+}
+
 fn segs_match(pat: &[String], path: &[&str]) -> bool {
     match pat.split_first() {
         None => path.is_empty(),
@@ -138,6 +174,20 @@ mod tests {
         assert!(i.is_ignored("dx") && !i.is_ignored("bx"));
         assert!(i.is_ignored("*star") && !i.is_ignored("zstar"));
         assert!(i.is_ignored("out/a/b") && !i.is_ignored("out") && !i.is_ignored("out/keep"));
+    }
+
+    #[test]
+    fn copy_wildcards_expand_against_the_context() {
+        let d = std::env::temp_dir().join(format!("expand-glob-{}", std::process::id()));
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        for f in ["package.json", "package-lock.json", "readme.md", "src/a.rs", "src/b.rs"] {
+            std::fs::write(d.join(f), "").unwrap();
+        }
+        assert_eq!(expand_glob(&d, "package*.json"), ["package-lock.json", "package.json"]);
+        assert_eq!(expand_glob(&d, "/src/*.rs"), ["src/a.rs", "src/b.rs"]);
+        assert_eq!(expand_glob(&d, "plain.txt"), ["plain.txt"]);
+        assert!(expand_glob(&d, "*.zip").is_empty());
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

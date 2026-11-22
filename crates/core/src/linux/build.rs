@@ -701,6 +701,17 @@ fn copy_step(store: &Store, ctx: &Path, ig: &Ignore, a: &BuildArgs, stages: &Sta
             docker_image::fetch_url(s, &dir.join(&name)).map_err(img)?;
             extra.insert(s.clone(), dir.join(name));
         }
+        // `COPY package*.json ./`: wildcards in context sources expand to what matches (none matching keeps the pattern, so the error names it)
+        let mut srcs: Vec<String> = if spec.from.is_none() {
+            srcs.iter()
+                .flat_map(|s| {
+                    let hit = if extra.contains_key(s) { vec![] } else { docker_image::expand_glob(ctx, s) };
+                    if hit.is_empty() { vec![s.clone()] } else { hit }
+                })
+                .collect()
+        } else {
+            srcs
+        };
         let (source, content) = match &spec.from {
             None => (
                 Src::Context(Local { ctx, ig, extra: Some(&extra), add: spec.add }),
@@ -708,6 +719,15 @@ fn copy_step(store: &Store, ctx: &Path, ig: &Ignore, a: &BuildArgs, stages: &Sta
             ),
             Some(f) => {
                 let (layers, id) = copy_source(store, stages, f, say)?;
+                // wildcards (`COPY --from=build /app/dist/* ./`) expand against the stage's merged files
+                let m = Merged { layers: &layers };
+                srcs = srcs
+                    .iter()
+                    .flat_map(|s| {
+                        let hit = docker_image::expand_with(s, |d| m.list(Path::new(d)).into_iter().collect(), |p| m.locate(Path::new(p)).is_some());
+                        if hit.is_empty() { vec![s.clone()] } else { hit }
+                    })
+                    .collect();
                 (Src::Layers(layers), key(&["from", &id, &srcs.join("\u{1}")]))
             }
         };

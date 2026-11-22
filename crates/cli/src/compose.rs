@@ -38,8 +38,12 @@ struct Service {
     command: Option<Value>,
     entrypoint: Option<Value>,
     environment: Option<Value>,
+    env_file: Option<Value>,
+    hostname: Option<String>,
+    /// `["name:ip", ...]` or `{name: ip}`.
+    extra_hosts: Option<Value>,
     ports: Vec<Value>,
-    volumes: Vec<String>,
+    volumes: Vec<Value>,
     depends_on: Option<Value>,
     networks: Option<Value>,
     restart: Option<String>,
@@ -85,7 +89,11 @@ fn interpolate(text: &str, dir: &Path) -> String {
             }
         }
     }
-    text.lines().map(|l| if l.trim_start().starts_with('#') { l.to_string() } else { subst(l, &vars) }).collect::<Vec<_>>().join("\n")
+    // `$$` is an escaped `$` (`command: echo $$HOME` must reach the container as `$HOME`)
+    text.lines()
+        .map(|l| if l.trim_start().starts_with('#') { l.to_string() } else { subst(&l.replace("$$", "\u{0}"), &vars).replace('\u{0}', "$") })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// `dir.join(rel)` without the `.` components (`./site` -> `<dir>/site`).
@@ -103,7 +111,10 @@ fn load(args: &ComposeArgs) -> Res<Project> {
     let abs = fs::canonicalize(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let dir = abs.parent().map(Path::to_path_buf).unwrap_or_default();
     let text = interpolate(&fs::read_to_string(&abs)?, &dir);
-    let file: File = serde_yaml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    // YAML anchors with merge keys (`<<: *defaults`) are common in real compose files
+    let mut doc: Value = serde_yaml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    doc.apply_merge().map_err(|e| format!("{}: {e}", path.display()))?;
+    let file: File = serde_yaml::from_value(doc).map_err(|e| format!("{}: {e}", path.display()))?;
     let name = args
         .project
         .clone()
@@ -155,6 +166,43 @@ fn environment(v: &Value) -> Vec<String> {
             })
             .collect(),
         other => string_list(other),
+    }
+}
+
+/// `env_file:` as (path, required) pairs: a path, a list of paths, or a list of `{path, required}`.
+fn env_files(v: &Value) -> Vec<(String, bool)> {
+    let one = |x: &Value| match x {
+        Value::Mapping(_) => x.get("path").and_then(scalar).map(|p| (p, x.get("required").and_then(Value::as_bool).unwrap_or(true))),
+        other => scalar(other).map(|p| (p, true)),
+    };
+    match v {
+        Value::Sequence(s) => s.iter().filter_map(one).collect(),
+        other => one(other).into_iter().collect(),
+    }
+}
+
+/// `extra_hosts:` as `name:ip` entries: a list (`"name:ip"` or `"name=ip"`) or a mapping.
+fn extra_hosts(v: &Value) -> Vec<String> {
+    match v {
+        Value::Mapping(m) => m.iter().filter_map(|(k, v)| Some(format!("{}:{}", scalar(k)?, scalar(v)?))).collect(),
+        other => string_list(other).into_iter().map(|s| s.replacen('=', ":", 1)).collect(),
+    }
+}
+
+/// A `volumes:` entry of a service as `source:target[:ro]`; the long form is `{type, source, target, read_only}`.
+fn volume_str(v: &Value) -> Res<String> {
+    match v {
+        Value::Mapping(_) => {
+            let get = |k: &str| v.get(k).and_then(scalar);
+            let target = get("target").ok_or("a volume needs a target")?;
+            let kind = get("type").unwrap_or_else(|| "volume".into());
+            if kind == "tmpfs" {
+                return Err("tmpfs volumes are not supported yet".into());
+            }
+            let source = get("source").ok_or("a volume needs a source")?;
+            Ok(format!("{source}:{target}{}", if v.get("read_only").and_then(Value::as_bool).unwrap_or(false) { ":ro" } else { "" }))
+        }
+        other => scalar(other).ok_or_else(|| "unsupported volume entry".into()),
     }
 }
 
@@ -243,6 +291,8 @@ fn plan(p: &Project, name: &str, s: &Service) -> Res<Plan> {
         privileged: s.privileged,
         workdir: s.working_dir.clone(),
         user: s.user.clone(),
+        hostname: s.hostname.clone(),
+        extra_hosts: s.extra_hosts.as_ref().map(extra_hosts).unwrap_or_default(),
         ..Config::default()
     };
     if let Some(r) = &s.restart {
@@ -251,13 +301,31 @@ fn plan(p: &Project, name: &str, s: &Service) -> Res<Plan> {
     if let Some(m) = &s.mem_limit {
         cfg.mem_bytes = Some(mem_mb(m)? << 20);
     }
+    // env_file first: `environment:` entries win over it
+    for (path, required) in s.env_file.as_ref().map(env_files).unwrap_or_default() {
+        let full = clean_join(&p.dir, Path::new(&path));
+        match fs::read_to_string(&full) {
+            Ok(t) => cfg.env.extend(docker_core::env::parse_env_file(&t)),
+            Err(_) if !required => {}
+            Err(e) => return Err(format!("env_file {}: {e}", full.display()).into()),
+        }
+    }
     if let Some(e) = &s.environment {
-        cfg.env = environment(e);
+        cfg.env.extend(environment(e));
     }
     for pv in &s.ports {
         cfg.ports.extend(port(pv)?);
     }
     for v in &s.volumes {
+        let v = &volume_str(v).map_err(|e| format!("service {name}: {e}"))?;
+        // `- /app/node_modules`: an anonymous volume, kept per service and path
+        let anon;
+        let v: &str = if v.starts_with('/') && !v.contains(':') {
+            anon = format!("{name}_{}:{v}", docker_core::cli::anon_volume_name(v));
+            &anon
+        } else {
+            v
+        };
         let (src, rest) = v.split_once(':').ok_or_else(|| format!("service {name}: volume {v:?} needs a destination"))?;
         let host = if src.starts_with('.') || src.starts_with('/') {
             let q = Path::new(src);
@@ -346,12 +414,12 @@ fn order(plans: &BTreeMap<String, Plan>) -> Res<Vec<String>> {
 
 fn plans(p: &Project) -> Res<BTreeMap<String, Plan>> {
     for (name, s) in &p.file.services {
-        const IGNORED: &[&str] = &["labels", "hostname", "stdin_open", "tty", "env_file", "expose", "logging", "deploy", "init", "stop_grace_period", "platform", "pull_policy", "extra_hosts", "dns"];
-        let unknown: Vec<&String> = s.extra.keys().filter(|k| !IGNORED.contains(&k.as_str())).collect();
-        if !s.extra.is_empty() {
-            eprintln!("warning: service {name}: ignoring unsupported keys: {}", s.extra.keys().cloned().collect::<Vec<_>>().join(", "));
+        // harmless for a local run: metadata, or behaviour that only matters on a real orchestrator
+        const IGNORED: &[&str] = &["labels", "stdin_open", "tty", "expose", "logging", "deploy", "init", "stop_grace_period", "platform", "pull_policy", "profiles", "container_labels"];
+        let unknown: Vec<&String> = s.extra.keys().filter(|k| !IGNORED.contains(&k.as_str()) && !k.starts_with("x-")).collect();
+        if !unknown.is_empty() {
+            eprintln!("warning: service {name}: ignoring unsupported keys: {}", unknown.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(", "));
         }
-        let _ = unknown;
     }
     p.file.services.iter().map(|(n, s)| Ok((n.clone(), plan(p, n, s).map_err(|e| format!("service {n}: {e}"))?))).collect()
 }
@@ -626,6 +694,32 @@ pub fn stack_services(file: &str, stack: &str) -> Res<Vec<StackService>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn double_dollar_is_a_literal_dollar() {
+        let out = interpolate("cmd: echo $$HOME ${SASTA_UNSET_VAR_X:-dflt}\n", Path::new("/nonexistent"));
+        assert_eq!(out, "cmd: echo $HOME dflt");
+    }
+
+    #[test]
+    fn env_file_forms_and_long_volume_syntax() {
+        let y = |s: &str| serde_yaml::from_str::<Value>(s).unwrap();
+        assert_eq!(env_files(&y("./a.env")), [("./a.env".to_string(), true)]);
+        assert_eq!(env_files(&y("[a.env, {path: b.env, required: false}]")), [("a.env".to_string(), true), ("b.env".to_string(), false)]);
+        assert_eq!(volume_str(&y("./x:/y:ro")).unwrap(), "./x:/y:ro");
+        assert_eq!(volume_str(&y("{type: bind, source: ./x, target: /y, read_only: true}")).unwrap(), "./x:/y:ro");
+        assert_eq!(volume_str(&y("{type: volume, source: data, target: /d}")).unwrap(), "data:/d");
+        assert!(volume_str(&y("{type: tmpfs, target: /t}")).is_err());
+    }
+
+    #[test]
+    fn yaml_merge_keys_apply() {
+        let mut d: Value = serde_yaml::from_str("x: &d {image: redis, restart: always}\nservices:\n  a:\n    <<: *d\n    restart: no\n").unwrap();
+        d.apply_merge().unwrap();
+        let f: File = serde_yaml::from_value(d).unwrap();
+        assert_eq!(f.services["a"].image.as_deref(), Some("redis"));
+        assert_eq!(f.services["a"].restart.as_deref(), Some("no"));
+    }
 
     #[test]
     fn deploy_section_maps_to_swarm_settings() {

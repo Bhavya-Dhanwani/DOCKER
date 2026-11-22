@@ -111,7 +111,10 @@ pub fn enter(src: &Source, id: &str, rw: bool, volumes: &[Volume]) -> Result<()>
     // Best effort: a rootless container may not be allowed to mount it.
     let _ = fs::create_dir_all("/sys");
     let _ = sys::mount("sysfs", "/sys", Some("sysfs"), libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, None);
-    sys::mount("tmpfs", "/tmp", Some("tmpfs"), 0, Some("size=64m"))?;
+    if read_only {
+        // a read-only root directory needs somewhere to write; an image's /tmp is plain container storage, as in Docker
+        sys::mount("tmpfs", "/tmp", Some("tmpfs"), 0, Some("size=64m"))?;
+    }
     if !rootless {
         sys::mount("tmpfs", "/dev", Some("tmpfs"), 0, Some("size=1m,mode=755"))?;
         for (name, major, minor) in [("null", 1, 3), ("zero", 1, 5), ("random", 1, 8), ("urandom", 1, 9), ("tty", 5, 0)] {

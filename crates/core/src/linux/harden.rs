@@ -79,14 +79,33 @@ fn drop_bounding(keep: u64) -> Result<()> {
 
 /// Order matters: seccomp needs CAP_SYS_ADMIN (so before caps go), the bounding set needs CAP_SETPCAP
 /// (before the uid change), and setuid/setgid need to run before no_new_privs.
+/// Home directory of `uid` from the text of /etc/passwd; `/` when there is no entry (like Docker).
+fn home_of(passwd: &str, uid: u32) -> String {
+    passwd
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split(':').collect();
+            (f.len() >= 6 && f[2].parse() == Ok(uid)).then(|| f[5].to_string())
+        })
+        .next()
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "/".into())
+}
+
 pub fn finalize(user: &str, sec: &Security) -> Result<()> {
     if sec.seccomp {
         install_seccomp()?;
     }
     drop_bounding(sec.caps)?;
+    // resolved inside the container's own root: its /etc/passwd decides what a name means
+    let passwd = fs::read_to_string("/etc/passwd").unwrap_or_default();
+    let uid = if user.is_empty() { 0 } else { crate::user::resolve(user, &passwd, &fs::read_to_string("/etc/group").unwrap_or_default())?.uid };
+    // tools such as Go, .NET and npm refuse to run without a home directory
+    if std::env::var_os("HOME").is_none() {
+        // SAFETY: the container's init is single-threaded here, just before exec
+        unsafe { std::env::set_var("HOME", home_of(&passwd, uid)) };
+    }
     if !user.is_empty() {
-        // resolved inside the container's own root: its /etc/passwd decides what a name means
-        let passwd = fs::read_to_string("/etc/passwd").unwrap_or_default();
         let group = fs::read_to_string("/etc/group").unwrap_or_default();
         let ids = crate::user::resolve(user, &passwd, &group)?;
         if crate::registry::rootless() && super::rootless::single_map() && (ids.uid != 0 || ids.gid != 0) {
@@ -100,4 +119,18 @@ pub fn finalize(user: &str, sec: &Security) -> Result<()> {
         return Err(Error::sys("set no_new_privs"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod home_tests {
+    use super::home_of;
+
+    #[test]
+    fn home_comes_from_passwd_or_is_root_of_the_filesystem() {
+        let p = "root:x:0:0:root:/root:/bin/sh\nnode:x:1000:1000::/home/node:/bin/sh\nnobody:x:65534:65534:::/sbin/nologin\n";
+        assert_eq!(home_of(p, 0), "/root");
+        assert_eq!(home_of(p, 1000), "/home/node");
+        assert_eq!(home_of(p, 65534), "/");
+        assert_eq!(home_of(p, 4242), "/");
+    }
 }

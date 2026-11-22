@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Sasta Docker
+Comment=Manage containers and images
+Exec=docker-gui
+Terminal=false
+Categories=Development;System;

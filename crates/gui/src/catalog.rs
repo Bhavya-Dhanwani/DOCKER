@@ -36,48 +36,49 @@ const APP: &str = CATEGORIES[5];
 const CI: &str = CATEGORIES[6];
 
 pub static CATALOG: &[Entry] = &[
-    e("ubuntu", "latest", OS, "Ubuntu LTS base image", "", &[], false),
-    e("debian", "stable-slim", OS, "Debian stable, slim variant", "", &[], false),
+    e("ubuntu", "latest", OS, "Ubuntu LTS base image", "", &[], true),
+    e("debian", "stable-slim", OS, "Debian stable, slim variant", "", &[], true),
     e("alpine", "latest", OS, "Tiny 5 MB Linux with apk", "", &[], true),
-    e("busybox", "latest", OS, "Minimal Unix tools in ~1 MB", "", &[], false),
-    e("fedora", "latest", OS, "Fedora base image", "", &[], false),
+    e("busybox", "latest", OS, "Minimal Unix tools in ~1 MB", "", &[], true),
+    e("fedora", "latest", OS, "Fedora base image", "", &[], true),
+    e("kalilinux/kali-rolling", "latest", OS, "Kali Linux (security tooling base)", "", &[], true),
+    e("archlinux", "latest", OS, "Arch Linux (Intel-only image: runs through x86-64 emulation)", "", &[], true),
     e("node", "alpine", LANG, "Node.js runtime (Alpine)", "3000", &[], true),
     e("python", "alpine", LANG, "Python runtime (Alpine)", "8000", &[], true),
-    e("golang", "alpine", LANG, "Go toolchain (Alpine)", "", &[], false),
-    e("rust", "alpine", LANG, "Rust toolchain (Alpine)", "", &[], false),
-    e("eclipse-temurin", "21-jre-alpine", LANG, "OpenJDK 21 runtime (Temurin)", "8080", &[], false),
-    e("php", "cli-alpine", LANG, "PHP command line (Alpine)", "", &[], false),
-    e("ruby", "alpine", LANG, "Ruby runtime (Alpine)", "3000", &[], false),
-    e("mcr.microsoft.com/dotnet/aspnet", "8.0-alpine", LANG, ".NET 8 ASP.NET runtime (Alpine)", "8080", &[], false),
+    e("golang", "alpine", LANG, "Go toolchain (Alpine)", "", &[], true),
+    e("rust", "alpine", LANG, "Rust toolchain (Alpine)", "", &[], true),
+    e("eclipse-temurin", "21-jre-alpine", LANG, "OpenJDK 21 runtime (Temurin)", "8080", &[], true),
+    e("php", "cli-alpine", LANG, "PHP command line (Alpine)", "", &[], true),
+    e("ruby", "alpine", LANG, "Ruby runtime (Alpine)", "3000", &[], true),
+    e("mcr.microsoft.com/dotnet/aspnet", "8.0-alpine", LANG, ".NET 8 ASP.NET runtime (Alpine)", "8080", &[], true),
     e("nginx", "alpine", WEB, "Web server and reverse proxy", "80", &[], true),
-    e("httpd", "alpine", WEB, "Apache HTTP Server", "80", &[], false),
-    e("caddy", "alpine", WEB, "Web server with automatic HTTPS", "80, 443", &[], false),
-    e("traefik", "latest", WEB, "Cloud-native reverse proxy", "80, 8080", &[], false),
-    e("haproxy", "alpine", WEB, "TCP/HTTP load balancer", "80", &[], false),
+    e("httpd", "alpine", WEB, "Apache HTTP Server", "80", &[], true),
+    e("caddy", "alpine", WEB, "Web server with automatic HTTPS", "80, 443", &[], true),
+    e("traefik", "latest", WEB, "Cloud-native reverse proxy", "80, 8080", &[], true),
+    e("haproxy", "alpine", WEB, "TCP/HTTP load balancer", "80", &[], true),
     e("postgres", "alpine", DB, "PostgreSQL database", "5432", &["POSTGRES_PASSWORD=postgres"], true),
-    e("mysql", "lts", DB, "MySQL database", "3306", &["MYSQL_ROOT_PASSWORD=root"], false),
+    e("mysql", "8", DB, "MySQL database", "3306", &["MYSQL_ROOT_PASSWORD=root"], true),
     e("mariadb", "lts", DB, "MariaDB database (MySQL compatible)", "3306", &["MARIADB_ROOT_PASSWORD=root"], true),
-    e("mongo", "latest", DB, "MongoDB document database", "27017", &[], false),
+    e("mongo", "latest", DB, "MongoDB document database", "27017", &[], true),
     e("redis", "alpine", DB, "In-memory key-value store", "6379", &[], true),
-    e("memcached", "alpine", DB, "Distributed memory cache", "11211", &[], false),
-    e("cassandra", "latest", DB, "Wide-column NoSQL database", "9042", &[], false),
-    e("couchdb", "latest", DB, "Document database with HTTP API", "5984", &["COUCHDB_USER=admin", "COUCHDB_PASSWORD=admin"], false),
-    e("influxdb", "2", DB, "Time-series database", "8086", &[], false),
-    e("rabbitmq", "4-management-alpine", MSG, "RabbitMQ broker with management UI", "5672, 15672", &[], false),
-    e("nats", "alpine", MSG, "NATS messaging server", "4222", &[], false),
-    e("redpandadata/redpanda", "latest", MSG, "Kafka-compatible streaming platform", "9092", &[], false),
-    e("eclipse-mosquitto", "latest", MSG, "MQTT broker", "1883", &[], false),
-    e("wordpress", "latest", APP, "WordPress CMS (needs a MySQL/MariaDB)", "80", &["WORDPRESS_DB_HOST=mariadb", "WORDPRESS_DB_USER=root", "WORDPRESS_DB_PASSWORD=root"], false),
-    e("ghost", "alpine", APP, "Ghost blogging platform", "2368", &[], false),
-    e("grafana/grafana", "latest", APP, "Dashboards and visualisation", "3000", &[], false),
-    e("prom/prometheus", "latest", APP, "Metrics monitoring", "9090", &[], false),
-    e("hashicorp/vault", "latest", APP, "Secrets management", "8200", &[], false),
-    e("registry", "2", APP, "Private Docker registry", "5000", &[], false),
-    e("minio/minio", "latest", APP, "S3-compatible object storage", "9000, 9001", &["MINIO_ROOT_USER=minioadmin", "MINIO_ROOT_PASSWORD=minioadmin"], false),
-    e("mailhog/mailhog", "latest", APP, "Fake SMTP server with web inbox", "1025, 8025", &[], false),
-    e("adminer", "latest", APP, "Web UI for SQL databases", "8080", &[], false),
-    e("jenkins/jenkins", "lts", CI, "Jenkins automation server", "8080", &[], false),
-    e("gitea/gitea", "latest", CI, "Self-hosted Git service", "3000", &[], false),
+    e("memcached", "alpine", DB, "Distributed memory cache", "11211", &[], true),
+    e("cassandra", "latest", DB, "Wide-column NoSQL database", "9042", &[], true),
+    e("couchdb", "latest", DB, "Document database with HTTP API", "5984", &["COUCHDB_USER=admin", "COUCHDB_PASSWORD=admin"], true),
+    e("influxdb", "2", DB, "Time-series database", "8086", &[], true),
+    e("rabbitmq", "alpine", MSG, "RabbitMQ broker with management UI", "5672, 15672", &[], true),
+    e("nats", "alpine", MSG, "NATS messaging server", "4222", &[], true),
+    e("redpandadata/redpanda", "latest", MSG, "Kafka-compatible streaming platform", "9092", &[], true),
+    e("eclipse-mosquitto", "latest", MSG, "MQTT broker", "1883", &[], true),
+    e("wordpress", "apache", APP, "WordPress CMS (needs a MySQL/MariaDB)", "80", &["WORDPRESS_DB_HOST=mariadb", "WORDPRESS_DB_USER=root", "WORDPRESS_DB_PASSWORD=root"], true),
+    e("ghost", "alpine", APP, "Ghost blogging platform (SQLite settings below; MySQL for production)", "2368", &["url=http://localhost:2368", "database__client=sqlite3", "database__connection__filename=/var/lib/ghost/content/data/ghost.db"], true),
+    e("grafana/grafana", "latest", APP, "Dashboards and visualisation", "3000", &[], true),
+    e("prom/prometheus", "latest", APP, "Metrics monitoring", "9090", &[], true),
+    e("hashicorp/vault", "latest", APP, "Secrets management", "8200", &[], true),
+    e("registry", "2", APP, "Private Docker registry", "5000", &[], true),
+    e("mailhog/mailhog", "latest", APP, "Fake SMTP server with web inbox (Intel-only image: runs through x86-64 emulation)", "1025, 8025", &[], true),
+    e("adminer", "latest", APP, "Web UI for SQL databases", "8080", &[], true),
+    e("jenkins/jenkins", "lts-jdk17", CI, "Jenkins automation server", "8080", &[], true),
+    e("gitea/gitea", "latest", CI, "Self-hosted Git service", "3000", &[], true),
 ];
 
 /// The short name of an image reference: `docker.io/library/postgres:alpine` -> `postgres`.
@@ -117,7 +118,7 @@ pub fn pull_args(reference: &str) -> Result<Vec<String>, String> {
 pub fn to_markdown() -> String {
     let mut s = String::from("# Sasta Docker: image catalog\n\n");
     let tested = CATALOG.iter().filter(|c| c.tested).count();
-    s.push_str(&format!("{tested} of {} images were actually run on this engine (**tested**); the rest are expected to work but are **untested**.\n", CATALOG.len()));
+    s.push_str(&format!("{tested} of {} images were actually pulled and run on this engine (**tested**). Any other Docker Hub image can be pulled by name too (Intel-only images run through x86-64 emulation); those have not been tried.\n", CATALOG.len()));
     for cat in CATEGORIES {
         s.push_str(&format!("\n## {cat}\n\n| Image | Description | Port(s) | Status |\n|---|---|---|---|\n"));
         for c in CATALOG.iter().filter(|c| c.category == cat) {
@@ -145,10 +146,14 @@ mod tests {
     }
 
     #[test]
-    fn tested_set_is_exactly_the_seven() {
-        let mut t: Vec<String> = CATALOG.iter().filter(|c| c.tested).map(Entry::reference).collect();
-        t.sort();
-        assert_eq!(t, ["alpine:latest", "mariadb:lts", "nginx:alpine", "node:alpine", "postgres:alpine", "python:alpine", "redis:alpine"]);
+    fn every_listed_image_was_run_on_this_engine() {
+        // the catalog only lists images that were pulled and run here (see scripts/live-images.sh)
+        assert!(CATALOG.iter().all(|c| c.tested));
+        assert!(!CATALOG.iter().any(|c| c.name == "minio/minio"), "minio/minio is not pullable any more");
+        let t: Vec<String> = CATALOG.iter().map(Entry::reference).collect();
+        for must in ["alpine:latest", "postgres:alpine", "mongo:latest", "kalilinux/kali-rolling:latest", "archlinux:latest", "jenkins/jenkins:lts-jdk17"] {
+            assert!(t.iter().any(|r| r == must), "{must}");
+        }
     }
 
     #[test]
@@ -183,7 +188,7 @@ mod tests {
     fn markdown_lists_status() {
         let m = to_markdown();
         assert!(m.contains("| `postgres:alpine` | PostgreSQL database | 5432 | tested |"));
-        assert!(m.contains("| `ubuntu:latest` |") && m.contains("untested"));
-        assert!(m.contains("7 of "));
+        assert!(m.contains("| `ubuntu:latest` |") && !m.contains("untested |"));
+        assert!(m.contains(&format!("{n} of {n} images", n = CATALOG.len())));
     }
 }

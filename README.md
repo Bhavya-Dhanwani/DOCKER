@@ -48,10 +48,24 @@ The command is still called `docker`, so existing scripts and tools keep working
 - Unix socket or TCP. Ping, version, info, containers (create, start, stop, restart, kill, pause, wait, logs, attach with stdin, inspect, top, stats, changes, export, archive, commit, update, rename, resize, prune, remove, filters), exec (create, start, inspect, resize, with stdin and a terminal), `POST /build`, `GET /events` (with filters), images (list, inspect, history, pull, tag, load, save, prune, remove), volumes, networks, `system/df`
 - Works with the real Docker CLI and the Docker SDK for Python (see Testing)
 
-**Desktop GUI (`docker-gui`)**
-- Containers (start, stop, restart, pause, kill, remove, logs, live stats), images (pull, remove, prune, run, build), volumes and networks, run and build dialogs, dark and light themes
+**Resource usage**
+- `docker stats [--no-stream] [--json]` shows RAM, CPU, process count and the writable-layer size of every running container (container writes live in RAM by default)
 
-**Verified images:** `alpine`, `node`, `postgres`, `redis`, `nginx`, `python`, `mariadb`.
+**Desktop GUI (`docker-gui`)**
+- Containers (start, stop, restart, pause, kill, remove, logs) with live RAM, disk and CPU bars and a two-minute history chart per container, a Live tab with all containers side by side, images (pull, remove, prune, run, build), running several images together as a group on a shared network, an image catalog, volumes and networks, run and build dialogs, dark and light themes
+
+**Any image works.** `docker run <image>` pulls it automatically if it is not on the machine yet, from Docker Hub or any other registry. Intel-only (x86-64) images run on ARM64 machines through built-in emulation (`docker emulation enable|disable|status`, switched on by itself when needed; slower than native).
+
+**Images run and checked on this engine (43):**
+- Base systems: alpine, ubuntu, debian, busybox, fedora, kali, archlinux (Intel, emulated)
+- Languages: node, python, golang, rust, php, ruby, java (temurin), .NET
+- Web servers and proxies: nginx, httpd, caddy, traefik, haproxy
+- Databases: postgres, mysql, mariadb, mongo, redis, memcached, cassandra, couchdb, influxdb
+- Messaging: rabbitmq, nats, redpanda, mosquitto
+- Apps and tools: wordpress, ghost, grafana, prometheus, vault, registry, mailhog (Intel, emulated), adminer
+- CI and dev: jenkins, gitea
+
+`scripts/live-images.sh` pulls and runs each of them again and records the result.
 
 ## Platforms
 

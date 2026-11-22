@@ -127,8 +127,12 @@ pub enum Upload {
 pub struct Client {
     base: String,
     repo: String,
-    /// Full `Authorization` header value.
-    auth: Option<String>,
+    /// Full `Authorization` header value. Behind a lock because a token that expires in the middle of a long
+    /// pull is renewed (the client is shared between upload threads).
+    auth: std::sync::Mutex<Option<String>>,
+    /// What was used to log in, kept to renew the token.
+    creds: Option<Creds>,
+    scopes: Vec<String>,
     tmp: PathBuf,
 }
 
@@ -158,10 +162,12 @@ impl Client {
 
     fn open(registry: &str, repo: &str, tmp: &Path, creds: Option<&Creds>, scopes: &[String]) -> Result<Self> {
         fs::create_dir_all(tmp)?;
-        let mut c = Client {
+        let c = Client {
             base: format!("{}://{registry}", scheme(registry)),
             repo: repo.into(),
-            auth: None,
+            auth: std::sync::Mutex::new(None),
+            creds: creds.cloned(),
+            scopes: scopes.to_vec(),
             tmp: tmp.into(),
         };
         c.authenticate(creds, scopes)?;
@@ -173,7 +179,7 @@ impl Client {
         http::scratch(&self.tmp, what)
     }
 
-    fn authenticate(&mut self, creds: Option<&Creds>, scopes: &[String]) -> Result<()> {
+    fn authenticate(&self, creds: Option<&Creds>, scopes: &[String]) -> Result<()> {
         let probe = self.scratch("probe");
         let reply = http::send_retry(&Req { method: "GET", url: &format!("{}/v2/", self.base), headers: &[], upload: None }, &probe, TRIES)?;
         let _ = fs::remove_file(&probe);
@@ -198,7 +204,7 @@ impl Client {
                         200 => {
                             let t: Token = serde_json::from_slice(&bytes)?;
                             let t = t.token.or(t.access_token).ok_or_else(|| err("no token in response"))?;
-                            self.auth = Some(format!("Bearer {t}"));
+                            *self.auth.lock().unwrap() = Some(format!("Bearer {t}"));
                             Ok(())
                         }
                         401 | 403 if creds.is_some() => Err(err("incorrect username or password")),
@@ -207,7 +213,7 @@ impl Client {
                     }
                 } else if challenge.trim_start().to_ascii_lowercase().starts_with("basic") {
                     let c = creds.ok_or_else(|| err("this registry requires `docker login`"))?;
-                    self.auth = Some(c.basic());
+                    *self.auth.lock().unwrap() = Some(c.basic());
                     let r = http::get(&format!("{}/v2/", self.base), &self.headers(None), &probe)?;
                     let _ = fs::remove_file(&probe);
                     if r.status == 200 { Ok(()) } else { Err(err("incorrect username or password")) }
@@ -221,7 +227,7 @@ impl Client {
 
     fn headers(&self, extra: Option<(&'static str, String)>) -> Vec<(&'static str, String)> {
         let mut h = vec![];
-        if let Some(a) = &self.auth {
+        if let Some(a) = self.auth.lock().unwrap().as_ref() {
             h.push(("Authorization", a.clone()));
         }
         h.extend(extra);
@@ -239,7 +245,13 @@ impl Client {
 
     fn fetch(&self, path: &str, accept: Option<&str>, dest: &Path) -> Result<()> {
         let h = self.headers(accept.map(|a| ("Accept", a.to_string())));
-        let r = http::send_retry(&Req { method: "GET", url: &self.url(path), headers: &h, upload: None }, dest, TRIES)?;
+        let mut r = http::send_retry(&Req { method: "GET", url: &self.url(path), headers: &h, upload: None }, dest, TRIES)?;
+        if r.status == 401 {
+            // the bearer token expired during a long pull: get a new one and try once more
+            self.authenticate(self.creds.as_ref(), &self.scopes)?;
+            let h = self.headers(accept.map(|a| ("Accept", a.to_string())));
+            r = http::send_retry(&Req { method: "GET", url: &self.url(path), headers: &h, upload: None }, dest, TRIES)?;
+        }
         if r.status != 200 {
             let _ = fs::remove_file(dest);
             return Err(err(format!("{path}: HTTP {}", r.status)));

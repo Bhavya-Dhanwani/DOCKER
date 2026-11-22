@@ -56,7 +56,21 @@ fn pull_inner(name: &str, platform: Option<&str>, to_stderr: bool) -> Res {
     let r = Reference::parse(name)?;
     let store = store();
     say(&format!("Pulling {}", r.display()));
-    let meta = docker_image::pull_for(&store, &r, platform, &mut |line| say(&line)).map_err(|e| friendly_pull_error(&r.display(), e.to_string()))?;
+    let meta = match docker_image::pull_for(&store, &r, platform, &mut |line| say(&line)) {
+        // an Intel-only image on an ARM64 engine: switch on emulation and take the linux/amd64 build
+        Err(e) if platform.is_none() && crate::emulation::applies(&e.to_string()) => {
+            say(&format!("{} has no ARM64 build: using its Intel (linux/amd64) build under emulation", r.display()));
+            crate::emulation::enable()?;
+            docker_image::pull_for(&store, &r, Some("linux/amd64"), &mut |line| say(&line)).map_err(|e| friendly_pull_error(&r.display(), e.to_string()))?
+        }
+        other => other.map_err(|e| friendly_pull_error(&r.display(), e.to_string()))?,
+    };
+    // an Intel image on an ARM64 Linux engine (single-arch image, or `--platform linux/amd64`) needs emulation to run
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    if docker_image::inspect(&store, &r).ok().and_then(|v| v["Architecture"].as_str().map(|a| a == "amd64")).unwrap_or(false) {
+        say("this is an Intel (linux/amd64) image: switching on x86-64 emulation");
+        crate::emulation::enable()?;
+    }
     #[cfg(target_os = "linux")]
     for l in &meta.layers {
         store.ensure_layer(l)?; // unpack now so `run` starts instantly

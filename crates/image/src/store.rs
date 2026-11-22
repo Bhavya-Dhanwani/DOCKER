@@ -89,6 +89,9 @@ fn hex(digest: &str) -> Result<&str> {
     }
 }
 
+/// Released (the flock with it) when dropped.
+pub struct StoreLock(#[allow(dead_code)] Option<fs::File>);
+
 impl Store {
     pub fn open(root: impl Into<PathBuf>) -> Self {
         Store { root: root.into() }
@@ -96,6 +99,31 @@ impl Store {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// A pull holds this shared while it downloads (layers it fetched are not recorded until the end), and
+    /// `remove`/`prune` hold it exclusively while they delete: so an `rmi` in another process can never pull
+    /// a layer out from under a pull in progress. Linux only (elsewhere nothing deletes concurrently).
+    pub fn lock(&self, exclusive: bool) -> StoreLock {
+        self.lock_file(".lock", exclusive)
+    }
+
+    /// Same, on a named lock file inside the store (one per layer while it is unpacked).
+    fn lock_file(&self, name: &str, exclusive: bool) -> StoreLock {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let path = self.root.join(name);
+            if path.parent().is_some_and(|d| fs::create_dir_all(d).is_ok())
+                && let Ok(f) = fs::OpenOptions::new().create(true).truncate(false).write(true).open(path)
+            {
+                // SAFETY: flock on a descriptor we own; it is released when the file is dropped.
+                unsafe { libc::flock(f.as_raw_fd(), if exclusive { libc::LOCK_EX } else { libc::LOCK_SH }) };
+                return StoreLock(Some(f));
+            }
+        }
+        let _ = (name, exclusive);
+        StoreLock(None)
     }
 
     /// Give an existing image another name (shares all layers).
@@ -128,6 +156,7 @@ impl Store {
 
     /// Delete layers, blobs and staging data that no image refers to. Returns bytes freed.
     pub fn prune(&self) -> Result<u64> {
+        let _lock = self.lock(true);
         let used: HashSet<String> = self
             .list()
             .into_iter()
@@ -187,6 +216,7 @@ impl Store {
 
     /// Delete an image and every layer no other image uses. Returns bytes freed (compressed size).
     pub fn remove(&self, r: &Reference) -> Result<u64> {
+        let _lock = self.lock(true);
         let meta = self.get(r)?.ok_or_else(|| err(format!("no such image: {}", r.display())))?;
         fs::remove_file(self.image_file(r))?;
         crate::info::forget(self, r);
@@ -210,6 +240,12 @@ impl Store {
         let dir = self.layer_path(&l.digest)?;
         if dir.is_dir() {
             return Ok(dir);
+        }
+        // One process unpacks a given layer at a time: two pulls that share a layer (every Debian-based image
+        // does) would otherwise wipe each other's half-unpacked staging directory.
+        let _unpacking = self.lock_file(&format!(".locks/{}", hex(&l.digest)?), true);
+        if dir.is_dir() {
+            return Ok(dir); // the other process finished it while we waited
         }
         let blob = self.blob_path(&l.digest)?;
         let staging = Path::new(&self.root).join("tmp").join(format!("unpack-{}", hex(&l.digest)?));

@@ -15,7 +15,11 @@ pub enum Source {
 
 /// overlayfs wants the top layer first.
 pub fn overlay_opts(layers: &[PathBuf], upper: &Path, work: &Path) -> String {
-    let lower: Vec<String> = layers.iter().rev().map(|p| sys::path_str(p)).collect();
+    // An image can use the same layer twice (identical empty or repeated steps), and the kernel refuses a lowerdir
+    // that appears twice ("conflicting lowerdir path"). Keep the topmost copy: it covers everything the lower one
+    // provided, so what the container sees is unchanged.
+    let mut seen = std::collections::HashSet::new();
+    let lower: Vec<String> = layers.iter().rev().filter(|p| seen.insert(*p)).map(|p| sys::path_str(p)).collect();
     format!("lowerdir={},upperdir={},workdir={}", lower.join(":"), sys::path_str(upper), sys::path_str(work))
 }
 
@@ -103,6 +107,10 @@ pub fn enter(src: &Source, id: &str, rw: bool, volumes: &[Volume]) -> Result<()>
         fs::create_dir_all(Path::new("/").join(d)).map_err(|e| Error::io(format!("mkdir /{d}"), e))?;
     }
     sys::mount("proc", "/proc", Some("proc"), 0, None)?;
+    // /sys, read-only like Docker: runtimes read CPU and cgroup facts from it (MongoDB's tcmalloc aborts without it).
+    // Best effort: a rootless container may not be allowed to mount it.
+    let _ = fs::create_dir_all("/sys");
+    let _ = sys::mount("sysfs", "/sys", Some("sysfs"), libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, None);
     sys::mount("tmpfs", "/tmp", Some("tmpfs"), 0, Some("size=64m"))?;
     if !rootless {
         sys::mount("tmpfs", "/dev", Some("tmpfs"), 0, Some("size=1m,mode=755"))?;
@@ -139,6 +147,17 @@ mod tests {
         assert_eq!(
             overlay_opts(&layers, Path::new("/u"), Path::new("/w")),
             "lowerdir=/l/top:/l/base,upperdir=/u,workdir=/w"
+        );
+    }
+
+    #[test]
+    fn a_layer_used_twice_appears_once_at_its_topmost_place() {
+        // base, a, b, a  (an image that reuses layer `a`)
+        let l = |n: &str| PathBuf::from(format!("/l/{n}"));
+        let layers = [l("base"), l("a"), l("b"), l("a")];
+        assert_eq!(
+            overlay_opts(&layers, Path::new("/u"), Path::new("/w")),
+            "lowerdir=/l/a:/l/b:/l/base,upperdir=/u,workdir=/w"
         );
     }
 }

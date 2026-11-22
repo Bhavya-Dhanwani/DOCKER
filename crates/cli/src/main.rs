@@ -1,6 +1,7 @@
 mod api;
 mod commands;
 mod compose;
+mod emulation;
 mod swarm;
 mod vm;
 
@@ -52,11 +53,11 @@ fn main() -> ExitCode {
         )
         .into()),
         Command::Run(cfg) => {
-            if cfg!(target_os = "linux") {
-                if let Err(e) = commands::ensure_image(&cfg.target) {
-                    eprintln!("docker: {e}");
-                    return ExitCode::FAILURE;
-                }
+            if cfg!(target_os = "linux")
+                && let Err(e) = commands::ensure_image(&cfg.target)
+            {
+                eprintln!("docker: {e}");
+                return ExitCode::FAILURE;
             }
             exit_with(platform::run(&cfg).map_err(Into::into))
         }
@@ -97,6 +98,11 @@ fn main() -> ExitCode {
         Command::Swarm(words) => ok(swarm::run(&words)),
         Command::PullPlatform { image, platform } => ok(commands::pull_platform(&image, Some(&platform))),
         Command::Search(t) => ok(commands::search(&t)),
+        Command::Emulation(w) => ok(match w.as_str() {
+            "enable" => emulation::enable(),
+            "disable" => emulation::disable(),
+            _ => emulation::status(),
+        }),
         Command::History(n) => ok(commands::history(&n)),
         Command::ImageInspect(n) => ok(commands::image_inspect(&n)),
     };

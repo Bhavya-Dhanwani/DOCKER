@@ -69,6 +69,7 @@ pub fn pull_for(store: &Store, r: &Reference, platform: Option<&str>, say: &mut 
         Some(p) => parse_platform(p)?,
         None => ("linux".to_string(), host_arch().to_string()),
     };
+    let _pulling = store.lock(false); // keep `rmi`/`prune` in other processes away until the image is recorded
     let creds = crate::auth::load(store.root(), &r.registry);
     let client = Client::connect(r, &store.tmp_dir(), creds.as_ref(), false)?;
     let (mut m, mut manifest_digest) = client.manifest(&r.tag)?;
@@ -88,13 +89,21 @@ pub fn pull_for(store: &Store, r: &Reference, platform: Option<&str>, say: &mut 
     for d in &m.layers {
         let l = LayerRef { digest: d.digest.clone(), media_type: d.media_type.clone(), size: d.size };
         let short = &l.digest[7..19];
-        if store.has_layer(&l) || store.blob_path(&l.digest)?.is_file() {
+        let blob = store.blob_path(&l.digest)?;
+        // A blob left by an interrupted download (a killed or timed-out pull) must not count as "already here":
+        // only a layer that is unpacked, or a blob whose digest checks out, is skipped.
+        if store.has_layer(&l) || blob_intact(&blob, &l.digest) {
             say(format!("{short}: Already exists"));
         } else {
-            let blob = store.blob_path(&l.digest)?;
             fs::create_dir_all(blob.parent().expect("has parent"))?;
             say(format!("{short}: Pulling"));
-            client.blob(&l.digest, &blob)?;
+            // download beside the final name and rename when complete and verified, so a half-written file is
+            // never mistaken for the layer
+            // (the name includes our pid: two pulls of the same shared layer must not write the same file, and
+            // an existing blob is left alone for whoever is unpacking it)
+            let part = blob.with_extension(format!("part{}", std::process::id()));
+            client.blob(&l.digest, &part)?;
+            fs::rename(&part, &blob)?;
             say(format!("{short}: Pull complete"));
         }
         layers.push(l);
@@ -104,6 +113,14 @@ pub fn pull_for(store: &Store, r: &Reference, platform: Option<&str>, say: &mut 
     store.save(r, &meta)?;
     crate::info::record(store, r, Some(cfg.digest.clone()), Some(manifest_digest), &cfg_bytes);
     Ok(meta)
+}
+
+/// Does `path` exist and hash to `digest` (`sha256:<hex>`)?
+fn blob_intact(path: &std::path::Path, digest: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    let Ok(mut f) = fs::File::open(path) else { return false };
+    let mut h = Sha256::new();
+    std::io::copy(&mut f, &mut h).is_ok() && format!("sha256:{:x}", h.finalize()) == digest
 }
 
 /// Build the stored image record from an image config JSON (as found in registries and archives).

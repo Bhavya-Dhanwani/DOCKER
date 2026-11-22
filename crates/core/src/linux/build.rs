@@ -448,6 +448,16 @@ pub(super) fn seed_volume(layers: &[PathBuf], path: &str, dst: &Path) {
     let m = Merged { layers };
     if m.is_dir(rel) {
         let _ = m.copy(rel, dst); // best effort: an empty volume is still a working volume
+        // The volume directory itself takes the owner and mode of the image's directory, as in Docker: without
+        // this a program that runs as a non-root user (Jenkins, Ghost) cannot write into its own data directory.
+        #[cfg(unix)]
+        if let Some(src) = m.locate(rel)
+            && let Ok(meta) = fs::symlink_metadata(&src)
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let _ = std::os::unix::fs::chown(dst, Some(meta.uid()), Some(meta.gid()));
+            let _ = fs::set_permissions(dst, fs::Permissions::from_mode(meta.mode() & 0o7777));
+        }
     }
 }
 

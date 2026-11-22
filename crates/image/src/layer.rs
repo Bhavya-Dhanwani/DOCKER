@@ -69,6 +69,18 @@ pub fn unpack_rootless(blob: &Path, media_type: &str, dest: &Path) -> Result<()>
 }
 
 #[cfg(target_os = "linux")]
+/// An error with its causes (`tar` hides the real reason, e.g. the failing system call, behind its own message).
+fn chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut src = e.source();
+    while let Some(c) = src {
+        out.push_str(&format!(": {c}"));
+        src = c.source();
+    }
+    out
+}
+
+#[cfg(target_os = "linux")]
 fn unpack_as(blob: &Path, media_type: &str, dest: &Path, rootless: bool) -> Result<()> {
     use crate::error::err;
     use std::{ffi::CString, fs, os::unix::ffi::OsStrExt};
@@ -94,7 +106,8 @@ fn unpack_as(blob: &Path, media_type: &str, dest: &Path, rootless: bool) -> Resu
                     continue; // devices need real root; the runtime binds host ones instead
                 }
                 let (uid, gid) = (entry.header().uid().unwrap_or(0) as u32, entry.header().gid().unwrap_or(0) as u32);
-                if entry.unpack_in(dest)? && rootless && (uid != 0 || gid != 0) {
+                let unpacked = entry.unpack_in(dest).map_err(|e| err(format!("cannot unpack {}: {}", path.display(), chain(&e))))?;
+                if unpacked && rootless && (uid != 0 || gid != 0) {
                     // best effort: works under a full uid/gid map, EINVAL under a single-id map (stays root-owned)
                     unsafe { libc::lchown(cpath(&dest.join(&path)).as_ptr(), uid, gid) };
                 }

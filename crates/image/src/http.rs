@@ -81,6 +81,8 @@ pub fn send(req: &Req, dest: &Path) -> Result<Reply> {
 
     let mut c = Command::new("curl");
     c.arg("-sS");
+    // never hang forever on a dead connection: give up when nothing arrives for a minute (the caller retries)
+    c.args(["--connect-timeout", "30", "--speed-time", "60", "--speed-limit", "1024"]);
     match req.method {
         "GET" => {
             c.args(["-L", "--retry", "2"]);

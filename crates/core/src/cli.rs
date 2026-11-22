@@ -26,6 +26,7 @@ usage:
   docker container prune     remove all exited containers
   docker build -t <name[:tag]> [-f <Dockerfile>] [--build-arg K=V] [--target <stage>] [--no-cache] <context>
   docker pull [--platform os/arch] <image[:tag]|image@sha256:digest>
+  docker emulation enable|disable|status   run Intel (x86-64) images on an ARM64 engine; also automatic for images with no ARM64 build
   docker push <image>
   docker save -o <file.tar> <image>...
   docker load -i <file.tar>
@@ -443,6 +444,8 @@ pub enum Command {
     History(String),
     /// `docker image inspect <image>`
     ImageInspect(String),
+    /// `docker emulation enable|disable|status`: run Intel images on an ARM64 engine (qemu-user + binfmt_misc).
+    Emulation(String),
 }
 
 fn usage(msg: &str) -> Error {
@@ -584,6 +587,10 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command> {
         Some("images") => only_flags(rest, &[]).map(|_| Command::Images),
         Some(g @ ("swarm" | "service" | "stack")) => Ok(Command::Swarm([vec![g.to_string()], rest].concat())),
         Some("search") => flags_then_one(rest, &[], "term").map(|(_, v)| Command::Search(v)),
+        Some("emulation") => match rest.as_slice() {
+            [w] if matches!(w.as_str(), "enable" | "disable" | "status") => Ok(Command::Emulation(w.clone())),
+            _ => Err(usage("usage: docker emulation enable|disable|status")),
+        },
         Some("history") => flags_then_one(rest, &[], "image").map(|(_, v)| Command::History(v)),
         Some("image-inspect") => flags_then_one(rest, &[], "image").map(|(_, v)| Command::ImageInspect(v)),
         _ => Err(usage("expected a command")),
@@ -1311,6 +1318,7 @@ impl Command {
             Command::Swarm(words) => words.clone(),
             Command::PullPlatform { image, platform } => vec![s("pull"), s("--platform"), platform.clone(), image.clone()],
             Command::Search(t) => vec![s("search"), t.clone()],
+            Command::Emulation(w) => vec![s("emulation"), w.clone()],
             Command::History(n) => vec![s("history"), n.clone()],
             Command::ImageInspect(n) => vec![s("image"), s("inspect"), n.clone()],
         }
@@ -1367,6 +1375,8 @@ mod tests {
         assert_eq!(p("pull --platform=linux/arm64 a").unwrap(), Command::PullPlatform { image: "a".into(), platform: "linux/arm64".into() });
         assert!(p("pull --platform").is_err() && p("pull --bogus a").is_err());
         assert_eq!(p("search nginx").unwrap(), Command::Search("nginx".into()));
+        assert_eq!(p("emulation enable").unwrap(), Command::Emulation("enable".into()));
+        assert!(p("emulation").is_err() && p("emulation on").is_err());
         assert_eq!(p("history a:1").unwrap(), Command::History("a:1".into()));
         assert_eq!(p("image history a:1").unwrap(), Command::History("a:1".into()));
         assert_eq!(p("image inspect a:1").unwrap(), Command::ImageInspect("a:1".into()));

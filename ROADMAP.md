@@ -21,7 +21,9 @@ Windows and macOS forwarding into a hidden Linux VM, the `Sasta Docker` desktop 
 - Engine API: `changes`/`export`/`archive`/`commit` need a running container; `images/search` returns an empty list; `commit` does not carry the container's run-time cmd/env
 - Build: `ADD --checksum/--keep-git-dir/--exclude`, git URLs, `COPY --parents`, `.tar.zst` are rejected; anonymous `VOLUME`s are never garbage-collected
 - Windows-native containers beyond the Job Object backend (`--native`)
-- Only about a dozen real images have been run, so other images may hit bugs
+- Only 43 popular images have been run (see the README); other images may hit bugs. Intel-only images run under emulation, which is slower and not fully compatible
+- Android and macOS images cannot run: Android needs a kernel feature (binder) that the stock WSL kernel lacks, and macOS cannot legally run in a container
+- minio/minio is not pullable from Docker Hub or quay.io any more
 
 | Phase | What | State |
 |---|---|---|

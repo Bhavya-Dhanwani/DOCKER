@@ -168,6 +168,20 @@ pub fn wsl_path(win: &str) -> Result<String> {
     }
 }
 
+/// Is WSL itself missing (not just our distro)? `spawned`: wsl.exe could be started at all; `ok`: it exited 0;
+/// `text`: what it printed. Without the WSL feature Windows ships a stub that says "... is not installed".
+/// "has no installed distributions" is a different case: WSL is there, only our VM is not (`docker vm init`).
+pub fn wsl_missing(spawned: bool, ok: bool, text: &str) -> bool {
+    if !spawned {
+        return true;
+    }
+    if ok {
+        return false;
+    }
+    let t = text.to_ascii_lowercase();
+    t.contains("is not installed") || t.contains("optional component is not enabled") || t.contains("wsl is not installed")
+}
+
 /// `wsl -l -q` prints UTF-16LE (with a BOM); decode it into distro names.
 pub fn parse_wsl_list(bytes: &[u8]) -> Vec<String> {
     let text = if bytes.contains(&0) {
@@ -190,6 +204,17 @@ mod tests {
 
     fn args(s: &str) -> Vec<String> {
         s.split_whitespace().map(String::from).collect()
+    }
+
+    #[test]
+    fn missing_wsl_is_told_apart_from_a_missing_distro() {
+        // wsl.exe cannot even start, or the "feature not installed" stub answers
+        assert!(wsl_missing(false, false, ""));
+        assert!(wsl_missing(true, false, "The Windows Subsystem for Linux is not installed. You can install by running 'wsl.exe --install'."));
+        assert!(wsl_missing(true, false, "The Windows Subsystem for Linux optional component is not enabled. Please enable it"));
+        // WSL works (even if it has no distributions yet): that is `docker vm init`'s job, not a missing WSL
+        assert!(!wsl_missing(true, true, ""));
+        assert!(!wsl_missing(true, false, "Windows Subsystem for Linux has no installed distributions. Install one using wsl.exe --install"));
     }
 
     #[test]

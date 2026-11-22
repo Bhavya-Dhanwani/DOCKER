@@ -58,7 +58,7 @@ The command is still called `docker`, so existing scripts and tools keep working
 | OS | How containers run |
 |---|---|
 | **Linux** | Native: namespaces, cgroup v2, overlayfs, `pivot_root`. Run as root. |
-| **Windows** | The same engine inside a small hidden WSL2 distro: run `docker vm init` once, then use the CLI as on Linux (`docker run -v C:\data:/data ...` works; paths are translated). `docker --native run ...` runs a Windows process tree under a Job Object (memory and CPU caps). |
+| **Windows** | The same engine inside a small hidden WSL2 distro: run `docker vm init` once, then use the CLI as on Linux (`docker run -v C:\data:/data ...` works; paths are translated). **Without WSL2** the app still runs, in native mode: `docker run <folder> <program>` runs a Windows program under a Job Object (memory and CPU caps, `ps`/`logs`/`stop`/`stats` work), and commands that need Linux explain how to install WSL2. `docker --native ...` forces this mode. |
 | **macOS** | The same engine in a Lima VM (`brew install lima`, then `docker vm init`). The driver is written and compiled but has not been tried on a real Mac. |
 
 ## Quick start

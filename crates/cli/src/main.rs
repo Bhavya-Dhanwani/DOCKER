@@ -37,11 +37,20 @@ fn main() -> ExitCode {
         }
     };
     let ok = |r: Result<(), Box<dyn Error>>| r.map(|()| ExitCode::SUCCESS);
+    // Windows without WSL2: keep working in native mode instead of failing on every command
+    let fallback = if native { None } else { vm::native_reason() };
     let result = match cmd {
         Command::Vm(v) => ok(vm::manage(&v)),
         Command::Version => ok(commands::version()),
-        // Windows and macOS run Linux containers inside the VM
-        cmd if !cfg!(target_os = "linux") && !native => exit_with(vm::forward(cmd)),
+        // Windows and macOS run Linux containers inside the VM, unless there is none (Windows without WSL2)
+        cmd if !cfg!(target_os = "linux") && !native && fallback.is_none() => exit_with(vm::forward(cmd)),
+        // native Windows mode: only a folder can be "run" (as a Job Object); an image needs a Linux engine
+        Command::Run(cfg) if cfg!(windows) && !std::path::Path::new(&cfg.target).is_dir() => Err(format!(
+            "{:?} is an image, and images need a Linux engine (none is available: {})",
+            cfg.target,
+            fallback.as_deref().unwrap_or("--native was given")
+        )
+        .into()),
         Command::Run(cfg) => exit_with(platform::run(&cfg).map_err(Into::into)),
         Command::Exec { id, cmd, tty } => exit_with(commands::exec(&id, &cmd, tty)),
         Command::Ps { all } => ok(commands::ps(all)),
@@ -87,6 +96,10 @@ fn main() -> ExitCode {
         Ok(code) => code,
         Err(e) => {
             eprintln!("docker: {e}");
+            if fallback.is_some() || native {
+                eprintln!("
+{}", vm::NATIVE_HINT);
+            }
             ExitCode::FAILURE
         }
     }

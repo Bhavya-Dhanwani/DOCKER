@@ -9,6 +9,48 @@ use std::{error::Error, fs, path::{Path, PathBuf}, process::{Command as Proc, St
 
 type Res<T = ()> = Result<T, Box<dyn Error>>;
 
+/// Why there is no Linux VM to forward to, if that is the case. Windows without WSL2 then runs in native
+/// mode (Job Objects) instead of failing. `SASTA_ENGINE=native|vm` forces the choice; `SASTA_NO_WSL=1`
+/// pretends WSL is not installed (used by the tests).
+pub fn native_reason() -> Option<String> {
+    static REASON: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    REASON.get_or_init(detect_native_reason).clone()
+}
+
+fn detect_native_reason() -> Option<String> {
+    if !cfg!(windows) {
+        return None;
+    }
+    match std::env::var("SASTA_ENGINE").ok().as_deref() {
+        Some("native") => return Some("SASTA_ENGINE=native".into()),
+        Some("vm") => return None,
+        _ => {}
+    }
+    if std::env::var_os("SASTA_NO_WSL").is_some() {
+        return Some("WSL2 is not installed (SASTA_NO_WSL)".into());
+    }
+    let out = Proc::new("wsl.exe").args(["-l", "-q"]).stdin(Stdio::null()).output();
+    let (spawned, ok, text) = match &out {
+        Ok(o) => (true, o.status.success(), parse_wsl_text(&[o.stdout.as_slice(), o.stderr.as_slice()].concat())),
+        Err(_) => (false, false, String::new()),
+    };
+    docker_core::vm::wsl_missing(spawned, ok, &text).then(|| "WSL2 is not installed".into())
+}
+
+/// wsl.exe prints UTF-16LE; decode it for matching.
+fn parse_wsl_text(bytes: &[u8]) -> String {
+    if bytes.contains(&0) {
+        let units: Vec<u16> = bytes.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
+        String::from_utf16_lossy(&units)
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+}
+
+/// The friendly hint printed after an error when running without a Linux engine.
+pub const NATIVE_HINT: &str = "Linux images need a Linux engine, which on Windows is WSL2: run `wsl --install` (as administrator, then restart) and `docker vm init`.\n\
+                               Without it only native Windows mode works: `docker run <folder> <program> [args]` runs a program under a Job Object with memory/CPU limits, and ps/logs/stop/rm/stats manage those.";
+
 fn driver(name: Option<&str>) -> Res<Driver> {
     Driver::detect(name).ok_or_else(|| "this OS runs containers natively: no VM needed".into())
 }
@@ -108,6 +150,20 @@ pub fn vm_version() -> Option<String> {
 }
 
 pub fn manage(v: &VmCommand) -> Res {
+    if let Some(reason) = native_reason() {
+        return match v {
+            VmCommand::Status => {
+                println!("VM:      none ({reason})");
+                println!("engine:  native Windows mode (Job Objects); Linux images need WSL2");
+                println!("
+{NATIVE_HINT}");
+                Ok(())
+            }
+            _ => Err(format!("there is no Linux VM to manage: {reason}
+
+{NATIVE_HINT}").into()),
+        };
+    }
     match v {
         VmCommand::Init { distro, use_existing, dry_run } => init(&driver(distro.as_deref())?, *use_existing, *dry_run),
         VmCommand::Start => {

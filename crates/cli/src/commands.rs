@@ -231,7 +231,10 @@ pub fn version() -> Res {
         println!("{line}");
     } else {
         println!("Client: {line}");
-        println!("VM:     {}", crate::vm::vm_version().unwrap_or_else(|| "not running (run `docker vm init`)".into()));
+        match crate::vm::native_reason() {
+            Some(why) => println!("Engine: native Windows mode, no Linux VM ({why})"),
+            None => println!("VM:     {}", crate::vm::vm_version().unwrap_or_else(|| "not running (run `docker vm init`)".into())),
+        }
     }
     Ok(())
 }

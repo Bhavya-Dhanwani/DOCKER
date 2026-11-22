@@ -77,6 +77,16 @@ docker daemon --host unix:///tmp/docker.sock     # Engine API for other Docker t
 docker-gui                                       # desktop app
 ```
 
+### Keeping WSL2's memory small (Windows)
+The Linux engine runs in WSL2, whose VM takes RAM from Windows. You can cap it and let it give memory back by putting this in `%USERPROFILE%\.wslconfig` (then `wsl --shutdown`):
+```
+[wsl2]
+memory=3GB
+[experimental]
+autoMemoryReclaim=gradual
+```
+Without WSL2 the app runs in native mode and uses no VM memory at all.
+
 ## Why it is light
 - **RAM:** no daemon; `--mem` is a hard cgroup cap with swap off.
 - **SSD:** layers are stored once (content-addressed) and shared; container writes go to RAM (tmpfs) by default, so a container writes nothing to disk unless you mount a volume.

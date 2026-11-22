@@ -20,4 +20,7 @@ pub struct Stats {
     pub mem_bytes: u64,
     pub cpu_ms: u64,
     pub procs: u32,
+    /// Writable-layer usage. Container writes live in RAM-backed tmpfs, so on Linux this is the cgroup's
+    /// `shmem` (tmpfs pages); 0 where it cannot be measured.
+    pub disk_bytes: u64,
 }

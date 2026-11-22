@@ -563,11 +563,13 @@ pub fn stats(id: &str) -> Option<Stats> {
         return rootless::proc_stats(registry::find(id).ok()?.pid);
     }
     let read = |f: &str| fs::read_to_string(d.join(f)).ok();
+    let disk_bytes = read("memory.stat").and_then(|t| t.lines().find_map(|l| l.strip_prefix("shmem ")?.trim().parse::<u64>().ok())).unwrap_or(0);
     let cpu_us = read("cpu.stat")?.lines().find_map(|l| l.strip_prefix("usage_usec ")?.trim().parse::<u64>().ok())?;
     Some(Stats {
         mem_bytes: read("memory.current")?.trim().parse().ok()?,
         cpu_ms: cpu_us / 1000,
         procs: read("cgroup.procs")?.lines().count() as u32,
+        disk_bytes,
     })
 }
 

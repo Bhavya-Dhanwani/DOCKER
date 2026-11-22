@@ -94,6 +94,7 @@ impl Job {
             mem_bytes: ext.PeakJobMemoryUsed as u64,
             cpu_ms: (acct.TotalUserTime + acct.TotalKernelTime) as u64 / 10_000, // 100ns ticks
             procs: acct.ActiveProcesses,
+            disk_bytes: 0,
         })
     }
 }

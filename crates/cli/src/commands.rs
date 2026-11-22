@@ -388,7 +388,7 @@ fn host_memory() -> Option<u64> {
     t.lines().find_map(|l| l.strip_prefix("MemTotal:"))?.split_whitespace().next()?.parse::<u64>().ok().map(|kb| kb * 1024)
 }
 
-pub fn stats(no_stream: bool, ids: &[String]) -> Res {
+pub fn stats(no_stream: bool, json: bool, ids: &[String]) -> Res {
     let pick = || -> Result<Vec<Entry>, Box<dyn Error>> {
         if ids.is_empty() {
             Ok(registry::list().into_iter().filter(Entry::running).collect())
@@ -402,14 +402,30 @@ pub fn stats(no_stream: bool, ids: &[String]) -> Res {
         let before: Vec<_> = list.iter().map(|e| platform::stats(&e.id)).collect();
         thread::sleep(Duration::from_millis(if no_stream { 500 } else { 1000 }));
         let wall_ms = t0.elapsed().as_millis().max(1) as f64;
-        if !no_stream {
+        if !no_stream && !json {
             print!("\x1b[2J\x1b[H"); // clear, like `docker stats`
         }
-        println!("{:<18} {:<12} {:>8} {:>24} {:>7} {:>5}", "CONTAINER ID", "NAME", "CPU %", "MEM USAGE / LIMIT", "MEM %", "PIDS");
+        if !json {
+            println!("{:<18} {:<12} {:>8} {:>24} {:>7} {:>5}", "CONTAINER ID", "NAME", "CPU %", "MEM USAGE / LIMIT", "MEM %", "PIDS");
+        }
         for (e, b) in list.iter().zip(before) {
             let (Some(b), Some(a)) = (b, platform::stats(&e.id)) else { continue };
             let cpu = a.cpu_ms.saturating_sub(b.cpu_ms) as f64 / wall_ms * 100.0;
             let limit = e.mem_bytes.or_else(host_memory);
+            if json {
+                // one object per line: the desktop app and scripts read this
+                let mem_limit = limit.unwrap_or(0);
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "id": e.id, "name": e.name, "image": e.image, "cpu_percent": (cpu * 10.0).round() / 10.0,
+                        "mem_bytes": a.mem_bytes, "mem_limit": mem_limit,
+                        "mem_percent": if mem_limit > 0 { (a.mem_bytes as f64 / mem_limit as f64 * 1000.0).round() / 10.0 } else { 0.0 },
+                        "pids": a.procs, "disk_bytes": a.disk_bytes,
+                    })
+                );
+                continue;
+            }
             let (lim, pct) = match limit {
                 Some(l) => (mb(l), format!("{:.1}%", a.mem_bytes as f64 / l as f64 * 100.0)),
                 None => ("-".into(), "-".into()),

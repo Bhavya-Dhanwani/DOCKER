@@ -56,7 +56,7 @@ fn main() -> ExitCode {
         Command::Wait(id) => ok(commands::wait(&id)),
         Command::Top(id) => ok(commands::top(&id)),
         Command::Rename { old, new } => ok(commands::rename(&old, &new)),
-        Command::Stats { no_stream, ids } => ok(commands::stats(no_stream, &ids)),
+        Command::Stats { no_stream, json, ids } => ok(commands::stats(no_stream, json, &ids)),
         Command::Cp { src, dst } => ok(commands::cp(&src, &dst)),
         Command::Volume(v) => ok(commands::volume(&v)),
         Command::Network(n) => ok(commands::network(&n)),

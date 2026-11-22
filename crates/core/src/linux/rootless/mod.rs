@@ -195,5 +195,5 @@ pub fn proc_stats(pid: u32) -> Option<crate::stats::Stats> {
     let ticks = f.get(11)?.parse::<u64>().ok()? + f.get(12)?.parse::<u64>().ok()?; // utime + stime
     let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     let rss_kb = status.lines().find_map(|l| l.strip_prefix("VmRSS:")).and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok()).unwrap_or(0);
-    Some(crate::stats::Stats { mem_bytes: rss_kb * 1024, cpu_ms: ticks * 10, procs: 1 })
+    Some(crate::stats::Stats { mem_bytes: rss_kb * 1024, cpu_ms: ticks * 10, procs: 1, disk_bytes: 0 })
 }

@@ -410,7 +410,8 @@ pub enum Command {
     Wait(String),
     Top(String),
     Rename { old: String, new: String },
-    Stats { no_stream: bool, ids: Vec<String> },
+    /// `docker stats`; `json` prints one JSON object per container per line (for the GUI and scripts).
+    Stats { no_stream: bool, json: bool, ids: Vec<String> },
     Cp { src: String, dst: String },
     Volume(VolumeCmd),
     Network(NetCmd),
@@ -525,15 +526,21 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command> {
             Err(_) => Err(usage("usage: docker cp <container>:<path> <host-path>  |  <host-path> <container>:<path>")),
         },
         Some("stats") => {
-            let (mut no_stream, mut ids) = (false, vec![]);
-            for a in rest {
+            let (mut no_stream, mut json, mut ids) = (false, false, vec![]);
+            let mut it = rest.into_iter();
+            while let Some(a) = it.next() {
                 match a.as_str() {
                     "--no-stream" => no_stream = true,
+                    "--json" => json = true,
+                    "--format" => match it.next().as_deref() {
+                        Some("json" | "{{json .}}") => json = true,
+                        _ => return Err(usage("stats --format supports only: json")),
+                    },
                     f if f.starts_with('-') => return Err(usage(&format!("unknown flag {f}"))),
                     _ => ids.push(a),
                 }
             }
-            Ok(Command::Stats { no_stream, ids })
+            Ok(Command::Stats { no_stream, json, ids })
         }
         Some("volume") => parse_volume(rest).map(Command::Volume),
         Some("network") => parse_network(rest).map(Command::Network),
@@ -1189,10 +1196,13 @@ impl Command {
             Command::Top(id) => vec![s("top"), id.clone()],
             Command::Rename { old, new } => vec![s("rename"), old.clone(), new.clone()],
             Command::Cp { src, dst } => vec![s("cp"), src.clone(), dst.clone()],
-            Command::Stats { no_stream, ids } => {
+            Command::Stats { no_stream, json, ids } => {
                 let mut a = vec![s("stats")];
                 if *no_stream {
                     a.push(s("--no-stream"));
+                }
+                if *json {
+                    a.push(s("--json"));
                 }
                 a.extend(ids.iter().cloned());
                 a
@@ -1557,7 +1567,8 @@ mod tests {
         assert_eq!(p("system df").unwrap(), Command::SystemDf);
         assert_eq!(p("system prune").unwrap(), Command::Prune);
         assert_eq!(p("volume create data").unwrap(), Command::Volume(VolumeCmd::Create("data".into())));
-        assert_eq!(p("stats --no-stream web").unwrap(), Command::Stats { no_stream: true, ids: vec!["web".into()] });
+        assert_eq!(p("stats --no-stream web").unwrap(), Command::Stats { no_stream: true, json: false, ids: vec!["web".into()] });
+        assert_eq!(p("stats --no-stream --format json").unwrap(), Command::Stats { no_stream: true, json: true, ids: vec![] });
         assert_eq!(p("rename a b").unwrap(), Command::Rename { old: "a".into(), new: "b".into() });
         let c = run("run -v data:/var/lib/x -v ./p:/p alpine");
         assert!(c.volumes[0].is_named() && !c.volumes[1].is_named());

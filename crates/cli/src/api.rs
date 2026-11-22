@@ -417,6 +417,19 @@ pub fn config_from_create(body: &Value, ncpu: u64) -> Result<Config, String> {
     cfg.interactive = body.get("OpenStdin").and_then(Value::as_bool).unwrap_or(false);
     cfg.hostname = body.get("Hostname").and_then(Value::as_str).filter(|h| !h.is_empty() && is_volume_name(h)).map(String::from);
     cfg.extra_hosts = strings(host.get("ExtraHosts"));
+    cfg.dns = strings(host.get("Dns"));
+    cfg.read_only = host.get("ReadonlyRootfs").and_then(Value::as_bool).unwrap_or(false);
+    cfg.init = host.get("Init").and_then(Value::as_bool).unwrap_or(false);
+    cfg.shm_mb = host.get("ShmSize").and_then(Value::as_u64).filter(|b| *b > 0).map(|b| b.div_ceil(1 << 20));
+    if let Some(Value::Object(t)) = host.get("Tmpfs") {
+        cfg.tmpfs = t.iter().map(|(p, o)| match o.as_str().filter(|o| !o.is_empty()) { Some(o) => format!("{p}:{o}"), None => p.clone() }).collect();
+    }
+    for u in host.get("Ulimits").and_then(Value::as_array).into_iter().flatten() {
+        let (n, soft, hard) = (u.get("Name").and_then(Value::as_str).unwrap_or(""), u.get("Soft").and_then(Value::as_i64), u.get("Hard").and_then(Value::as_i64));
+        if let (true, Some(s), Some(h)) = (!n.is_empty(), soft, hard) {
+            cfg.ulimits.push(format!("{n}={s}:{h}"));
+        }
+    }
 
     for b in strings(host.get("Binds")) {
         // "src:dst" or "src:dst:opts" (opts are comma-separated: ro, rw, z, ...)
@@ -1496,7 +1509,15 @@ fn labels_from(meta: &Value) -> BTreeMap<String, String> {
 }
 
 fn labels_of(id: &str) -> BTreeMap<String, String> {
-    labels_from(&meta_of(id))
+    let mut labels = labels_from(&meta_of(id));
+    // `docker run --label k=v` keeps them in the container's own config
+    if let Some(c) = registry::find(id).ok().and_then(|e| e.config) {
+        for l in &c.labels {
+            let (k, v) = l.split_once('=').unwrap_or((l, ""));
+            labels.entry(k.to_string()).or_insert_with(|| v.to_string());
+        }
+    }
+    labels
 }
 
 fn save_meta(id: &str, body: &Value) {

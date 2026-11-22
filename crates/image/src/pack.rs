@@ -83,8 +83,7 @@ fn is_opaque(p: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(p.as_os_str().as_bytes()).expect("no NUL in path");
     let mut b = [0u8; 1];
-    let n = unsafe { libc::lgetxattr(c.as_ptr(), c"trusted.overlay.opaque".as_ptr(), b.as_mut_ptr().cast(), 1) };
-    n == 1 && b[0] == b'y'
+    [c"trusted.overlay.opaque", c"user.overlay.opaque"].iter().any(|name| unsafe { libc::lgetxattr(c.as_ptr(), name.as_ptr(), b.as_mut_ptr().cast(), 1) } == 1 && b[0] == b'y')
 }
 
 #[cfg(target_os = "linux")]

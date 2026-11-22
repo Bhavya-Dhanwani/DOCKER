@@ -26,6 +26,11 @@ pub fn ensure(name: &str) -> Result<PathBuf> {
     Ok(p)
 }
 
+/// A volume made for `docker run -v /path` (no name given): `anon-` plus 16 hex digits.
+pub fn is_anonymous(name: &str) -> bool {
+    name.strip_prefix("anon-").is_some_and(|h| h.len() == 16 && h.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
 pub fn exists(name: &str) -> bool {
     path(name).is_dir()
 }

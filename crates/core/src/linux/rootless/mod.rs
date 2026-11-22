@@ -10,6 +10,7 @@ pub mod cgroup;
 mod copyfs;
 pub mod idmap;
 pub mod net;
+pub mod pod;
 
 use super::{rootfs, sys};
 use crate::error::{Error, Result};

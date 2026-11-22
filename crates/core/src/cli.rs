@@ -353,7 +353,22 @@ impl Port {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)] // registry entries written by older versions lack the newer fields
 pub struct Config {
+    /// `--label key=value`.
+    pub labels: Vec<String>,
+    /// `--dns <server>`: replaces the nameservers in the container's resolv.conf.
+    pub dns: Vec<String>,
+    /// `--init`: a tiny process 1 that reaps zombies and passes signals on.
+    pub init: bool,
+    /// `--read-only`: the root filesystem cannot be written (volumes, `--tmpfs`, /dev, /proc and /tmp stay writable).
+    pub read_only: bool,
+    /// `--ulimit name=soft[:hard]` (`-1` = unlimited).
+    pub ulimits: Vec<String>,
+    /// `--tmpfs /path[:options]`.
+    pub tmpfs: Vec<String>,
+    /// `--shm-size`, in MB (default 64).
+    pub shm_mb: Option<u64>,
     pub cap_add: Vec<String>,
     pub cap_drop: Vec<String>,
     pub security_opt: Vec<String>,
@@ -944,7 +959,88 @@ const RUN_VALUE_FLAGS: &[&str] = &[
     "--shm-size", "--ulimit", "--stop-timeout", "--stop-signal", "--pull", "--platform", "--tmpfs", "--cpus", "--memory-swap", "--ipc", "--pid",
 ];
 
-/// Name of the volume behind an anonymous mount (`-v /data`, compose `- /data`): one per container path.
+/// `nofile=1024:2048`, `nproc=512`, `core=-1` as (RLIMIT_* number on Linux, soft, hard); `-1` is unlimited.
+pub fn parse_ulimit(s: &str) -> Option<(i32, u64, u64)> {
+    let (name, v) = s.split_once('=')?;
+    let res = match name {
+        "cpu" => 0,
+        "fsize" => 1,
+        "data" => 2,
+        "stack" => 3,
+        "core" => 4,
+        "rss" => 5,
+        "nproc" => 6,
+        "nofile" => 7,
+        "memlock" => 8,
+        "as" => 9,
+        "locks" => 10,
+        "sigpending" => 11,
+        "msgqueue" => 12,
+        "nice" => 13,
+        "rtprio" => 14,
+        _ => return None,
+    };
+    let num = |t: &str| if t == "-1" { Some(u64::MAX) } else { t.parse().ok() };
+    let (soft, hard) = match v.split_once(':') {
+        Some((a, b)) => (num(a)?, num(b)?),
+        None => (num(v)?, num(v)?),
+    };
+    (soft <= hard).then_some((res, soft, hard))
+}
+
+/// `64m`, `1g`, `512k` or plain bytes as megabytes (at least 1).
+pub fn parse_size_mb(s: &str) -> Option<u64> {
+    let s = s.trim().to_lowercase();
+    let s = s.trim_end_matches('b');
+    let (num, mult) = match s.chars().last()? {
+        'k' => (&s[..s.len() - 1], 1.0 / 1024.0),
+        'm' => (&s[..s.len() - 1], 1.0),
+        'g' => (&s[..s.len() - 1], 1024.0),
+        _ => (s, 1.0 / (1024.0 * 1024.0)),
+    };
+    let mb = (num.trim().parse::<f64>().ok()? * mult).ceil() as u64;
+    (mb > 0).then_some(mb)
+}
+
+/// `docker rm -f a b c`, `docker stop -t 2 a b`, `docker rmi x y`: Docker takes several names for these. Returns one
+/// argument list per name (a single list when the command is not one of them or has at most one name).
+pub fn split_multi(args: Vec<String>) -> Vec<Vec<String>> {
+    const VERBS: [&str; 8] = ["rm", "stop", "start", "restart", "kill", "pause", "unpause", "rmi"];
+    let group = matches!(args.first().map(String::as_str), Some("container" | "image"));
+    let at = usize::from(group);
+    if args.get(at).is_none_or(|v| !VERBS.contains(&v.as_str())) || (group && args.first().map(String::as_str) == Some("image") && args[1] != "rm") {
+        return vec![args];
+    }
+    let (head, rest) = args.split_at(at + 1);
+    let (mut flags, mut names) = (vec![], vec![]);
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        if a.starts_with('-') {
+            flags.push(a.clone());
+            if matches!(a.as_str(), "-t" | "--time" | "-s" | "--signal") {
+                flags.extend(it.next().cloned());
+            }
+        } else {
+            names.push(a.clone());
+        }
+    }
+    if names.len() < 2 {
+        return vec![args];
+    }
+    names.into_iter().map(|n| [head, &flags, &[n]].concat()).collect()
+}
+
+/// A fresh name for the volume behind `docker run -v /data`: `anon-` and 16 hex digits, never reused.
+/// `docker run --rm` deletes such volumes together with the container (see `volumes::is_anonymous`).
+pub fn new_anon_volume_name() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+    let mix = t ^ (u64::from(std::process::id()) << 32) ^ N.fetch_add(1, Ordering::Relaxed).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    format!("anon-{mix:016x}")
+}
+
+/// Name of the volume behind an anonymous mount of a compose service (`- /data`): one per service and path, kept between runs.
 pub fn anon_volume_name(dst: &str) -> String {
     format!("anon-{:x}", dst.bytes().fold(0u64, |a, b| a.wrapping_mul(31).wrapping_add(u64::from(b))))
 }
@@ -965,7 +1061,7 @@ fn mount_spec(s: &str) -> Result<String> {
         return Err(usage("--mount needs target= (and source= for a bind mount)"));
     }
     // an anonymous volume has no source: give it a name of its own
-    let src = if src.is_empty() { anon_volume_name(dst) } else { src.to_string() };
+    let src = if src.is_empty() { new_anon_volume_name() } else { src.to_string() };
     Ok(format!("{src}:{dst}{}", if ro { ":ro" } else { "" }))
 }
 
@@ -1081,17 +1177,45 @@ fn parse_run(args: Vec<String>) -> Result<Config> {
                     _ => return Err(usage("--add-host needs name:ip (ip can be host-gateway)")),
                 }
             }
-            "--label" | "-l" | "--dns" | "--log-driver" | "--shm-size" | "--ulimit" | "--stop-timeout" | "--stop-signal"
-            | "--pull" | "--platform" | "--tmpfs" | "--cpus" | "--memory-swap" | "--ipc" | "--pid" => {
+            "--label" | "-l" => {
+                let l = value("key=value")?;
+                if l.is_empty() || l.starts_with('=') {
+                    return Err(usage("--label needs key or key=value"));
+                }
+                cfg.labels.push(l);
+            }
+            "--dns" => cfg.dns.push(value("a server address")?),
+            "--init" => cfg.init = true,
+            "--read-only" => cfg.read_only = true,
+            "--ulimit" => {
+                let u = value("name=soft[:hard]")?;
+                parse_ulimit(&u).ok_or_else(|| usage("--ulimit needs name=soft[:hard] with a known name (nofile, nproc, core, cpu, fsize, data, stack, memlock, as, ...)"))?;
+                cfg.ulimits.push(u);
+            }
+            "--tmpfs" => {
+                let t = value("/path[:options]")?;
+                if !t.starts_with('/') {
+                    return Err(usage("--tmpfs needs an absolute path"));
+                }
+                cfg.tmpfs.push(t);
+            }
+            "--shm-size" => cfg.shm_mb = Some(parse_size_mb(&value("a size like 64m or 1g")?).ok_or_else(|| usage("--shm-size needs a size like 64m or 1g"))?),
+            "--cpus" => {
+                // 1.5 = a cap of one and a half cores (the cgroup quota is percent of one core)
+                let c: f64 = value("a number of CPUs")?.parse().ok().filter(|c: &f64| *c > 0.0 && c.is_finite()).ok_or_else(|| usage("--cpus needs a positive number"))?;
+                cfg.cpu_percent = Some(((c * 100.0).round() as u32).max(1));
+            }
+            // accepted so existing commands keep working; the engine does not apply them yet
+            "--log-driver" | "--stop-timeout" | "--stop-signal" | "--pull" | "--platform" | "--memory-swap" | "--ipc" | "--pid" => {
                 let v = value("a value")?;
                 eprintln!("warning: {flag} {v} is accepted but not applied by this engine yet");
             }
-            "--init" | "--read-only" | "--oom-kill-disable" => eprintln!("warning: {flag} is accepted but not applied by this engine yet"),
+            "--oom-kill-disable" => eprintln!("warning: {flag} is accepted but not applied by this engine yet"),
             "-p" | "--publish" => cfg.ports.extend(Port::parse_all(&value("[ip:]host:container[/udp]")?)?),
             "-v" | "--volume" => {
                 let v = value("host:container[:ro]")?;
                 // `-v /data`: an anonymous volume
-                let v = if v.starts_with('/') && !v.contains(':') { format!("{}:{v}", anon_volume_name(&v)) } else { v };
+                let v = if v.starts_with('/') && !v.contains(':') { format!("{}:{v}", new_anon_volume_name()) } else { v };
                 cfg.volumes.push(Volume::parse(&v)?);
             }
             "--mem" => {
@@ -1230,7 +1354,29 @@ impl Command {
                     flag("--mem", Some((m >> 20).to_string()));
                 }
                 if let Some(p) = c.cpu_percent {
-                    flag("--cpu", Some(p.to_string()));
+                    // `--cpu` only goes up to one core; more is `--cpus`
+                    if p > 100 { flag("--cpus", Some((f64::from(p) / 100.0).to_string())) } else { flag("--cpu", Some(p.to_string())) }
+                }
+                for l in &c.labels {
+                    flag("--label", Some(l.clone()));
+                }
+                for d in &c.dns {
+                    flag("--dns", Some(d.clone()));
+                }
+                if c.init {
+                    flag("--init", None);
+                }
+                if c.read_only {
+                    flag("--read-only", None);
+                }
+                for u in &c.ulimits {
+                    flag("--ulimit", Some(u.clone()));
+                }
+                for t in &c.tmpfs {
+                    flag("--tmpfs", Some(t.clone()));
+                }
+                if let Some(m) = c.shm_mb {
+                    flag("--shm-size", Some(format!("{m}m")));
                 }
                 if let Some(p) = c.procs {
                     flag("--procs", Some(p.to_string()));
@@ -1415,6 +1561,54 @@ mod tests {
         assert_eq!((c.cpu_percent, c.procs, c.rw), (Some(50), Some(8), true));
         assert_eq!(c.target, "./alpine");
         assert_eq!(c.cmd, ["/bin/sh", "-c", "id"]);
+    }
+
+    #[test]
+    fn docker_flags_that_used_to_be_ignored_are_kept() {
+        let c = run("run --label a=1 -l b --dns 9.9.9.9 --init --read-only --ulimit nofile=1024:2048 --ulimit core=-1 --tmpfs /run:size=8m --shm-size 128m --cpus 1.5 alpine true");
+        assert_eq!((c.labels.as_slice(), c.dns.as_slice()), (["a=1".to_string(), "b".to_string()].as_slice(), ["9.9.9.9".to_string()].as_slice()));
+        assert!(c.init && c.read_only);
+        assert_eq!((c.ulimits.as_slice(), c.tmpfs.as_slice()), (["nofile=1024:2048".to_string(), "core=-1".to_string()].as_slice(), ["/run:size=8m".to_string()].as_slice()));
+        assert_eq!((c.shm_mb, c.cpu_percent), (Some(128), Some(150)));
+        // the command is forwarded to a VM as arguments: they must parse back to the same thing
+        let again = match parse(Command::Run(c.clone()).to_args().into_iter()).unwrap() {
+            Command::Run(c) => c,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(again, c);
+        assert!(p("run --ulimit nope=1 alpine").is_err() && p("run --tmpfs rel alpine").is_err() && p("run --cpus 0 alpine").is_err());
+    }
+
+    #[test]
+    fn several_names_become_several_commands() {
+        let v = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+        assert_eq!(split_multi(v("rm -f a b c")), vec![v("rm -f a"), v("rm -f b"), v("rm -f c")]);
+        assert_eq!(split_multi(v("stop -t 2 a b")), vec![v("stop -t 2 a"), v("stop -t 2 b")]);
+        assert_eq!(split_multi(v("container rm a b")), vec![v("container rm a"), v("container rm b")]);
+        assert_eq!(split_multi(v("rmi x y")), vec![v("rmi x"), v("rmi y")]);
+        // one name, other commands, and `image ls`-style subcommands stay as they are
+        assert_eq!(split_multi(v("rm -f a")), vec![v("rm -f a")]);
+        assert_eq!(split_multi(v("run alpine echo a b")), vec![v("run alpine echo a b")]);
+        assert_eq!(split_multi(v("image ls a b")), vec![v("image ls a b")]);
+        assert_eq!(split_multi(v("ps")), vec![v("ps")]);
+    }
+
+    #[test]
+    fn anonymous_volumes_get_their_own_names() {
+        let (a, b) = (new_anon_volume_name(), new_anon_volume_name());
+        assert!(crate::volumes::is_anonymous(&a) && a != b);
+        assert!(!crate::volumes::is_anonymous("anon-2c54059") && !crate::volumes::is_anonymous("data") && !crate::volumes::is_anonymous("proj_anon-0123456789abcdef"));
+        let c = run("run -v /data alpine true");
+        assert!(crate::volumes::is_anonymous(&c.volumes[0].host) && c.volumes[0].container == "/data");
+    }
+
+    #[test]
+    fn ulimits_and_sizes() {
+        assert_eq!(parse_ulimit("nofile=1024:2048"), Some((7, 1024, 2048)));
+        assert_eq!(parse_ulimit("nproc=5"), Some((6, 5, 5)));
+        assert_eq!(parse_ulimit("core=-1"), Some((4, u64::MAX, u64::MAX)));
+        assert_eq!(parse_ulimit("nofile=9:1"), None);
+        assert_eq!((parse_size_mb("64m"), parse_size_mb("1g"), parse_size_mb("512k"), parse_size_mb("x")), (Some(64), Some(1024), Some(1), None));
     }
 
     #[test]

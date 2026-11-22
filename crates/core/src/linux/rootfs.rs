@@ -41,13 +41,15 @@ fn mount_overlay(layers: &[PathBuf], id: &str) -> Result<PathBuf> {
 }
 
 fn mount_step_overlay(layers: &[PathBuf], upper: &Path, work: &Path, id: &str) -> Result<PathBuf> {
-    if crate::registry::rootless() {
-        return Err(Error::Usage("docker build is not supported in rootless mode yet".into()));
-    }
     let merged = super::rootless::run_root().join(id).join("merged");
     fs::create_dir_all(&merged).map_err(|e| Error::io(format!("mkdir {}", merged.display()), e))?;
-    // plain overlay semantics: no redirects or metacopy, so the upper dir is a portable layer
-    let opts = format!("{},redirect_dir=off,metacopy=off", overlay_opts(layers, upper, work));
+    // plain overlay semantics: no redirects or metacopy, so the upper dir is a portable layer.
+    // Rootless: the same, with the `user.overlay.*` attributes a user namespace is allowed to write.
+    let opts = if crate::registry::rootless() {
+        format!("{},userxattr", overlay_opts(layers, upper, work)) // the kernel does not combine userxattr with the redirect/metacopy switches; both are off by default there
+    } else {
+        format!("{},redirect_dir=off,metacopy=off", overlay_opts(layers, upper, work))
+    };
     sys::mount("overlay", &sys::path_str(&merged), Some("overlay"), 0, Some(&opts))?;
     Ok(merged)
 }
@@ -80,11 +82,41 @@ fn mount_volume(root: &Path, v: &Volume) -> Result<()> {
     Ok(())
 }
 
-pub fn enter(src: &Source, id: &str, rw: bool, volumes: &[Volume]) -> Result<()> {
+/// Per-container options applied once the root is in place.
+pub struct Extras<'a> {
+    /// `--read-only`
+    pub read_only: bool,
+    /// `--tmpfs /path[:options]`
+    pub tmpfs: &'a [String],
+    /// `--shm-size` in MB
+    pub shm_mb: Option<u64>,
+}
+
+/// Mount options for `--tmpfs`: what the user gave, or Docker's defaults (writable, no exec, no setuid).
+fn tmpfs_options(opts: &str) -> (libc::c_ulong, String) {
+    let mut flags = libc::MS_NOSUID | libc::MS_NODEV;
+    let mut data = vec![];
+    for o in opts.split(',').filter(|o| !o.is_empty()) {
+        match o {
+            "rw" => {}
+            "ro" => flags |= libc::MS_RDONLY,
+            "noexec" => flags |= libc::MS_NOEXEC,
+            "exec" => flags &= !libc::MS_NOEXEC,
+            "nosuid" | "suid" | "nodev" | "dev" => {}
+            other => data.push(other.to_string()), // size=, mode=, uid=, gid=, nr_inodes=
+        }
+    }
+    if !opts.split(',').any(|o| o == "exec") {
+        flags |= libc::MS_NOEXEC;
+    }
+    (flags, data.join(","))
+}
+
+pub fn enter(src: &Source, id: &str, rw: bool, volumes: &[Volume], extras: &Extras) -> Result<()> {
     sys::mount("none", "/", None, MS_PRIVATE | MS_REC, None)?; // don't leak mounts to the host
     let (root, read_only) = match src {
-        Source::Dir(p) => (p.clone(), !rw),
-        Source::Image(layers) => (mount_overlay(layers, id)?, false),
+        Source::Dir(p) => (p.clone(), !rw || extras.read_only),
+        Source::Image(layers) => (mount_overlay(layers, id)?, extras.read_only),
         Source::Step { layers, upper, work } => (mount_step_overlay(layers, upper, work, id)?, false),
     };
     let root_s = sys::path_str(&root);
@@ -132,7 +164,13 @@ pub fn enter(src: &Source, id: &str, rw: bool, volumes: &[Volume]) -> Result<()>
         let _ = std::os::unix::fs::symlink(target, Path::new("/dev").join(link));
     }
     if fs::create_dir_all("/dev/shm").is_ok() {
-        let _ = sys::mount("tmpfs", "/dev/shm", Some("tmpfs"), 0, Some("size=64m,mode=1777"));
+        let _ = sys::mount("tmpfs", "/dev/shm", Some("tmpfs"), 0, Some(&format!("size={}m,mode=1777", extras.shm_mb.unwrap_or(64))));
+    }
+    for t in extras.tmpfs {
+        let (path, opts) = t.split_once(':').unwrap_or((t, ""));
+        fs::create_dir_all(path).map_err(|e| Error::io(format!("mkdir {path}"), e))?;
+        let (flags, data) = tmpfs_options(opts);
+        sys::mount("tmpfs", path, Some("tmpfs"), flags, Some(&if data.is_empty() { "mode=1777".to_string() } else { data }))?;
     }
     if read_only {
         sys::mount("/", "/", None, MS_REMOUNT | MS_BIND | MS_RDONLY, None)?;

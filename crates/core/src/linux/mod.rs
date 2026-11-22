@@ -24,7 +24,7 @@ use crate::{
 use cgroup::Cgroup;
 use docker_image::{Reference, Store};
 use rootfs::Source;
-use std::{fs, io::{Read, Write}, os::fd::{AsRawFd, OwnedFd}, path::Path, process};
+use std::{fs, io::{Read, Write}, os::fd::{AsRawFd, OwnedFd}, path::{Path, PathBuf}, process};
 
 pub use build::build;
 pub use cp::{cp, secure_join};
@@ -47,6 +47,18 @@ struct Plan {
     health: Option<docker_image::Health>,
     /// `--hostname` (default `container`).
     hostname: Option<String>,
+    /// `--init`: run a small PID 1 in front of the command.
+    init: bool,
+    read_only: bool,
+    tmpfs: Vec<String>,
+    shm_mb: Option<u64>,
+}
+
+impl Plan {
+    /// The per-container options that only matter once the root is set up.
+    fn extras(&self) -> rootfs::Extras<'_> {
+        rootfs::Extras { read_only: self.read_only, tmpfs: &self.tmpfs, shm_mb: self.shm_mb }
+    }
 }
 
 fn img(e: docker_image::Error) -> Error {
@@ -103,6 +115,10 @@ fn plan(cfg: &Config) -> Result<Plan> {
             security: security::resolve(cfg)?,
             health: cfg.health.clone(),
             hostname: cfg.hostname.clone(),
+            init: cfg.init,
+            read_only: cfg.read_only,
+            tmpfs: cfg.tmpfs.clone(),
+            shm_mb: cfg.shm_mb,
         });
     }
 
@@ -155,6 +171,10 @@ fn plan(cfg: &Config) -> Result<Plan> {
         security: security::resolve(cfg)?,
         health: if cfg.no_healthcheck { None } else { cfg.health.clone().or_else(|| meta.healthcheck.clone()) },
         hostname: cfg.hostname.clone(),
+        init: cfg.init,
+        read_only: cfg.read_only,
+        tmpfs: cfg.tmpfs.clone(),
+        shm_mb: cfg.shm_mb,
     })
 }
 
@@ -219,6 +239,10 @@ pub fn run_step(s: &Step) -> Result<i32> {
         security: Security::default(),
         health: None,
         hostname: None,
+        init: false,
+        read_only: false,
+        tmpfs: vec![],
+        shm_mb: None,
     };
     run_with_plan(&cfg, plan)
 }
@@ -267,25 +291,33 @@ fn run_container(cfg: &Config, mut plan: Plan) -> Result<i32> {
     let rl = registry::rootless();
     let mut rl_helper = None;
     let mut rl_map = None;
+    // rootless user-defined network: this process joins the network's shared user + network namespace (see rootless::pod)
+    let mut pod_api: Option<PathBuf> = None;
     if rl {
         let m = rootless::detect();
         rootless::describe(&m);
-        rl_map = Some(m);
         if mode == Network::Bridge {
             rl_helper = rootless::net::detect();
-            if cfg.network_name.is_some() {
-                rootless::warn("user-defined networks are not available rootless; using the default rootless network");
-            }
-            if rl_helper.is_none() {
-                rootless::warn("neither slirp4netns nor pasta found: sharing the HOST network namespace (like --network host)");
-                if let Some(p) = cfg.ports.iter().find(|p| p.host != p.container) {
-                    return Err(Error::Usage(format!(
-                        "-p {}:{} needs slirp4netns or pasta (with the host network only identical ports like -p {}:{} work)",
-                        p.host, p.container, p.container, p.container
-                    )));
+            if let Some(n) = &cfg.network_name {
+                if !crate::networks::exists(n) {
+                    return Err(Error::Usage(format!("network {n:?} does not exist: run `docker network create {n}`")));
                 }
-                mode = Network::Host;
+                match rl_helper {
+                    Some(h @ rootless::net::Helper::Slirp4netns) => pod_api = Some(rootless::pod::join(n, h, &m)?),
+                    _ => rootless::warn("user-defined networks need slirp4netns when rootless; using the default rootless network"),
+                }
             }
+        }
+        rl_map = Some(m);
+        if mode == Network::Bridge && rl_helper.is_none() {
+            rootless::warn("neither slirp4netns nor pasta found: sharing the HOST network namespace (like --network host)");
+            if let Some(p) = cfg.ports.iter().find(|p| p.host != p.container) {
+                return Err(Error::Usage(format!(
+                    "-p {}:{} needs slirp4netns or pasta (with the host network only identical ports like -p {}:{} work)",
+                    p.host, p.container, p.container, p.container
+                )));
+            }
+            mode = Network::Host;
         }
         let _ = fs::create_dir_all(rootless::run_root());
     }
@@ -306,11 +338,15 @@ fn run_container(cfg: &Config, mut plan: Plan) -> Result<i32> {
         fs::create_dir_all(&dir).map_err(|e| Error::io("mkdir run dir", e))?;
         let host = fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
         let file = dir.join("resolv.conf");
-        let text = if rl_helper.is_some() { format!("nameserver {}\n", rootless::net::DNS) } else { net::resolv_conf(&host, mode == Network::Bridge) };
+        let text = if !cfg.dns.is_empty() {
+            cfg.dns.iter().map(|d| format!("nameserver {d}\n")).collect()
+        } else if rl_helper.is_some() { format!("nameserver {}\n", rootless::net::DNS) } else { net::resolv_conf(&host, mode == Network::Bridge) };
         fs::write(&file, text).map_err(|e| Error::io("write resolv.conf", e))?;
         plan.volumes.push(Volume { host: file.to_string_lossy().into_owned(), container: "/etc/resolv.conf".into(), ro: true });
     }
-    if let (Network::Bridge, Some(ip)) = (mode, ip) {
+    // the address /etc/hosts and `ps` show: the container's own, or 127.0.0.1 when a whole network shares one namespace
+    let hosts_ip: Option<String> = ip.map(|i| i.to_string()).or_else(|| pod_api.as_ref().map(|_| "127.0.0.1".to_string()));
+    if let (Network::Bridge, Some(own_ip)) = (mode, hosts_ip.clone()) {
         // /etc/hosts: the container's own name, plus its peers on a user-defined network
         if let Some(n) = &cfg.network_name
             && !crate::networks::exists(n)
@@ -321,7 +357,7 @@ fn run_container(cfg: &Config, mut plan: Plan) -> Result<i32> {
         own_names.push(id.chars().take(12).collect());
         own_names.extend(cfg.aliases.iter().cloned());
         let own = crate::networks::Host {
-            ip: ip.to_string(),
+            ip: own_ip,
             names: own_names,
             hostname: cfg.hostname.clone(),
             extra: crate::networks::resolve_extra_hosts(&cfg.extra_hosts, cfg.network_name.as_deref()),
@@ -348,7 +384,7 @@ fn run_container(cfg: &Config, mut plan: Plan) -> Result<i32> {
     };
     let code = loop {
         let cgroup = Cgroup::create(&id, cfg)?;
-        let helper_net = rl_helper.is_some();
+        let helper_net = rl_helper.is_some() && pod_api.is_none(); // a shared network has its own helper
         let (rd, wr) = sys::pipe()?; // parent -> child: "you are in the cgroup, go"
         let (nr_r, nr_w) = sys::pipe()?; // child -> parent: "my network namespace exists"
         let (nd_r, nd_w) = sys::pipe()?; // parent -> child: "your veth is in place"
@@ -357,7 +393,8 @@ fn run_container(cfg: &Config, mut plan: Plan) -> Result<i32> {
         // The child gets its own pid namespace at birth and unshares the rest itself, so this process
         // stays in the host namespaces. It also stays single-threaded (the -p forwarder and the health
         // monitor are helper *processes*), which makes forking the next run after a restart safe.
-        let forked = if rl { sys::fork_ns(libc::CLONE_NEWUSER | libc::CLONE_NEWPID)? } else { sys::fork_newpid()? };
+        // (inside a shared rootless network this process already is in the right user namespace: no new one)
+        let forked = if rl && pod_api.is_none() { sys::fork_ns(libc::CLONE_NEWUSER | libc::CLONE_NEWPID)? } else { sys::fork_newpid()? };
         let code = match forked {
             sys::Fork::Child => {
                 drop((wr, nr_r, nd_w, ready));
@@ -367,7 +404,8 @@ fn run_container(cfg: &Config, mut plan: Plan) -> Result<i32> {
                     process::exit(127);
                 }
                 let link = tty.map(|(_, c)| c);
-                let net = ChildNet { mode, ip, subnet, helper: helper_net, ready: nr_w, go: nd_r };
+                // a shared rootless network is already the container's network namespace: keep it
+                let net = ChildNet { mode: if pod_api.is_some() { Network::Host } else { mode }, ip, subnet, helper: helper_net, ready: nr_w, go: nd_r };
                 let err = child(&plan, &id, cfg.rw, rd, net, link).unwrap_err();
                 eprintln!("docker: {err}");
                 process::exit(127);
@@ -375,7 +413,7 @@ fn run_container(cfg: &Config, mut plan: Plan) -> Result<i32> {
             sys::Fork::Parent(pid) => {
                 drop((rd, nr_w, nd_r));
                 let link = tty.map(|(p, _)| p);
-                if let Some(m) = &rl_map {
+                if let (Some(m), None) = (&rl_map, &pod_api) {
                     // the child is a stranger in its new user namespace until its id maps exist
                     if let Err(e) = rootless::write_maps(pid, m) {
                         sys::kill(pid);
@@ -384,6 +422,13 @@ fn run_container(cfg: &Config, mut plan: Plan) -> Result<i32> {
                     }
                 }
                 cgroup.add_pid(pid)?;
+                if let (Some(api), 0) = (&pod_api, restarts)
+                    && let Err(e) = rootless::pod::publish(api, &cfg.ports)
+                {
+                    sys::kill(pid);
+                    let _ = sys::wait(pid);
+                    return Err(e);
+                }
                 drop(wr); // child is released once it is inside the cgroup
                 if ip.is_some() || helper_net {
                     let mut b = [0u8; 1];
@@ -407,7 +452,7 @@ fn run_container(cfg: &Config, mut plan: Plan) -> Result<i32> {
                     entry.workdir = plan.workdir.clone();
                     entry.user = plan.user.clone();
                     entry.security = Some(plan.security.clone());
-                    entry.ip = ip.map(|i| i.to_string());
+                    entry.ip = hosts_ip.clone();
                     entry.health = health.as_ref().map(|_| "starting".to_string());
                     reg = if cfg.ephemeral { None } else { Some(registry::register(&entry)?) };
                     drop(lease.take());
@@ -472,6 +517,9 @@ fn run_container(cfg: &Config, mut plan: Plan) -> Result<i32> {
         sys::kill(h);
         let _ = sys::wait(h);
     }
+    if let Some(api) = &pod_api {
+        rootless::pod::unpublish(api, &cfg.ports); // free the host ports again
+    }
     if let Some(r) = reg {
         r.finish(*code.as_ref().unwrap_or(&-1));
     }
@@ -481,6 +529,10 @@ fn run_container(cfg: &Config, mut plan: Plan) -> Result<i32> {
             std::thread::sleep(std::time::Duration::from_millis(1500));
         }
         registry::delete(&id);
+        // anonymous volumes (`-v /data`) belong to the container: they go with it, as in Docker
+        for v in cfg.volumes.iter().filter(|v| v.is_named() && crate::volumes::is_anonymous(&v.host)) {
+            let _ = crate::volumes::remove(&v.host);
+        }
     }
     if let Some(n) = &cfg.network_name {
         net::refresh_hosts(n); // ... and that we are gone
@@ -557,7 +609,7 @@ fn child(plan: &Plan, id: &str, rw: bool, gate: OwnedFd, net: ChildNet, tty: Opt
         (Network::None, _) => net::loopback_up()?,
         _ => {}
     }
-    rootfs::enter(&plan.source, id, rw, &plan.volumes)?;
+    rootfs::enter(&plan.source, id, rw, &plan.volumes, &plan.extras())?;
     if let Some(h) = &plan.hostname {
         sys::set_hostname(h)?;
     }
@@ -567,7 +619,7 @@ fn child(plan: &Plan, id: &str, rw: bool, gate: OwnedFd, net: ChildNet, tty: Opt
         pty::setup_in_container(link)?; // /dev/pts exists now; the terminal becomes stdin/stdout/stderr
     }
     harden::finalize(&plan.user, &plan.security)?;
-    Err(sys::execvp(&plan.cmd))
+    Err(if plan.init { sys::init_exec(&plan.cmd) } else { sys::execvp(&plan.cmd) })
 }
 
 pub fn stats(id: &str) -> Option<Stats> {

@@ -120,7 +120,7 @@ pub fn start(h: Helper, pid: u32, ports: &[Port], run_dir: &Path) -> Result<i32>
     Ok(hpid)
 }
 
-fn forward_slirp(api: &Path, ports: &[Port]) -> Result<()> {
+pub(super) fn forward_slirp(api: &Path, ports: &[Port]) -> Result<()> {
     if ports.is_empty() {
         return Ok(());
     }

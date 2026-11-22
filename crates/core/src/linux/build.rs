@@ -132,8 +132,28 @@ impl State {
     }
 
     fn layer_paths(&self, store: &Store) -> Result<Vec<PathBuf>> {
-        self.layers.iter().map(|l| store.layer_path(&l.digest).map_err(img)).collect()
+        self.layers.iter().map(|l| layer_dir(store, &l.digest)).collect()
     }
+}
+
+/// Where the unpacked layer of `digest` lives. Rootless users have layers of their own (`layers-rootless/`:
+/// files owned through the user's id mapping, `user.overlay.*` attributes), never mixed with the root engine's.
+fn layer_dir(store: &Store, digest: &str) -> Result<PathBuf> {
+    let p = store.layer_path(digest).map_err(img)?;
+    if registry::rootless() {
+        return Ok(store.root().join("layers-rootless").join(p.file_name().unwrap_or_default()));
+    }
+    Ok(p)
+}
+
+/// Rootless: run `f` as root of a user namespace with this user's id mapping, so files it creates or reads get
+/// the container's ids (chown to other users, files of other ids in lower layers). Elsewhere: just run it.
+fn as_container_root(f: impl FnOnce() -> Result<()>) -> Result<()> {
+    if !registry::rootless() {
+        return f();
+    }
+    let ok = super::rootless::in_userns(&super::rootless::detect(), || f().map_err(|e| eprintln!("docker: {e}")).is_ok())?;
+    if ok { Ok(()) } else { Err(Error::Usage("build step failed (see above)".into())) }
 }
 
 type Stages = Vec<(Option<String>, State)>;
@@ -166,8 +186,12 @@ fn from(store: &Store, image: &str, say: &mut dyn FnMut(String)) -> Result<State
             docker_image::pull(store, &r, &mut |l| say(l)).map_err(img)?
         }
     };
-    for l in &meta.layers {
-        store.ensure_layer(l).map_err(img)?;
+    if registry::rootless() {
+        super::rootless::ensure_layers(store, &meta.layers)?;
+    } else {
+        for l in &meta.layers {
+            store.ensure_layer(l).map_err(img)?;
+        }
     }
     let digests: Vec<&str> = meta.layers.iter().map(|l| l.digest.as_str()).collect();
     Ok(State {
@@ -199,13 +223,20 @@ fn commit(
     produce: impl FnOnce(&Path) -> Result<PathBuf>,
 ) -> Result<()> {
     let digest = format!("sha256:{key}");
-    let path = store.layer_path(&digest).map_err(img)?;
+    let path = layer_dir(store, &digest)?;
     if !no_cache && path.is_dir() {
         say(" ---> Using cache".into());
     } else {
         let stage = store.new_staging_dir("layer").map_err(img)?;
         let dir = produce(&stage)?;
-        store.adopt_layer(&digest, &dir).map_err(img)?;
+        if registry::rootless() {
+            // rootless layers are adopted by renaming: they must keep their attributes and ids as they are
+            fs::create_dir_all(path.parent().expect("has parent")).map_err(io_err("mkdir layers-rootless"))?;
+            let _ = fs::remove_dir_all(&path); // --no-cache: replace the old one
+            fs::rename(&dir, &path).map_err(io_err(format!("adopt layer {}", path.display())))?;
+        } else {
+            store.adopt_layer(&digest, &dir).map_err(img)?;
+        }
         let _ = fs::remove_dir_all(&stage);
         say(format!(" ---> {}", &key[..12]));
     }
@@ -236,8 +267,8 @@ fn is_whiteout(md: &fs::Metadata) -> bool {
 fn is_opaque(p: &Path) -> bool {
     let c = CString::new(p.as_os_str().as_bytes()).expect("no NUL in path");
     let mut b = [0u8; 1];
-    let n = unsafe { libc::lgetxattr(c.as_ptr(), c"trusted.overlay.opaque".as_ptr(), b.as_mut_ptr().cast(), 1) };
-    n == 1 && b[0] == b'y'
+    // `trusted.*` is written by the root engine, `user.*` by a rootless user namespace
+    [c"trusted.overlay.opaque", c"user.overlay.opaque"].iter().any(|name| unsafe { libc::lgetxattr(c.as_ptr(), name.as_ptr(), b.as_mut_ptr().cast(), 1) } == 1 && b[0] == b'y')
 }
 
 /// What the image looks like with all layers applied (whiteouts hide, opaque directories cut off lower layers).
@@ -742,14 +773,17 @@ fn copy_step(store: &Store, ctx: &Path, ig: &Ignore, a: &BuildArgs, stages: &Sta
         ]);
         let (lowers, workdir) = (st.layer_paths(store)?, st.workdir.clone());
         commit(store, st, k, a.no_cache, say, |stage| {
-            let (out, targets) = copy_layer(stage, &source, &srcs, &dst, &workdir, &lowers)?;
-            if let Some(c) = &chown {
-                apply_chown(c, &targets, &lowers)?;
-            }
-            if let Some(mode) = chmod {
-                targets.iter().for_each(|t| chmod_tree(t, mode));
-            }
-            Ok(out)
+            as_container_root(|| {
+                let (_, targets) = copy_layer(stage, &source, &srcs, &dst, &workdir, &lowers)?;
+                if let Some(c) = &chown {
+                    apply_chown(c, &targets, &lowers)?;
+                }
+                if let Some(mode) = chmod {
+                    targets.iter().for_each(|t| chmod_tree(t, mode));
+                }
+                Ok(())
+            })?;
+            Ok(stage.join("layer"))
         })
     })();
     let _ = fs::remove_dir_all(&pre);

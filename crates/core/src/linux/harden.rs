@@ -93,6 +93,13 @@ fn home_of(passwd: &str, uid: u32) -> String {
 }
 
 pub fn finalize(user: &str, sec: &Security) -> Result<()> {
+    // before the capability set shrinks: raising a hard limit needs CAP_SYS_RESOURCE
+    for &(res, soft, hard) in &sec.ulimits {
+        let lim = libc::rlimit { rlim_cur: soft, rlim_max: hard };
+        if unsafe { libc::setrlimit(res as _, &lim) } < 0 {
+            return Err(Error::sys(format!("set resource limit {res}")));
+        }
+    }
     if sec.seccomp {
         install_seccomp()?;
     }

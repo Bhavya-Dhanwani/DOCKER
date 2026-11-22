@@ -15,7 +15,18 @@ fn exit_with(r: Result<i32, Box<dyn Error>>) -> Result<ExitCode, Box<dyn Error>>
 }
 
 fn main() -> ExitCode {
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // `docker rm -f a b c`: Docker takes several names at once; run the command once for each
+    let mut code = ExitCode::SUCCESS;
+    for args in cli::split_multi(std::env::args().skip(1).collect()) {
+        let c = run(args);
+        if format!("{c:?}") != format!("{:?}", ExitCode::SUCCESS) {
+            code = c;
+        }
+    }
+    code
+}
+
+fn run(mut args: Vec<String>) -> ExitCode {
     // `docker --native ...`: use the Windows Job Object backend instead of the Linux VM
     let native = args.first().is_some_and(|a| a == "--native");
     if native {

@@ -21,7 +21,8 @@ The command is the same everywhere: `docker run`, `docker compose up`, `docker b
 ## What it can do
 
 **Containers**
-- `run` (`-d`, `-it`, `--name`, `-e`, `--env-file`, `-v` (also anonymous `-v /data`), `--mount`, `-p`, `--network`, `--hostname`/`-h`, `--add-host` (including `host-gateway`), `--mem`, `--cpu`, `--procs`, `--restart`, `--rm`, `--entrypoint`, `-w`, `-u`, `--health-*`, `--cap-add/--cap-drop`, `--security-opt`, `--privileged`). Flags that exist in Docker but are not applied by this engine yet (`--label`, `--dns`, `--init`, `--read-only`, `--ulimit`, `--shm-size`, `--tmpfs`, `--cpus`, ...) are accepted with a warning instead of failing.
+- `run` (`-d`, `-it`, `--name`, `-e`, `--env-file`, `-v` (also anonymous `-v /data`), `--mount`, `-p`, `--network`, `--hostname`/`-h`, `--add-host` (including `host-gateway`), `--mem`, `--cpu`, `--procs`, `--restart`, `--rm`, `--entrypoint`, `-w`, `-u`, `--health-*`, `--cap-add/--cap-drop`, `--security-opt`, `--privileged`, `--label`, `--dns`, `--init`, `--read-only`, `--ulimit`, `--tmpfs`, `--shm-size`, `--cpus`). A few flags that only matter on a real orchestrator (`--log-driver`, `--stop-timeout`, `--stop-signal`, `--memory-swap`, `--ipc`, `--pid`, `--pull`, `--platform`, `--oom-kill-disable`) are accepted with a warning instead of failing.
+- `rm`, `stop`, `start`, `restart`, `kill`, `pause`, `unpause` and `rmi` take several names (`docker rm -f a b c`). Anonymous volumes (`-v /data`) are removed together with the container when it was started with `--rm`
 - Like Docker, containers get `HOME` and `PATH`, `/tmp` is ordinary container storage with no small size limit, and on Windows your own environment variables reach `${VAR}` in compose files and `-e VAR`
 - `exec` (also `-it`), `logs [-f]`, `ps [-a]`, `inspect`, `stop`, `start`, `restart`, `kill`, `pause`, `unpause`, `wait`, `top`, `rename`, `rm [-f]`, `cp`, `stats`
 - `update --mem/--cpu/--procs` changes the limits of a running container
@@ -50,6 +51,8 @@ The command is the same everywhere: `docker run`, `docker compose up`, `docker b
 **Rootless mode (Linux)**
 - `docker --rootless ...`, selected automatically when not running as root: user namespaces (full uid/gid mapping with `newuidmap`, or a single-uid fallback), its own layer store, networking through `slirp4netns` or `pasta` (or `--network none|host`), cgroup limits when a delegated cgroup exists
 - `run`, `ps`, `logs`, `exec`, `stop`, `rm` work as an unprivileged user
+- `docker build` works rootless too: `RUN`, `COPY` (wildcards, `--chown`, `--from`), multi-stage builds and the layer cache, with the layers kept in the user's own store
+- User-defined networks (`network create`, `run --network <name> --name <svc>`, `-p`, compose): without root there is no bridge, so all containers of a network share one network namespace. They reach each other by name (every name points at `127.0.0.1`) and share one set of ports, so two containers cannot both listen on port 80. Needs `slirp4netns`
 
 **Compose**
 - `docker compose up|down|ps|logs|config|build` with services, networks, volumes, `depends_on` and healthchecks
@@ -136,6 +139,7 @@ cargo build --release -p docker-cli --target aarch64-unknown-linux-musl   # or x
 ## Testing
 - Unit tests for every crate: `cargo test --workspace`
 - End-to-end suites in `scripts/` (Linux, run as root, offline): containers, networking (TCP/UDP/IPv6/subnets), user-defined networks, builds (three suites), security, push and registry features, save/load, compose, terminals and healthchecks, Swarm-lite, Engine API, rootless (as an unprivileged user)
+- `scripts/e2e-flags.sh`: the `docker run` flags (`--dns`, `--read-only`, `--tmpfs`, `--ulimit`, `--init`, `--cpus`, `--label`, `--shm-size`) and anonymous volumes
 - `scripts/e2e-vm.ps1`: Windows to the Linux VM
 - `scripts/e2e-realcli.sh`: the real Docker CLI against our daemon (run, exec, `-it`, build, events, update and more)
 - `scripts/e2e-sdk.sh`: the Docker SDK for Python against our daemon

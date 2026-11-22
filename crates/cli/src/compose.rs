@@ -42,6 +42,16 @@ struct Service {
     hostname: Option<String>,
     /// `["name:ip", ...]` or `{name: ip}`.
     extra_hosts: Option<Value>,
+    /// `["k=v", ...]` or `{k: v}`.
+    labels: Option<Value>,
+    dns: Option<Value>,
+    init: bool,
+    read_only: bool,
+    /// `{nofile: 1024}` or `{nofile: {soft: 1024, hard: 2048}}`.
+    ulimits: Option<Value>,
+    tmpfs: Option<Value>,
+    shm_size: Option<Value>,
+    cpus: Option<Value>,
     ports: Vec<Value>,
     volumes: Vec<Value>,
     depends_on: Option<Value>,
@@ -181,6 +191,20 @@ fn env_files(v: &Value) -> Vec<(String, bool)> {
     }
 }
 
+/// `ulimits:` as `name=soft:hard` entries.
+fn ulimits(v: &Value) -> Vec<String> {
+    let Value::Mapping(m) = v else { return vec![] };
+    m.iter()
+        .filter_map(|(k, v)| {
+            let name = scalar(k)?;
+            Some(match v {
+                Value::Mapping(_) => format!("{name}={}:{}", v.get("soft").and_then(scalar)?, v.get("hard").and_then(scalar)?),
+                other => format!("{name}={}", scalar(other)?),
+            })
+        })
+        .collect()
+}
+
 /// `extra_hosts:` as `name:ip` entries: a list (`"name:ip"` or `"name=ip"`) or a mapping.
 fn extra_hosts(v: &Value) -> Vec<String> {
     match v {
@@ -293,8 +317,25 @@ fn plan(p: &Project, name: &str, s: &Service) -> Res<Plan> {
         user: s.user.clone(),
         hostname: s.hostname.clone(),
         extra_hosts: s.extra_hosts.as_ref().map(extra_hosts).unwrap_or_default(),
+        labels: s.labels.as_ref().map(environment).unwrap_or_default(),
+        dns: s.dns.as_ref().map(string_list).unwrap_or_default(),
+        init: s.init,
+        read_only: s.read_only,
+        ulimits: s.ulimits.as_ref().map(ulimits).unwrap_or_default(),
+        tmpfs: s.tmpfs.as_ref().map(string_list).unwrap_or_default(),
         ..Config::default()
     };
+    if let Some(v) = &s.shm_size {
+        cfg.shm_mb = Some(match v {
+            Value::Number(n) => docker_core::cli::parse_size_mb(&n.to_string()),
+            other => scalar(other).and_then(|t| docker_core::cli::parse_size_mb(&t)),
+        }
+        .ok_or("shm_size must be a size like 64m")?);
+    }
+    if let Some(c) = &s.cpus {
+        let cpus: f64 = scalar(c).and_then(|t| t.parse().ok()).filter(|c: &f64| *c > 0.0).ok_or("cpus must be a positive number")?;
+        cfg.cpu_percent = Some(((cpus * 100.0).round() as u32).max(1));
+    }
     if let Some(r) = &s.restart {
         cfg.restart = Restart::parse(r)?;
     }
@@ -415,7 +456,7 @@ fn order(plans: &BTreeMap<String, Plan>) -> Res<Vec<String>> {
 fn plans(p: &Project) -> Res<BTreeMap<String, Plan>> {
     for (name, s) in &p.file.services {
         // harmless for a local run: metadata, or behaviour that only matters on a real orchestrator
-        const IGNORED: &[&str] = &["labels", "stdin_open", "tty", "expose", "logging", "deploy", "init", "stop_grace_period", "platform", "pull_policy", "profiles", "container_labels"];
+        const IGNORED: &[&str] = &["stdin_open", "tty", "expose", "logging", "deploy", "init", "stop_grace_period", "platform", "pull_policy", "profiles", "container_labels"];
         let unknown: Vec<&String> = s.extra.keys().filter(|k| !IGNORED.contains(&k.as_str()) && !k.starts_with("x-")).collect();
         if !unknown.is_empty() {
             eprintln!("warning: service {name}: ignoring unsupported keys: {}", unknown.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(", "));

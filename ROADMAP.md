@@ -13,8 +13,8 @@ Windows and macOS forwarding into a hidden Linux VM, the `Sasta Docker` desktop 
 
 **Remaining:**
 - macOS has never been run on a real Mac (the Lima driver is written and compiled only)
-- The GUI has only been checked by looking at it: its buttons and dialogs have not been clicked through end to end; it has no Swarm, compose or rootless views
-- Rootless: no `build`, no `rmi`/`prune` of layers owned by mapped uids, no user-defined networks or name DNS, no UDP `-p`, limits only inside a delegated cgroup; `pull` and `--cpu` untested rootless; the systemd `user@UID.service` delegation path untested
+- The GUI was clicked through on Windows (every tab, dialog and button); it has no Swarm, compose or rootless views, and has not been run on Linux or macOS
+- Rootless: `build` and user-defined networks work (the containers of one network share a single network namespace, so they share ports); no `rmi`/`prune` of layers owned by mapped uids, no `push`/`save` of rootless-built layers, no UDP `-p`, limits only inside a delegated cgroup, user-defined networks need slirp4netns; the systemd `user@UID.service` delegation path untested
 - Swarm: single node only (no `swarm join`), `service create/update` do not wait for convergence, `service logs -f` prints a snapshot, `depends_on` ignored, `stack deploy` does not prune removed services
 - IPv6 to the internet (NAT66) untested (no IPv6 route on the test host); plain `-p` does not also listen on `[::]`
 - Registry: zstd tested only with hand-made frames, parallel upload/mount/chunk resume only against a mock registry, `docker manifest inspect` not implemented

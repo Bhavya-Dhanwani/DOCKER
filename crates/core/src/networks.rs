@@ -143,11 +143,13 @@ pub fn hosts_file(own: &Host, others: &[Host]) -> String {
     let mut mine = vec![own.hostname.clone().unwrap_or_else(|| "container".to_string())];
     mine.extend(own.names.iter().cloned());
     s.push_str(&line(&own.ip, &mine));
+    // a whole network in one namespace (rootless): everybody is 127.0.0.1, so "the others" are told apart by name
+    let shared = own.ip == "127.0.0.1";
     // its own IPv6 address too (peers stay IPv4-only: some tools take the first address they get and do not retry)
-    if let Ok(v4) = own.ip.parse::<Ipv4Addr>() {
+    if let (false, Ok(v4)) = (shared, own.ip.parse::<Ipv4Addr>()) {
         s.push_str(&line(&ip6_of(v4).to_string(), &mine));
     }
-    for o in others.iter().filter(|o| o.ip != own.ip) {
+    for o in others.iter().filter(|o| if shared { o.names != own.names } else { o.ip != own.ip }) {
         s.push_str(&line(&o.ip, &o.names));
     }
     for (name, ip) in &own.extra {

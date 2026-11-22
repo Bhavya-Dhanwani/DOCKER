@@ -40,11 +40,14 @@ pub struct Security {
     /// Block dangerous syscalls (see `linux/seccomp.rs`).
     pub seccomp: bool,
     pub no_new_privs: bool,
+    /// `--ulimit`: (RLIMIT_* number, soft, hard), applied before the capabilities are dropped.
+    #[serde(default)]
+    pub ulimits: Vec<(i32, u64, u64)>,
 }
 
 impl Default for Security {
     fn default() -> Self {
-        Security { caps: mask(&DEFAULT_CAPS), seccomp: true, no_new_privs: false }
+        Security { caps: mask(&DEFAULT_CAPS), seccomp: true, no_new_privs: false, ulimits: vec![] }
     }
 }
 
@@ -62,6 +65,9 @@ pub fn resolve(cfg: &Config) -> Result<Security> {
     let list = |names: &[String]| -> Result<u64> {
         names.iter().try_fold(0u64, |acc, n| Ok(acc | if n.eq_ignore_ascii_case("all") { u64::MAX } else { bit(n)? }))
     };
+    for u in &cfg.ulimits {
+        s.ulimits.push(crate::cli::parse_ulimit(u).ok_or_else(|| Error::Usage(format!("bad --ulimit {u:?}")))?);
+    }
     s.caps &= !list(&cfg.cap_drop)?;
     s.caps |= list(&cfg.cap_add)?;
     if cfg.privileged {

@@ -101,6 +101,40 @@ pub fn execvp(cmd: &[String]) -> Error {
     Error::sys(format!("exec {}", cmd[0]))
 }
 
+static INIT_CHILD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+extern "C" fn pass_signal(sig: libc::c_int) {
+    let pid = INIT_CHILD.load(std::sync::atomic::Ordering::Relaxed);
+    if pid > 0 {
+        unsafe { libc::kill(pid, sig) };
+    }
+}
+
+/// `--init`: run `cmd` as a child and stay behind as PID 1. Signals sent to the container reach the child,
+/// orphaned processes that get re-parented to PID 1 are reaped, and the container exits with the child's status.
+/// Only returns on error.
+pub fn init_exec(cmd: &[String]) -> Error {
+    let child = match fork() {
+        Ok(Fork::Child) => return execvp(cmd),
+        Ok(Fork::Parent(p)) => p,
+        Err(e) => return e,
+    };
+    INIT_CHILD.store(child, std::sync::atomic::Ordering::Relaxed);
+    for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT, libc::SIGUSR1, libc::SIGUSR2] {
+        unsafe { libc::signal(sig, pass_signal as extern "C" fn(libc::c_int) as libc::sighandler_t) };
+    }
+    loop {
+        let mut st = 0;
+        let r = unsafe { libc::waitpid(-1, &mut st, 0) };
+        if r == child {
+            std::process::exit(if libc::WIFSIGNALED(st) { 128 + libc::WTERMSIG(st) } else { libc::WEXITSTATUS(st) });
+        }
+        if r < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            std::process::exit(1); // no children left
+        }
+    }
+}
+
 pub fn path_str(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }

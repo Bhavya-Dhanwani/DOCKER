@@ -109,6 +109,61 @@ check "no helper: warns about sharing the host netns" has "$err" "HOST network n
 check "no helper: -p with different ports is refused" sh -c "! rl $BIN run -p 18082:80 alpine true </dev/null"
 unset SASTA_ROOTLESS_NET
 
+echo "== user-defined networks (all containers of a network share one namespace)"
+if command -v slirp4netns >/dev/null; then
+  dk network create rlnet >/dev/null 2>&1
+  check "network create" has "$(dk network ls)" rlnet
+  dk run -d --name rlsrv --network rlnet alpine sh -c 'while true; do printf "HTTP/1.0 200 OK\n\nnet-ok\n" | nc -l -p 8080; done' >/dev/null
+  sleep 2
+  check "a container reaches another one on the network by name" has "$(dk run --rm --network rlnet alpine wget -q -T5 -O- http://rlsrv:8080/ 2>&1)" net-ok
+  check "/etc/hosts lists the members" has "$(dk exec rlsrv cat /etc/hosts)" rlsrv
+  dk run -d --name rlpub --network rlnet -p 18090:8081 alpine sh -c 'while true; do printf "HTTP/1.0 200 OK\n\npub-ok\n" | nc -l -p 8081; done' >/dev/null
+  sleep 2
+  check "-p publishes a port of a container on the network" has "$(curl -s -m 5 http://127.0.0.1:18090/)" pub-ok
+  check "the other container on the network reaches it too" has "$(dk exec rlsrv wget -q -T5 -O- http://rlpub:8081/ 2>&1)" pub-ok
+  dk stop -t 1 rlpub >/dev/null 2>&1; sleep 1
+  check "-p is released when the container stops" sh -c "! curl -s -m 3 http://127.0.0.1:18090/ | grep -q pub-ok"
+  check "outbound DNS + HTTP from the network" has "$(dk run --rm --network rlnet alpine wget -q -T10 -O- http://archive.ubuntu.com/ubuntu/ 2>&1 | head -c 2000)" "Index of"
+  check "a container outside the network cannot reach it by name" sh -c "! rl $BIN run --rm alpine wget -q -T3 -O- http://rlsrv:8080/ </dev/null"
+  check "an unknown network is refused" sh -c "! rl $BIN run --network nonet alpine true </dev/null"
+  dk rm -f rlsrv rlpub >/dev/null 2>&1
+  dk network rm rlnet >/dev/null 2>&1
+  for _ in $(seq 1 30); do pgrep -u $U -f '[s]lirp4netns --configure' >/dev/null || break; sleep 1; done
+  check "the network's background process goes away when it is idle" sh -c "! pgrep -u $U -f '[s]lirp4netns --configure' >/dev/null"
+  pgrep -u $U -af '[s]lirp4netns --configure' | sed 's/^/    still running: /'
+  dk ps | sed 's/^/    ps: /'; ls $RH/run 2>&1 | sed 's/^/    run: /'; tail -3 $RH/run/net-rlnet/log | sed 's/^/    log: /'
+fi
+
+echo "== docker build, rootless"
+B=$RH/ctx; rm -rf "$B"; mkdir -p "$B/sub"; echo from-context > "$B/a.txt"; echo nested > "$B/sub/b.txt"; echo one > "$B/pkg1.json"; echo two > "$B/pkg2.json"
+cat > "$B/Dockerfile" <<'EOF'
+FROM alpine AS build
+RUN mkdir -p /out && echo built-in-stage > /out/artifact && chmod 640 /out/artifact
+FROM alpine
+ENV GREETING=hi
+WORKDIR /app
+COPY a.txt ./
+COPY sub ./sub/
+COPY pkg*.json /cfg/
+COPY --chown=1000:1000 a.txt /owned.txt
+COPY --from=build /out/artifact /app/artifact
+RUN echo "run-step $(cat /app/a.txt)" > /app/ran.txt && rm /app/sub/b.txt
+CMD ["sh", "-c", "cat /app/ran.txt; cat /app/artifact; ls /cfg; stat -c '%u' /owned.txt; ls /app/sub | wc -l; echo $GREETING"]
+EOF
+chown -R $U:$U "$B"
+out=$(dk build -t rlbuilt:1 "$B" 2>&1); check "build succeeds" has "$out" "Successfully built and tagged rlbuilt:1"
+check "the image is listed" has "$(dk images)" rlbuilt
+check "its layers are the rootless flavour" test -d "$RH/store/layers-rootless"
+out=$(dk run --rm rlbuilt:1 2>&1)
+check "RUN result is in the image" has "$out" "run-step from-context"
+check "COPY --from stage works" has "$out" "built-in-stage"
+check "COPY with a wildcard works" has "$out" "pkg1.json"
+check "COPY --chown sets the owner (full map)" has "$out" "1000"
+check "a file removed by a later RUN stays removed" has "$out" "0"
+check "ENV is kept" has "$out" "hi"
+out2=$(dk build -t rlbuilt:1 "$B" 2>&1); check "a second build uses the cache" has "$out2" "Using cache"
+dk rmi rlbuilt:1 >/dev/null 2>&1
+
 echo "== single-uid fallback (forced)"
 export SASTA_ROOTLESS_MAP=single
 err=$(dk run alpine true 2>&1 >/dev/null)

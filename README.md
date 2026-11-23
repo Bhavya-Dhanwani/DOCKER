@@ -26,6 +26,8 @@ The command is still called `docker`, so existing scripts and tools keep working
 | **macOS** Apple silicon | [SastaDocker-macos-aarch64.pkg](https://github.com/Bhavya-Dhanwani/DOCKER/releases/latest/download/SastaDocker-macos-aarch64.pkg) | `docker` and `docker-gui` in `/usr/local/bin`; Linux containers run in a small VM: `brew install lima`, then `docker vm init` |
 | **macOS** Intel | [SastaDocker-macos-x86_64.pkg](https://github.com/Bhavya-Dhanwani/DOCKER/releases/latest/download/SastaDocker-macos-x86_64.pkg) | the same |
 
+**The Windows installer asks for two folders:** where to install the program (default `%LOCALAPPDATA%\Programs\Sasta Docker`) and where to keep images, containers and the Linux VM disk, which can grow to many GB (default `%LOCALAPPDATA%\rust-docker`; pick another drive if C: is small). For a silent install use `/DIR=... /DATADIR=...`. Uninstalling removes the program but keeps the data folder.
+
 **First run**
 ```
 docker run alpine echo hello      # Linux: add sudo (or use `docker --rootless run ...`)

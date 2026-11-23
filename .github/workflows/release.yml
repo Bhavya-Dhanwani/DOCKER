@@ -29,7 +29,7 @@ jobs:
         run: cargo build --release -p docker-cli -p docker-gui
       - name: package
         run: |
-          d=sasta-docker-${{ github.ref_name }}-linux-${{ matrix.arch }}
+          d=sasta-docker-linux-${{ matrix.arch }}
           mkdir -p dist/$d
           cp target/release/docker target/release/docker-gui dist/$d/
           cp target/${{ matrix.target }}/release/docker dist/docker-linux-${{ matrix.arch }}

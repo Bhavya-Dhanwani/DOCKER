@@ -8,15 +8,34 @@ The command is still called `docker`, so existing scripts and tools keep working
 
 ## Install
 
-Installers are built by the `release` workflow (`.github/workflows/release.yml`: run it from the Actions tab, or push a tag like `v0.1.0` to publish a GitHub release):
+**One line** (it picks the right file for your machine):
 
-| OS | Installer | What you get |
+| OS | Command |
+|---|---|
+| **Linux** and **macOS** | `curl -fsSL https://raw.githubusercontent.com/Bhavya-Dhanwani/DOCKER/main/install.sh \| sh` |
+| **Windows** (PowerShell) | `irm https://raw.githubusercontent.com/Bhavya-Dhanwani/DOCKER/main/install.ps1 \| iex` |
+
+**Or download the installer yourself** from the [latest release](https://github.com/Bhavya-Dhanwani/DOCKER/releases/latest):
+
+| OS | Download | What you get |
 |---|---|---|
-| **Windows** (x64, arm64) | `SastaDocker-Setup-<arch>.exe` (Inno Setup, per-user, no admin) | `docker` and `docker-gui`, `docker` on your PATH, a Start menu shortcut, and an optional "set up the Linux engine now" step (`docker vm init`, needs WSL2) |
-| **Linux** (x86_64, aarch64) | `sasta-docker-<version>-linux-<arch>.tar.gz` | `sudo ./install.sh` puts `docker` and `docker-gui` in `/usr/local/bin` and adds a menu entry |
-| **macOS** (Intel, Apple silicon) | `SastaDocker-macos-<arch>.pkg` | `docker` and `docker-gui` in `/usr/local/bin`; needs Lima (`brew install lima`) for the Linux VM |
+| **Windows** x64 | [SastaDocker-Setup-x64.exe](https://github.com/Bhavya-Dhanwani/DOCKER/releases/latest/download/SastaDocker-Setup-x64.exe) | `docker` and `docker-gui`, `docker` on your PATH, a Start menu shortcut, and an optional "set up the Linux engine now" step (`docker vm init`, needs WSL2). Per-user, no admin |
+| **Windows** ARM64 | [SastaDocker-Setup-arm64.exe](https://github.com/Bhavya-Dhanwani/DOCKER/releases/latest/download/SastaDocker-Setup-arm64.exe) | the same |
+| **Linux** x86_64 | [sasta-docker-linux-x86_64.tar.gz](https://github.com/Bhavya-Dhanwani/DOCKER/releases/latest/download/sasta-docker-linux-x86_64.tar.gz) | unpack, then `sudo ./install.sh` puts `docker` and `docker-gui` in `/usr/local/bin` and adds a menu entry |
+| **Linux** ARM64 | [sasta-docker-linux-aarch64.tar.gz](https://github.com/Bhavya-Dhanwani/DOCKER/releases/latest/download/sasta-docker-linux-aarch64.tar.gz) | the same |
+| **macOS** Apple silicon | [SastaDocker-macos-aarch64.pkg](https://github.com/Bhavya-Dhanwani/DOCKER/releases/latest/download/SastaDocker-macos-aarch64.pkg) | `docker` and `docker-gui` in `/usr/local/bin`; Linux containers run in a small VM: `brew install lima`, then `docker vm init` |
+| **macOS** Intel | [SastaDocker-macos-x86_64.pkg](https://github.com/Bhavya-Dhanwani/DOCKER/releases/latest/download/SastaDocker-macos-x86_64.pkg) | the same |
 
-The command is the same everywhere: `docker run`, `docker compose up`, `docker build`, ... See [Platforms](#platforms) for how each system runs containers.
+**First run**
+```
+docker run alpine echo hello      # Linux: add sudo (or use `docker --rootless run ...`)
+docker-gui                        # the desktop app
+```
+On Windows run `docker vm init` once first (needs WSL2); on macOS `brew install lima`, then `docker vm init`.
+
+**Remove it:** Windows: Settings -> Apps -> Sasta Docker (or its uninstaller in the install folder). Linux and macOS: `curl -fsSL https://raw.githubusercontent.com/Bhavya-Dhanwani/DOCKER/main/install.sh | sh -s -- --uninstall`
+
+The files are built by the `release` workflow (`.github/workflows/release.yml`): run it from the Actions tab, or push a tag such as `v0.1.0` to build everything and publish the release.
 
 ## What it can do
 

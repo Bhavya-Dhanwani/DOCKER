@@ -51,6 +51,7 @@ pub struct App {
     minimized: bool,
     version_started: Option<Instant>,
     version_pending: bool,
+    logo: egui::TextureHandle,
 }
 
 impl App {
@@ -88,6 +89,7 @@ impl App {
             minimized: false,
             version_started: None,
             version_pending: false,
+            logo: cc.egui_ctx.load_texture("logo", crate::LOGO.to_color_image(), Default::default()),
         }
     }
 
@@ -435,7 +437,10 @@ impl App {
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
-        ui.label(RichText::new("🐳 Sasta Docker").size(18.0).strong());
+        ui.horizontal(|ui| {
+            ui.add(egui::Image::new((self.logo.id(), egui::vec2(38.0, 38.0))).tint(ui.visuals().text_color()));
+            ui.label(RichText::new("Sasta Docker").size(18.0).strong());
+        });
         ui.add_space(12.0);
         let d = &self.data;
         let running = d.containers.iter().filter(|c| c.state == parse::State::Running).count();

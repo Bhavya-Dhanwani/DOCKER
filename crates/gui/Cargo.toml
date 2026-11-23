@@ -17,3 +17,6 @@ eframe = { version = "0.31", default-features = false, features = ["glow", "defa
 
 [lints]
 workspace = true
+
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3"

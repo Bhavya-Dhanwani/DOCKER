@@ -20,9 +20,20 @@ mod worker;
 
 use eframe::egui;
 
+/// the logo as 128x128 RGBA: a card for the window icon, a white silhouette (tinted to the theme) for the sidebar
+pub struct Logo;
+pub const LOGO: Logo = Logo;
+const LOGO_RGBA: &[u8] = include_bytes!("icon.rgba");
+const SIDEBAR_RGBA: &[u8] = include_bytes!("sidebar.rgba");
+impl Logo {
+    pub fn to_color_image(&self) -> egui::ColorImage {
+        egui::ColorImage::from_rgba_unmultiplied([128, 128], SIDEBAR_RGBA)
+    }
+}
+
 fn main() -> eframe::Result {
     let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1040.0, 680.0]).with_min_inner_size([760.0, 440.0]).with_title("Sasta Docker"),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1040.0, 680.0]).with_min_inner_size([760.0, 440.0]).with_title("Sasta Docker").with_icon(egui::IconData { rgba: LOGO_RGBA.to_vec(), width: 128, height: 128 }),
         ..Default::default()
     };
     eframe::run_native("docker-gui", opts, Box::new(|cc| Ok(Box::new(app::App::new(cc)))))

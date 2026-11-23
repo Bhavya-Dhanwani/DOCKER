@@ -34,6 +34,8 @@ UninstallDisplayName=Sasta Docker
 DisableProgramGroupPage=yes
 WizardStyle=modern
 LicenseFile=..\LICENSE
+SetupIconFile=..\assets\logo.ico
+UninstallDisplayIcon={app}\docker-gui.exe
 
 [Files]
 Source: "{#Bin}\docker.exe"; DestDir: "{app}"; Flags: ignoreversion

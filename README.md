@@ -8,8 +8,6 @@ The command is still called `docker`, so existing scripts and tools keep working
 
 ## Install
 
-Website with download buttons: **https://bhavya-dhanwani.github.io/DOCKER/**
-
 **One line** (it picks the right file for your machine):
 
 | OS | Command |

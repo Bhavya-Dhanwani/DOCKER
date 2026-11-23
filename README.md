@@ -39,8 +39,8 @@ The command is the same everywhere: `docker run`, `docker compose up`, `docker b
 
 **Networking and storage**
 - A bridge with one veth per container (pure-Rust netlink) and NAT to the internet
-- `-p [ip:]host:container[/tcp|udp]` port publishing, host-IP binding and port ranges, `--network bridge|host|none`
-- IPv6 addresses for containers (bridge, NAT66)
+- `-p [ip:]host:container[/tcp|udp]` port publishing, host-IP binding and port ranges, `--network bridge|host|none`; the same options in compose (`"5353:53/udp"`, `"127.0.0.1:8080:80"`, a bare `"80"`, the long form with `target`/`published`/`protocol`)
+- IPv6 addresses for containers (bridge, NAT66). IPv6 to the internet needs IPv6 on the host: `scripts/e2e-ipv6.sh` checks it where the host has it and skips on a host without (this PC has none, so that part has never run against the real internet)
 - The bridge and its firewall rules are removed when the last container exits
 - User-defined networks with container-name DNS and aliases, `network create --subnet`, `network connect|disconnect`
 - Named volumes and bind mounts: `volume create|ls|rm|inspect|prune`, `network create|ls|rm|inspect`
@@ -52,7 +52,7 @@ The command is the same everywhere: `docker run`, `docker compose up`, `docker b
 
 **Rootless mode (Linux)**
 - `docker --rootless ...`, selected automatically when not running as root: user namespaces (full uid/gid mapping with `newuidmap`, or a single-uid fallback), its own layer store, networking through `slirp4netns` or `pasta` (or `--network none|host`), cgroup limits when a delegated cgroup exists
-- `run`, `ps`, `logs`, `exec`, `stop`, `rm` work as an unprivileged user
+- `run`, `ps`, `logs`, `exec`, `stop`, `rm` work as an unprivileged user; `-p` publishes TCP and UDP ports (slirp4netns or pasta)
 - `docker build` works rootless too: `RUN`, `COPY` (wildcards, `--chown`, `--from`), multi-stage builds and the layer cache, with the layers kept in the user's own store
 - User-defined networks (`network create`, `run --network <name> --name <svc>`, `-p`, compose): without root there is no bridge, so all containers of a network share one network namespace. They reach each other by name (every name points at `127.0.0.1`) and share one set of ports, so two containers cannot both listen on port 80. Needs `slirp4netns`
 
@@ -75,7 +75,7 @@ The command is the same everywhere: `docker run`, `docker compose up`, `docker b
 **Desktop GUI (`docker-gui`)**
 - Containers (start, stop, restart, pause, kill, remove, logs) with live RAM, disk and CPU bars and a two-minute history chart per container, a Live tab with all containers side by side, images (pull, remove, prune, run, build), running several images together as a group on a shared network, an image catalog, volumes and networks, run and build dialogs, dark and light themes. Every tab, dialog and button was clicked through on Windows (run, group run, pull, build, volumes, networks, confirm dialogs, theme)
 
-**Any image works.** `docker run <image>` pulls it automatically if it is not on the machine yet, from Docker Hub or any other registry. Intel-only (x86-64) images run on ARM64 machines through built-in emulation (`docker emulation enable|disable|status`, switched on by itself when needed; slower than native).
+**Any image works.** `docker run <image>` pulls it automatically if it is not on the machine yet, from Docker Hub or any other registry. Intel-only (x86-64) images run on ARM64 machines through built-in emulation (`docker emulation enable|disable|status`, switched on by itself when needed). Emulation translates every instruction: a CPU-bound test ran about 6 times slower than the same program on the native ARM64 image (1.0 s against 5.9 s). On an Intel or AMD PC these images run natively.
 
 **Images run and checked on this engine (43):**
 - Base systems: alpine, ubuntu, debian, busybox, fedora, kali, archlinux (Intel, emulated)

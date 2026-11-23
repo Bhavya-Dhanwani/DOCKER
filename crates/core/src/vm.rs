@@ -248,7 +248,8 @@ mod tests {
         cmd.push("echo hi; echo \"quoted\"".into());
         let a = wsl().docker_argv(&cmd);
         assert_eq!(&a[..6], ["wsl.exe", "-d", "rust-docker", "-u", "root", "--exec"]);
-        assert_eq!(a[6], DEFAULT_VM_BIN);
+        // (RUST_DOCKER_VM_BIN / RUST_DOCKER_VM_HOME from the environment, which the Windows test scripts set, change what sits between)
+        assert!(a[6..].contains(&Driver::vm_bin()));
         assert_eq!(a.last().unwrap(), "echo hi; echo \"quoted\""); // one untouched argument: no shell in between
         let with_env = wsl().run_argv("/x/docker", &args("ps"), &["RUST_DOCKER_HOME=/t".into()]);
         assert_eq!(&with_env[6..], ["env", "RUST_DOCKER_HOME=/t", "/x/docker", "ps"]);

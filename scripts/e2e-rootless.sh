@@ -25,6 +25,9 @@ fail=0
 check() { d=$1; shift; if "$@" >/dev/null 2>&1; then echo "PASS $d"; else echo "FAIL $d"; fail=$((fail+1)); fi; }
 eq() { [ "$1" = "$2" ]; }
 has() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
+# the mirror name answers with several addresses and BusyBox wget only tries the first one; some of them may not be reachable
+# from every network, so look at a few answers before calling it a failure
+web() { for _ in 1 2 3 4 5 6; do o=$(dk run "$@" alpine wget -q -T6 -O- http://deb.debian.org/debian/ 2>&1 | head -c 2000); case "$o" in *"Index of"*) echo "$o"; return 0 ;; esac; done; echo "$o"; return 1; }
 hasnt() { case "$1" in *"$2"*) return 1 ;; *) return 0 ;; esac; }
 
 echo "== environment: kernel $(uname -r), uid of test user $UID_"
@@ -82,7 +85,7 @@ check "--network host shares the host's interfaces" eq "$(dk run --network host 
 if command -v slirp4netns >/dev/null; then
   check "slirp4netns: own netns with tap0" has "$(dk run alpine sh -c 'cat /proc/net/dev')" tap0
   check "slirp4netns: not the host's interfaces" has "$(dk run alpine sh -c 'cat /proc/net/dev')" lo
-  check "slirp4netns: DNS + outbound HTTP" has "$(dk run alpine wget -q -T10 -O- http://archive.ubuntu.com/ubuntu/ 2>&1 | head -c 2000)" "Index of"
+  check "slirp4netns: DNS + outbound HTTP" has "$(web)" "Index of"
   dk run -d --name pub -p 18080:80 alpine sh -c 'while true; do printf "HTTP/1.0 200 OK
 
 rootless-ok
@@ -90,10 +93,16 @@ rootless-ok
   sleep 1
   check "slirp4netns: -p publishes a TCP port" has "$(curl -s -m 5 http://127.0.0.1:18080/)" "rootless-ok"
   dk stop -t 1 pub >/dev/null 2>&1; dk rm pub >/dev/null 2>&1
+  dk run -d --name udppub -p 18053:5353/udp alpine sh -c 'nc -u -l -p 5353 > /tmp/got.txt' >/dev/null
+  sleep 1
+  echo "udp-ok" | nc -u -w1 127.0.0.1 18053
+  sleep 1
+  check "slirp4netns: -p publishes a UDP port" has "$(dk exec udppub cat /tmp/got.txt 2>&1)" "udp-ok"
+  dk stop -t 1 udppub >/dev/null 2>&1; dk rm udppub >/dev/null 2>&1
 fi
 if command -v pasta >/dev/null; then
   export SASTA_ROOTLESS_NET=pasta
-  check "pasta: outbound HTTP" has "$(dk run alpine wget -q -T10 -O- http://archive.ubuntu.com/ubuntu/ 2>&1 | head -c 2000)" "Index of"
+  check "pasta: outbound HTTP" has "$(web)" "Index of"
   dk run -d --name pubp -p 18081:80 alpine sh -c 'while true; do printf "HTTP/1.0 200 OK
 
 rootless-ok
@@ -101,6 +110,12 @@ rootless-ok
   sleep 1
   check "pasta: -p publishes a TCP port" has "$(curl -s -m 5 http://127.0.0.1:18081/)" "rootless-ok"
   dk stop -t 1 pubp >/dev/null 2>&1; dk rm pubp >/dev/null 2>&1
+  dk run -d --name udppubp -p 18054:5353/udp alpine sh -c 'nc -u -l -p 5353 > /tmp/got.txt' >/dev/null
+  sleep 1
+  echo "udp-ok-pasta" | nc -u -w1 127.0.0.1 18054
+  sleep 1
+  check "pasta: -p publishes a UDP port" has "$(dk exec udppubp cat /tmp/got.txt 2>&1)" "udp-ok-pasta"
+  dk stop -t 1 udppubp >/dev/null 2>&1; dk rm udppubp >/dev/null 2>&1
   unset SASTA_ROOTLESS_NET
 fi
 export SASTA_ROOTLESS_NET=host
@@ -123,7 +138,7 @@ if command -v slirp4netns >/dev/null; then
   check "the other container on the network reaches it too" has "$(dk exec rlsrv wget -q -T5 -O- http://rlpub:8081/ 2>&1)" pub-ok
   dk stop -t 1 rlpub >/dev/null 2>&1; sleep 1
   check "-p is released when the container stops" sh -c "! curl -s -m 3 http://127.0.0.1:18090/ | grep -q pub-ok"
-  check "outbound DNS + HTTP from the network" has "$(dk run --rm --network rlnet alpine wget -q -T10 -O- http://archive.ubuntu.com/ubuntu/ 2>&1 | head -c 2000)" "Index of"
+  check "outbound DNS + HTTP from the network" has "$(web --rm --network rlnet)" "Index of"
   check "a container outside the network cannot reach it by name" sh -c "! rl $BIN run --rm alpine wget -q -T3 -O- http://rlsrv:8080/ </dev/null"
   check "an unknown network is refused" sh -c "! rl $BIN run --network nonet alpine true </dev/null"
   dk rm -f rlsrv rlpub >/dev/null 2>&1

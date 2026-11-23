@@ -330,18 +330,28 @@ fn mem_mb(v: &Value) -> Res<u64> {
     Ok(mb.max(1))
 }
 
-fn port(v: &Value) -> Res<Option<Port>> {
-    let s = scalar(v).ok_or("unsupported port entry")?;
-    let s = s.split('/').next().unwrap_or("");
-    if v.as_str().is_some_and(|x| x.contains("/udp")) {
-        return Err("UDP ports are not supported".into());
+/// A `ports:` entry: `"8080:80"`, `"127.0.0.1:8080:80"`, `"5353:53/udp"`, `"8000-8010:8000-8010"`, `"80"` (a free host port is
+/// picked) or the long form `{target, published, protocol, host_ip}`.
+fn port(v: &Value) -> Res<Vec<Port>> {
+    let spec = match v {
+        Value::Mapping(_) => {
+            let target = v.get("target").and_then(scalar).ok_or("a port needs a target")?;
+            let proto = v.get("protocol").and_then(scalar).unwrap_or_else(|| "tcp".into());
+            match v.get("published").and_then(scalar) {
+                Some(p) => format!("{}{p}:{target}/{proto}", v.get("host_ip").and_then(scalar).map(|i| format!("{i}:")).unwrap_or_default()),
+                None => format!("{target}/{proto}"),
+            }
+        }
+        other => scalar(other).ok_or("unsupported port entry")?,
+    };
+    let (main, proto) = spec.split_once('/').unwrap_or((spec.as_str(), "tcp"));
+    if let Ok(container) = main.parse::<u16>() {
+        // only the container port: Docker publishes it on a random host port
+        let udp = proto == "udp";
+        let host = if udp { std::net::UdpSocket::bind(("0.0.0.0", 0))?.local_addr()?.port() } else { std::net::TcpListener::bind(("0.0.0.0", 0))?.local_addr()?.port() };
+        return Ok(vec![Port { host_ip: None, host, container, udp }]);
     }
-    let parts: Vec<&str> = s.split(':').collect();
-    Ok(match parts.as_slice() {
-        [c] if c.parse::<u16>().is_ok() => None, // "80": a random host port, not supported
-        [h, c] | [_, h, c] => Some(Port::parse(&format!("{h}:{c}"))?),
-        _ => return Err(format!("unsupported port {s:?}").into()),
-    })
+    Ok(Port::parse_all(&spec)?)
 }
 
 fn health(v: &Value) -> Res<Option<Health>> {
@@ -839,7 +849,9 @@ volumes: {data: {}}
         assert_eq!(c.network_name.as_deref(), Some("demo_default"));
         assert_eq!(c.aliases, ["web"]);
         assert_eq!(c.env, ["A=1", "B"]);
-        assert_eq!(c.ports.iter().map(|p| (p.host, p.container)).collect::<Vec<_>>(), [(8080, 80), (9090, 90)], "a bare port is dropped");
+        // a bare container port ("7000") gets a free host port of its own
+        assert_eq!(c.ports.iter().map(|p| (p.host, p.container)).take(2).collect::<Vec<_>>(), [(8080, 80), (9090, 90)]);
+        assert!(c.ports.len() == 3 && c.ports[2].container == 7000 && c.ports[2].host != 0);
         assert_eq!(c.volumes[0], Volume::parse("demo_data:/var/lib/x").unwrap());
         assert_eq!(Path::new(&c.volumes[1].host), Path::new("/proj").join("site"));
         assert!(c.volumes[1].ro && c.volumes[2].host == "/abs");
@@ -870,7 +882,7 @@ volumes: {data: {}}
         let y = "services:\n  a:\n    image: x\n    networks: [back]\n  b:\n    image: x\n    ports: [\"53:53/udp\"]\n  c: {}\nnetworks: {back: {}}\n";
         let p = project(y);
         assert_eq!(plan(&p, "a", &p.file.services["a"]).unwrap().cfg.network_name.as_deref(), Some("demo_back"));
-        assert!(plan(&p, "b", &p.file.services["b"]).is_err(), "udp ports are rejected");
+        assert!(plan(&p, "b", &p.file.services["b"]).unwrap().cfg.ports[0].udp, "udp ports are published as udp");
         assert!(plan(&p, "c", &p.file.services["c"]).is_err(), "no image and no build");
     }
 

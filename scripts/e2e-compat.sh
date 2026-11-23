@@ -32,7 +32,7 @@ t "ps --format json" "$($D ps --format json)" '"Names":"cweb"'
 t "images header" "$($D images)" "REPOSITORY"
 t "images --format" "$($D images --format '{{.Repository}}:{{.Tag}}')" "alpine:latest"
 t "images -q" "$($D images -q alpine)" ""
-[ "$(echo "$($D images -q alpine)" | tr -d '\n' | wc -c)" = "12" ] && ok "images -q is a 12-char id" || bad "images -q length" "$($D images -q alpine)"
+id12=$($D images -q alpine:latest); [ "${#id12}" = "12" ] && ok "images -q is a 12-char id" || bad "images -q length" "$id12"
 t "images name filter" "$($D images alpine --format '{{.Repository}}')" "alpine"
 t "image ls works" "$($D image ls --format '{{.Repository}}')" "alpine"
 

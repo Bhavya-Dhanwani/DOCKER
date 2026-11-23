@@ -35,20 +35,17 @@ pub fn detect() -> Option<Helper> {
     }
 }
 
-/// `-t 8080:80,9090:90` (TCP only: the CLI has no UDP publishing).
-fn pasta_ports(ports: &[Port]) -> String {
-    if ports.is_empty() {
-        "none".into()
-    } else {
-        ports.iter().map(|p| format!("{}:{}", p.host, p.container)).collect::<Vec<_>>().join(",")
-    }
+/// `8080:80,9090:90` for pasta's `-t` (TCP) and `-u` (UDP) options; `none` when there are no ports of that kind.
+fn pasta_ports(ports: &[Port], udp: bool) -> String {
+    let list: Vec<String> = ports.iter().filter(|p| p.udp == udp).map(|p| format!("{}:{}", p.host, p.container)).collect();
+    if list.is_empty() { "none".into() } else { list.join(",") }
 }
 
 pub fn pasta_args(pid: u32, ports: &[Port]) -> Vec<String> {
-    let mut a: Vec<String> = ["--foreground", "--quiet", "--config-net", "--dns-forward", DNS, "-u", "none", "-U", "none", "-T", "none", "-t"]
-        .map(String::from)
-        .to_vec();
-    a.push(pasta_ports(ports));
+    let mut a: Vec<String> = ["--foreground", "--quiet", "--config-net", "--dns-forward", DNS, "-u"].map(String::from).to_vec();
+    a.push(pasta_ports(ports, true));
+    a.extend(["-U", "none", "-T", "none", "-t"].map(String::from));
+    a.push(pasta_ports(ports, false));
     a.push(pid.to_string());
     a
 }
@@ -61,11 +58,13 @@ pub fn slirp_args(pid: u32, api: &Path) -> Vec<String> {
     a
 }
 
-/// slirp4netns API request that publishes one TCP port to the guest address slirp4netns configured.
+/// slirp4netns API request that publishes one TCP or UDP port to the guest address slirp4netns configured.
 pub fn hostfwd_json(p: &Port) -> String {
     format!(
-        r#"{{"execute":"add_hostfwd","arguments":{{"proto":"tcp","host_addr":"0.0.0.0","host_port":{},"guest_addr":"10.0.2.100","guest_port":{}}}}}"#,
-        p.host, p.container
+        r#"{{"execute":"add_hostfwd","arguments":{{"proto":"{}","host_addr":"0.0.0.0","host_port":{},"guest_addr":"10.0.2.100","guest_port":{}}}}}"#,
+        if p.udp { "udp" } else { "tcp" },
+        p.host,
+        p.container
     )
 }
 
@@ -152,11 +151,17 @@ mod tests {
     #[test]
     fn helper_command_lines() {
         let ports = [Port { host: 8080, container: 80, host_ip: None, udp: false }];
-        assert_eq!(pasta_ports(&ports), "8080:80");
-        assert_eq!(pasta_ports(&[]), "none");
+        assert_eq!(pasta_ports(&ports, false), "8080:80");
+        assert_eq!(pasta_ports(&ports, true), "none");
+        assert_eq!(pasta_ports(&[], false), "none");
         let a = pasta_args(7, &ports);
         assert_eq!(a.last().unwrap(), "7");
         assert!(a.windows(2).any(|w| w == ["-t", "8080:80"]));
+        // UDP ports go to -u
+        let both = [ports[0].clone(), Port { host: 5353, container: 53, host_ip: None, udp: true }];
+        let a = pasta_args(7, &both);
+        assert!(a.windows(2).any(|w| w == ["-u", "5353:53"]) && a.windows(2).any(|w| w == ["-t", "8080:80"]));
+        assert!(hostfwd_json(&both[1]).contains(r#""proto":"udp""#));
         assert_eq!(slirp_args(7, Path::new("/s")).last().unwrap(), "tap0");
         assert!(hostfwd_json(&ports[0]).contains(r#""host_port":8080"#));
     }

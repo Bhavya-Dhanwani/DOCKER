@@ -17,12 +17,13 @@ One small static binary. No always-running daemon.
 </p>
 
 <p>
-  <a href="#-install"><b>Install</b></a> &nbsp;&middot;&nbsp;
-  <a href="#-how-to-use"><b>How to use</b></a> &nbsp;&middot;&nbsp;
-  <a href="#-features"><b>Features</b></a> &nbsp;&middot;&nbsp;
-  <a href="#-tech-stack"><b>Tech stack</b></a> &nbsp;&middot;&nbsp;
-  <a href="#-platforms"><b>Platforms</b></a> &nbsp;&middot;&nbsp;
-  <a href="#-testing"><b>Testing</b></a>
+  <a href="#benchmarks"><b>Benchmarks</b></a> &nbsp;&middot;&nbsp;
+  <a href="#install"><b>Install</b></a> &nbsp;&middot;&nbsp;
+  <a href="#how-to-use"><b>How to use</b></a> &nbsp;&middot;&nbsp;
+  <a href="#features"><b>Features</b></a> &nbsp;&middot;&nbsp;
+  <a href="#tech-stack"><b>Tech stack</b></a> &nbsp;&middot;&nbsp;
+  <a href="#platforms"><b>Platforms</b></a> &nbsp;&middot;&nbsp;
+  <a href="#testing"><b>Testing</b></a>
 </p>
 
 </div>
@@ -77,20 +78,32 @@ Sasta Docker against Docker Desktop 29.9.2, measured on the same PC: Windows 11 
 <td><img src="bench/install.svg" alt="Installed size" width="440"></td>
 <td><img src="bench/pull.svg" alt="Pull" width="440"></td>
 </tr>
+<tr>
+<td><img src="bench/start20.svg" alt="Start 20 containers" width="440"></td>
+<td><img src="bench/remove20.svg" alt="Remove 20 containers" width="440"></td>
+</tr>
+<tr>
+<td><img src="bench/compose.svg" alt="Compose up and down" width="440"></td>
+<td><img src="bench/ps.svg" alt="docker ps" width="440"></td>
+</tr>
 </table>
 
 | | Docker Desktop | Sasta Docker |
 |---|---|---|
-| RAM while idle (the VM plus the engine's own processes) | 4,492 MB | 850 MB |
-| RAM with 20 nginx containers running | 5,014 MB | 1,264 MB |
-| Engine ready after launch | 51 s | 6 s |
-| Start a container (`run --rm alpine true`, median of 15) | 745 ms | 606 ms |
-| Build, nothing cached / everything cached | 4.0 s / 1.3 s | 1.4 s / 0.4 s |
-| Pull `nginx:alpine` + `redis:alpine` | 21.7 s | 37.4 s |
-| VM disk file after the test | 2,348 MB | 347 MB |
+| RAM while idle (the VM plus the engine's own processes) | 2,736 MB | 612 MB |
+| RAM with 20 nginx containers running | 3,396 MB | 855 MB |
+| Engine ready after launch | 7.9 s | 1.9 s |
+| Start a container (`run --rm alpine true`, median of 15) | 466 ms | 322 ms |
+| Start 20 nginx containers | 7.9 s | 4.4 s |
+| Remove 20 containers | 2.2 s | 4.0 s |
+| Compose up + down (web + cache) | 2.1 s | 0.7 s |
+| `docker ps` (median of 15) | 151 ms | 186 ms |
+| Build, nothing cached / everything cached | 1.0 s / 0.6 s | 1.0 s / 0.3 s |
+| Pull `nginx:alpine` + `redis:alpine` | 91.6 s | 21.7 s |
+| VM disk file after the test | 2,414 MB | 344 MB |
 | Installed size | 3,670 MB | 20 MB |
 
-**Where Sasta Docker is not faster:** pulling images. It downloads through the system `curl` and was slower here (the pull numbers also move with the internet connection of the moment). Each number is one run on one machine, so treat the exact figures as an indication, not a guarantee. The engines were measured as installed with their default settings.
+**Where Sasta Docker is not faster:** removing many containers at once and `docker ps` (by about 35 ms), and the build is a tie. Pulls depend on the internet connection of the moment: the first run on this PC had Docker Desktop at 21.7 s and Sasta Docker (one layer at a time then) at 37.4 s, this run had them at 91.6 s and 21.7 s, so do not read a winner into the pull numbers. After a pull, build or load, the command drops the VM's file cache so idle RAM falls back; the first read of the same files afterwards comes from disk again. Docker Desktop's idle RAM also moved between runs (4,492 MB in the first one, 2,736 MB in this one). Each number is one run on one machine, so treat the exact figures as an indication, not a guarantee. The engines were measured as installed with their default settings.
 
 ---
 

@@ -57,6 +57,9 @@ fn health_from(h: HealthConfig) -> Option<Health> {
     })
 }
 
+/// Layers downloaded at once. ponytail: fixed; raise if registries keep up, lower on a very slow link.
+const PULL_WORKERS: usize = 4;
+
 /// Download an image (config + layer blobs, digest-verified) into the store.
 /// Layers already present are skipped, which is where the disk savings come from.
 pub fn pull(store: &Store, r: &Reference, say: &mut dyn FnMut(String)) -> Result<ImageMeta> {
@@ -86,6 +89,7 @@ pub fn pull_for(store: &Store, r: &Reference, platform: Option<&str>, say: &mut 
     let _ = fs::remove_file(&cfg_path);
 
     let mut layers = vec![];
+    let mut todo = vec![]; // (layer, final path)
     for d in &m.layers {
         let l = LayerRef { digest: d.digest.clone(), media_type: d.media_type.clone(), size: d.size };
         let short = &l.digest[7..19];
@@ -97,16 +101,39 @@ pub fn pull_for(store: &Store, r: &Reference, platform: Option<&str>, say: &mut 
         } else {
             fs::create_dir_all(blob.parent().expect("has parent"))?;
             say(format!("{short}: Pulling"));
-            // download beside the final name and rename when complete and verified, so a half-written file is
-            // never mistaken for the layer
-            // (the name includes our pid: two pulls of the same shared layer must not write the same file, and
-            // an existing blob is left alone for whoever is unpacking it)
-            let part = blob.with_extension(format!("part{}", std::process::id()));
-            client.blob(&l.digest, &part)?;
-            fs::rename(&part, &blob)?;
-            say(format!("{short}: Pull complete"));
+            todo.push((l.digest.clone(), blob));
         }
         layers.push(l);
+    }
+    // Layers download side by side (each is its own curl process). Download beside the final name and rename when
+    // complete and verified, so a half-written file is never mistaken for the layer; the name includes our pid:
+    // two pulls of the same shared layer must not write the same file, and an existing blob is left alone for
+    // whoever is unpacking it.
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let failure: std::sync::Mutex<Option<crate::error::Error>> = std::sync::Mutex::new(None);
+    std::thread::scope(|s| {
+        for _ in 0..PULL_WORKERS.min(todo.len()) {
+            s.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let Some((digest, blob)) = todo.get(i) else { break };
+                    if failure.lock().expect("lock").is_some() {
+                        break;
+                    }
+                    let part = blob.with_extension(format!("part{}", std::process::id()));
+                    let res = client.blob(digest, &part).and_then(|()| Ok(fs::rename(&part, blob)?));
+                    if let Err(e) = res {
+                        failure.lock().expect("lock").get_or_insert(e);
+                    }
+                }
+            });
+        }
+    });
+    if let Some(e) = failure.into_inner().expect("lock") {
+        return Err(e);
+    }
+    for (digest, _) in &todo {
+        say(format!("{}: Pull complete", &digest[7..19]));
     }
 
     let meta = meta_from_config(&r.display(), layers, &cfg_bytes)?;

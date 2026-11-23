@@ -41,6 +41,9 @@ $idle = Mb $ramNames
 # cold start of a container, as the user sees it (the whole command)
 $starts = 1..$Runs | ForEach-Object { Ms { & $dk run --rm alpine true } }
 
+# how fast does a plain command answer
+$ps = 1..$Runs | ForEach-Object { Ms { & $dk ps } }
+
 # pulling (needs the network: this number moves with the connection)
 $pulls = @{}
 foreach ($img in 'nginx:alpine', 'redis:alpine') {
@@ -49,11 +52,20 @@ foreach ($img in 'nginx:alpine', 'redis:alpine') {
 }
 
 # memory with many containers running
-$ids = 1..$Containers | ForEach-Object { & $dk run -d nginx:alpine }
+$ids = @()
+$start20 = Ms { $script:ids = 1..$Containers | ForEach-Object { & $dk run -d nginx:alpine } }
 Start-Sleep 10
 $loaded = Mb $ramNames
 $runningNow = (& $dk ps -q | Measure-Object).Count
-& $dk rm -f @($ids) *> $null
+$stop20 = Ms { & $dk rm -f @($ids) *> $null }
+
+# a small compose project (web + cache)
+$c = Join-Path $env:TEMP "sasta-bench-compose-$Engine"; Remove-Item $c -Recurse -Force -ErrorAction SilentlyContinue; New-Item -ItemType Directory $c | Out-Null
+Set-Content "$c\compose.yaml" "services:`n  web:`n    image: nginx:alpine`n  cache:`n    image: redis:alpine`n"
+Push-Location $c
+$composeUp = Ms { & $dk compose up -d }
+$composeDown = Ms { & $dk compose down }
+Pop-Location
 
 # build: cold, then again with everything cached
 $b = Join-Path $env:TEMP "sasta-bench-$Engine"; Remove-Item $b -Recurse -Force -ErrorAction SilentlyContinue; New-Item -ItemType Directory $b | Out-Null
@@ -71,7 +83,7 @@ $install = if ($Engine -eq 'sasta') { (Get-ChildItem (Join-Path $root 'target\re
 $res = [ordered]@{
     engine = $Engine; date = (Get-Date -Format 'yyyy-MM-dd'); runs = $Runs; containers = $runningNow
     base_ram_mb = $base; ready_s = $ready; idle_ram_mb = $idle; loaded_ram_mb = $loaded
-    start_ms = $starts; start_median_ms = (Median $starts); start_min_ms = ($starts | Measure-Object -Minimum).Minimum
+    start_ms = $starts; start_median_ms = (Median $starts); ps_median_ms = (Median $ps); start20_ms = $start20; remove20_ms = $stop20; compose_up_ms = $composeUp; compose_down_ms = $composeDown; start_min_ms = ($starts | Measure-Object -Minimum).Minimum
     pull_ms = $pulls; build_cold_ms = $buildCold; build_cached_ms = $buildCached
     vhdx_mb = [math]::Round($vhdx.Length / 1MB); install_mb = [math]::Round($install / 1MB)
 }

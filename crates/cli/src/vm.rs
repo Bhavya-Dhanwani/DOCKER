@@ -142,7 +142,27 @@ pub fn forward(cmd: Command) -> Res<i32> {
         p.env("WSLENV", wslenv(std::env::vars().map(|(k, _)| k), std::env::var("WSLENV").ok().as_deref()));
     }
     let status = p.status().map_err(|e| format!("cannot run {}: {e}", argv[0]))?;
+    trim_if_heavy(&d, &cmd.to_args());
     Ok(status.code().unwrap_or(1))
+}
+
+/// Commands that read or write a lot of image data: afterwards the VM's file cache is mostly dead weight.
+fn is_heavy(args: &[String]) -> bool {
+    let mut w = args.iter().map(String::as_str).filter(|a| !a.starts_with('-'));
+    let first = match w.next() {
+        Some("image" | "container") => w.next(),
+        Some("compose") => w.next().filter(|c| matches!(*c, "build" | "pull" | "up" | "push")).map(|_| "pull"),
+        other => other,
+    };
+    matches!(first, Some("pull" | "build" | "buildx" | "load" | "import" | "save" | "commit" | "push" | "export"))
+}
+
+/// Give the VM's file cache back: WSL2 and Lima keep it as host RAM (a pull left the idle VM at about 1 GB, 0.6 GB after dropping it).
+/// Costs a moment when the same files are read again; the files themselves stay.
+fn trim_if_heavy(d: &Driver, args: &[String]) {
+    if is_heavy(args) {
+        let _ = proc(&d.shell_argv("sync; echo 1 > /proc/sys/vm/drop_caches")).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+    }
 }
 
 /// Forward raw arguments (the commands `extra` handles) into the VM, translating the host paths of the options that take one.
@@ -156,6 +176,7 @@ pub fn forward_args(args: Vec<String>) -> Res<i32> {
         p.env("WSLENV", wslenv(std::env::vars().map(|(k, _)| k), std::env::var("WSLENV").ok().as_deref()));
     }
     let status = p.status().map_err(|e| format!("cannot run {}: {e}", argv[0]))?;
+    trim_if_heavy(&d, &args);
     Ok(status.code().unwrap_or(1))
 }
 
@@ -212,6 +233,18 @@ fn wslenv(names: impl Iterator<Item = String>, existing: Option<&str>) -> String
         }
     }
     list.join(":")
+}
+
+#[cfg(test)]
+mod heavy_tests {
+    use super::is_heavy;
+
+    #[test]
+    fn only_image_data_commands_trim() {
+        let h = |s: &str| is_heavy(&s.split(' ').map(String::from).collect::<Vec<_>>());
+        assert!(h("pull alpine") && h("image pull -q alpine") && h("build -t x .") && h("compose up -d") && h("load -i a.tar"));
+        assert!(!h("ps -a") && !h("run alpine true") && !h("compose ps") && !h("logs web"));
+    }
 }
 
 #[cfg(test)]

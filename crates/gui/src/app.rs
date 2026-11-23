@@ -437,8 +437,10 @@ impl App {
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.add(egui::Image::new((self.logo.id(), egui::vec2(60.0, 60.0))).tint(ui.visuals().text_color()));
+        // the whale only (the texture is square with empty bands above and below it)
+        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.18), egui::pos2(1.0, 0.82));
+        ui.vertical_centered(|ui| {
+            ui.add(egui::Image::new((self.logo.id(), egui::vec2(150.0, 96.0))).uv(uv));
             ui.label(RichText::new("Sasta Docker").size(18.0).strong());
         });
         ui.add_space(12.0);

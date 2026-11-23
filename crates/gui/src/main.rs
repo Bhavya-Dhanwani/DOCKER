@@ -27,7 +27,7 @@ const LOGO_RGBA: &[u8] = include_bytes!("icon.rgba");
 const SIDEBAR_RGBA: &[u8] = include_bytes!("sidebar.rgba");
 impl Logo {
     pub fn to_color_image(&self) -> egui::ColorImage {
-        egui::ColorImage::from_rgba_unmultiplied([128, 128], SIDEBAR_RGBA)
+        egui::ColorImage::from_rgba_unmultiplied([256, 256], SIDEBAR_RGBA)
     }
 }
 

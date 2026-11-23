@@ -14,6 +14,9 @@ The command is still called `docker`, so existing scripts and tools keep working
 |---|---|
 | **Linux** and **macOS** | `curl -fsSL https://raw.githubusercontent.com/Bhavya-Dhanwani/DOCKER/main/install.sh \| sh` |
 | **Windows** (PowerShell) | `irm https://raw.githubusercontent.com/Bhavya-Dhanwani/DOCKER/main/install.ps1 \| iex` |
+| **Windows** (CMD) | `powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/Bhavya-Dhanwani/DOCKER/main/install.ps1 \| iex"` |
+
+On Windows, the commands above download the installer without the browser, so Windows does not show its "Windows protected your PC" screen. The installer file is not code-signed (that costs money), so if you download the `.exe` in a browser instead, Windows SmartScreen may warn: click "More info", then "Run anyway".
 
 **Or download the installer yourself** from the [latest release](https://github.com/Bhavya-Dhanwani/DOCKER/releases/latest):
 

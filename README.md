@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/logo.png" alt="Sasta Docker" width="220">
+<img src="assets/logo.png" alt="Sasta Docker" width="260">
 
 # Sasta Docker
 
@@ -56,7 +56,7 @@ Layers are stored once and shared. Container writes go to RAM by default, so not
 
 ---
 
-## 📦 Install
+## Install
 
 ### One line
 
@@ -93,7 +93,7 @@ curl -fsSL https://raw.githubusercontent.com/Bhavya-Dhanwani/DOCKER/main/install
 
 ---
 
-## 🚀 How to use
+## How to use
 
 ### 1. First run
 
@@ -167,7 +167,7 @@ Without WSL2 the app runs in native mode and uses no VM memory at all.
 
 ---
 
-## ✨ Features
+## Features
 
 <details open>
 <summary><b>Containers</b></summary>
@@ -237,7 +237,7 @@ Without WSL2 the app runs in native mode and uses no VM memory at all.
 
 ---
 
-## 🧰 Tech stack
+## Tech stack
 
 <table>
 <tr><th align="left">Area</th><th align="left">What is used</th></tr>
@@ -278,7 +278,7 @@ JSON (<code>serde</code>), YAML, TOML, tar
 
 ---
 
-## 🖥 Platforms
+## Platforms
 
 | OS | How containers run |
 |---|---|
@@ -288,7 +288,7 @@ JSON (<code>serde</code>), YAML, TOML, tar
 
 ---
 
-## 🧪 Testing
+## Testing
 
 - Unit tests for every crate: `cargo test --workspace`
 - End-to-end suites in `scripts/` (Linux, run as root, offline): containers, networking (TCP/UDP/IPv6/subnets), user-defined networks, builds, security, registry, save/load, compose, terminals and healthchecks, Swarm-lite, Engine API, rootless
@@ -298,7 +298,7 @@ JSON (<code>serde</code>), YAML, TOML, tar
 - `scripts/build-all-projects.ps1` builds every Dockerfile and compose file under a folder and prints one PASS/FAIL line each
 - Every tab, dialog and button of the desktop app was clicked through on Windows
 
-## 🔨 Build from source
+## Build from source
 
 ```powershell
 scripts\build.ps1    # tests, then the Windows CLI + GUI and the Linux engine (docker-linux-<arch>)

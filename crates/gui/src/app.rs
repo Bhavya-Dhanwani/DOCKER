@@ -438,7 +438,7 @@ impl App {
     fn sidebar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            ui.add(egui::Image::new((self.logo.id(), egui::vec2(38.0, 38.0))).tint(ui.visuals().text_color()));
+            ui.add(egui::Image::new((self.logo.id(), egui::vec2(60.0, 60.0))).tint(ui.visuals().text_color()));
             ui.label(RichText::new("Sasta Docker").size(18.0).strong());
         });
         ui.add_space(12.0);

@@ -14,7 +14,7 @@ mkdir -p "$RUST_DOCKER_HOME" && cp -r "$SRC" "$RUST_DOCKER_HOME/store"
 fail=0
 check() { d=$1; shift; if "$@" >/dev/null 2>&1; then echo "PASS $d"; else echo "FAIL $d"; fail=$((fail+1)); fi; }
 has() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
-ipof() { $D inspect "$1" | sed -n 's/.*"ip": "\([0-9.]*\)".*/\1/p'; }
+ipof() { $D inspect -f '{{.NetworkSettings.IPAddress}}' "$1"; }
 
 echo "== bridge (default)"
 # the bridge now disappears with the last container, so keep one around for the host-side checks below

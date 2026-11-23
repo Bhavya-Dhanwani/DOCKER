@@ -44,25 +44,25 @@ $D rm -f bg >/dev/null
 echo "== restart policies"
 $D run -d $N --name rs-always --restart always alpine sh -c 'sleep 1; exit 0' </dev/null >/dev/null
 sleep 6
-r=$($D inspect rs-always | grep -o '"restarts": [0-9]*' | grep -o '[0-9]*$')
+r=$($D inspect -f '{{.RestartCount}}' rs-always)
 check "--restart always brings an exiting container back (restarts >= 2)" sh -c "[ ${r:-0} -ge 2 ]"
 $D ps | grep -q rs-always; check "it shows up in ps while restarting or running" test $? -eq 0
 $D stop -t 1 rs-always >/dev/null; sleep 2
 check "docker stop ends the restart loop" sh -c "$D ps -a | grep rs-always | grep -q Exited"
-n1=$($D inspect rs-always | grep -o '"restarts": [0-9]*' | grep -o '[0-9]*$'); sleep 3
-n2=$($D inspect rs-always | grep -o '"restarts": [0-9]*' | grep -o '[0-9]*$')
+n1=$($D inspect -f '{{.RestartCount}}' rs-always); sleep 3
+n2=$($D inspect -f '{{.RestartCount}}' rs-always)
 check "and it stays stopped (no more restarts)" eq "$n1" "$n2"
 $D rm -f rs-always >/dev/null
 
 $D run -d $N --name rs-fail --restart on-failure:2 alpine sh -c 'exit 7' </dev/null >/dev/null
 sleep 5
-check "on-failure:2 stops after 2 restarts" sh -c "$D inspect rs-fail | grep -q '\"restarts\": 2' && $D ps -a | grep rs-fail | grep -q 'Exited (7)'"
+check "on-failure:2 stops after 2 restarts" sh -c "[ \"\$($D inspect -f '{{.RestartCount}}' rs-fail)\" = 2 ] && $D ps -a | grep rs-fail | grep -q 'Exited (7)'"
 $D rm -f rs-fail >/dev/null
 $D run -d $N --name rs-ok --restart on-failure alpine sh -c 'exit 0' </dev/null >/dev/null; sleep 3
-check "on-failure does not restart a clean exit" sh -c "$D inspect rs-ok | grep -q '\"restarts\": 0' && $D ps -a | grep rs-ok | grep -q 'Exited (0)'"
+check "on-failure does not restart a clean exit" sh -c "[ \"\$($D inspect -f '{{.RestartCount}}' rs-ok)\" = 0 ] && $D ps -a | grep rs-ok | grep -q 'Exited (0)'"
 $D rm -f rs-ok >/dev/null
 $D run -d $N --name rs-no alpine sh -c 'exit 1' </dev/null >/dev/null; sleep 2
-check "the default (no) never restarts" sh -c "$D inspect rs-no | grep -q '\"restarts\": 0'"
+check "the default (no) never restarts" sh -c "[ \"\$($D inspect -f '{{.RestartCount}}' rs-no)\" = 0 ]"
 $D rm -f rs-no >/dev/null
 $D run -d $N --name rs-rm --restart always alpine sh -c 'exit 1' </dev/null >/dev/null; sleep 1
 check "rm -f works on a container that keeps restarting" sh -c "$D rm -f rs-rm && ! $D ps -a | grep -q rs-rm"
@@ -76,7 +76,7 @@ sleep 4
 check "a failing check turns it unhealthy (after 2 failures)" sh -c "$D ps | grep hc | grep -q unhealthy"
 $D exec hc touch /tmp/ok; sleep 3
 check "and it recovers to healthy once the check passes" sh -c "$D ps | grep hc | grep -q '(healthy)'"
-check "inspect shows the health status" has "$($D inspect hc)" '"health": "healthy"'
+check "inspect shows the health status" has "$($D inspect -f '{{.State.Health.Status}}' hc)" healthy
 $D rm -f hc >/dev/null
 $D run -d $N --name hc2 --health-cmd true --health-interval 1s --health-start-period 30s --health-retries 1 alpine sleep 1000 </dev/null >/dev/null
 sleep 3; check "a passing check is healthy" sh -c "$D ps | grep hc2 | grep -q '(healthy)'"

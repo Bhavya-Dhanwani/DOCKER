@@ -21,7 +21,7 @@ pub use add::{extract_archive, fetch_url, is_url, url_filename};
 pub use archive::{load, save};
 pub use auth::{login, logout};
 pub use ignore::{expand_glob, expand_with, Ignore};
-pub use info::{history, inspect, HistoryRow};
+pub use info::{history, inspect, manifest_inspect, HistoryRow};
 pub use pull::{pull, pull_for};
 pub use search::{search, Hit};
 #[cfg(target_os = "linux")]

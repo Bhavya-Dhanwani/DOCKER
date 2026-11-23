@@ -15,7 +15,7 @@ fail=0
 check() { d=$1; shift; if "$@" >/dev/null 2>&1; then echo "PASS $d"; else echo "FAIL $d"; fail=$((fail+1)); fi; }
 has() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
 eq() { [ "$1" = "$2" ]; }
-idof() { $D ps -a | awk -v n="$1" 'NR>1 && $2==n {print $1}'; }
+idof() { $D ps -a --no-trunc --format '{{.ID}} {{.Names}}' | awk -v n="$1" '$2==n {print $1}'; }
 N="--network none"
 
 echo "== stop / kill"
@@ -28,14 +28,14 @@ t0=$(date +%s); $D stop -t 1 stubborn >/dev/null; t1=$(date +%s)
 check "stop falls back to SIGKILL after the timeout (137)" sh -c "[ $((t1-t0)) -le 4 ] && $D ps -a | grep stubborn | grep -q 'Exited (137)'"
 $D run -d $N --name k alpine sleep 1000 </dev/null >/dev/null; sleep 1
 $D kill k >/dev/null; sleep 1
-check "kill is immediate" sh -c "$D ps -a | grep ' k ' | grep -q Exited"
+check "kill is immediate" sh -c "$D ps -a | grep -w k | grep -q Exited"
 check "stop on a stopped container is an error" sh -c "! $D stop k"
 
 echo "== start / restart / pause / wait / rename"
 $D run -d $N --name cyc alpine sh -c 'echo run-$$; sleep 1000' </dev/null >/dev/null; sleep 1
-check "restart gives the container a fresh run" sh -c "$D restart -t 1 cyc >/dev/null && sleep 1 && $D ps | grep -q 'cyc.*Up'"
+check "restart gives the container a fresh run" sh -c "$D restart -t 1 cyc >/dev/null && sleep 1 && $D ps | grep -q 'Up.*cyc'"
 $D kill cyc >/dev/null; sleep 1
-check "start re-runs an exited container under the same name" sh -c "$D start cyc >/dev/null && sleep 1 && $D ps | grep -q 'cyc.*Up'"
+check "start re-runs an exited container under the same name" sh -c "$D start cyc >/dev/null && sleep 1 && $D ps | grep -q 'Up.*cyc'"
 check "start refuses a running container" sh -c "! $D start cyc"
 id=$(idof cyc)
 $D pause cyc >/dev/null; sleep 1
@@ -44,7 +44,7 @@ $D unpause cyc >/dev/null; sleep 1
 check "unpause thaws it (frozen 0)" sh -c "grep -q 'frozen 0' /sys/fs/cgroup/rust-docker-$id/cgroup.events"
 $D run -d $N --name w alpine sh -c 'sleep 2; exit 5' </dev/null >/dev/null
 check "wait returns the exit code" eq "$($D wait w)" 5
-check "rename works" sh -c "$D rename w renamed && $D ps -a | grep -q ' renamed '"
+check "rename works" sh -c "$D rename w renamed && $D ps -a | grep -qw renamed"
 check "rename onto an existing name fails" sh -c "! $D rename renamed cyc"
 check "top lists the container's processes" has "$($D top cyc)" "sleep 1000"
 check "stats shows usage for a running container" has "$($D stats --no-stream cyc)" "$id"

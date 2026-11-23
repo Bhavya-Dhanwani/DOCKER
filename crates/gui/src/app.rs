@@ -114,8 +114,8 @@ impl App {
         self.pending.insert(kind);
         let a = |x: &[&str]| worker::args(x);
         match kind {
-            Kind::Containers => self.w.spawn(move || Event::Containers(run_cli(&a(&["ps", "-a"])).map(|o| parse::parse_ps(&o)))),
-            Kind::Images => self.w.spawn(move || Event::Images(run_cli(&a(&["images"])).map(|o| parse::parse_images(&o)))),
+            Kind::Containers => self.w.spawn(move || Event::Containers(run_cli(&a(&["ps", "-a", "--no-trunc", "--format", "{{json .}}"])).map(|o| parse::parse_ps_json(&o)))),
+            Kind::Images => self.w.spawn(move || Event::Images(run_cli(&a(&["images", "--format", "{{json .}}"])).map(|o| parse::parse_images_json(&o)))),
             Kind::Volumes => self.w.spawn(move || Event::Volumes(run_cli(&a(&["volume", "ls"])).map(|o| parse::parse_volumes(&o)))),
             Kind::Networks => self.w.spawn(move || Event::Networks(run_cli(&a(&["network", "ls"])).map(|o| parse::parse_networks(&o)))),
             Kind::Df => self.w.spawn(move || Event::Df(run_cli(&a(&["system", "df"])).map(|o| parse::parse_df(&o)))),

@@ -15,7 +15,7 @@ Windows and macOS forwarding into a hidden Linux VM, the `Sasta Docker` desktop 
 - macOS has never been run on a real Mac (the Lima driver is written and compiled only)
 - The GUI was clicked through on Windows (every tab, dialog and button); it has no Swarm, compose or rootless views, and has not been run on Linux or macOS
 - Rootless: `build` and user-defined networks work (the containers of one network share a single network namespace, so they share ports); no `rmi`/`prune` of layers owned by mapped uids, no `push`/`save` of rootless-built layers, no UDP `-p`, limits only inside a delegated cgroup, user-defined networks need slirp4netns; the systemd `user@UID.service` delegation path untested
-- Swarm: single node only (no `swarm join`), `service create/update` do not wait for convergence, `service logs -f` prints a snapshot, `depends_on` ignored, `stack deploy` does not prune removed services
+- Swarm: single node only (no `swarm join`: a swarm across machines needs overlay networking and a second machine to test on); `service create/update` do not wait for convergence, `service logs -f` prints a snapshot, `stack deploy` does not prune removed services
 - IPv6 to the internet (NAT66) untested (no IPv6 route on the test host); plain `-p` does not also listen on `[::]`
 - Registry: zstd tested only with hand-made frames, parallel upload/mount/chunk resume only against a mock registry, `docker manifest inspect` not implemented
 - Engine API: `changes`/`export`/`archive`/`commit` need a running container; `images/search` returns an empty list; `commit` does not carry the container's run-time cmd/env
@@ -66,3 +66,4 @@ Doing it half-way would hand out a "rootless" mode with silent ownership and net
 - Networking: no UDP `-p`, no IPv6; the NAT rule and bridge are left in place after the last container exits.
 - Engine API over Windows-to-WSL TCP: WSL's localhost forwarding drops half-closed connections, so exec/attach are only reliable over the Linux unix socket.
 - Container attach has no window-resize message.
+- Docker CLI gaps left: `logs -t/--since/--until` (container output is not timestamped), `compose watch`, `diff`/`commit`/`export` of a stopped container (its writes live in RAM and are gone at exit), `--ipc/--pid/--device/--gpus/--sysctl/--link` (accepted with a warning), `docker checkpoint`, `plugin`, `trust`

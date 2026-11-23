@@ -261,7 +261,7 @@ pub fn rfc3339(secs: u64) -> String {
 }
 
 /// A stable 64-hex-char id derived from text (images have no config digest of their own in this store).
-fn fake_id(text: &str) -> String {
+pub(crate) fn fake_id(text: &str) -> String {
     let mut out = String::new();
     for round in 0..4u64 {
         let mut h: u64 = 0xcbf29ce484222325 ^ round.wrapping_mul(0x9e3779b97f4a7c15);
@@ -285,11 +285,11 @@ fn cli(args: &[&str]) -> Result<String, String> {
     }
 }
 
-fn store() -> Store {
+pub(crate) fn store() -> Store {
     Store::open(registry::data_dir().join("store"))
 }
 
-fn state_of(e: &Entry) -> &'static str {
+pub(crate) fn state_of(e: &Entry) -> &'static str {
     if e.running() {
         "running"
     } else if e.restarting && e.exit_code.is_none() {
@@ -301,7 +301,7 @@ fn state_of(e: &Entry) -> &'static str {
     }
 }
 
-fn status_of(e: &Entry) -> String {
+pub(crate) fn status_of(e: &Entry) -> String {
     let now = registry::now_unix();
     match state_of(e) {
         "running" => format!("Up {} seconds", now.saturating_sub(e.started_unix)),
@@ -311,7 +311,15 @@ fn status_of(e: &Entry) -> String {
     }
 }
 
-fn names_of(e: &Entry) -> Vec<String> {
+/// What the container runs: its own command, or (when `run` was given none) the image's ENTRYPOINT + CMD.
+pub(crate) fn effective_cmd(e: &Entry) -> Vec<String> {
+    if !e.cmd.is_empty() {
+        return e.cmd.clone();
+    }
+    Reference::parse(&e.image).ok().and_then(|r| store().get(&r).ok().flatten()).map(|m| m.entrypoint.iter().chain(m.cmd.iter()).cloned().collect()).unwrap_or_default()
+}
+
+pub(crate) fn names_of(e: &Entry) -> Vec<String> {
     vec![format!("/{}", e.name.clone().unwrap_or_else(|| e.id.chars().take(12).collect()))]
 }
 
@@ -327,7 +335,7 @@ fn port_list(e: &Entry) -> Vec<Value> {
         .collect()
 }
 
-fn container_summary(e: &Entry) -> Value {
+pub(crate) fn container_summary(e: &Entry) -> Value {
     json!({
         "Id": e.id, "Names": names_of(e), "Image": e.image, "ImageID": fake_id(&e.image),
         "Command": e.cmd.join(" "), "Created": e.started_unix, "State": state_of(e), "Status": status_of(e),
@@ -335,7 +343,7 @@ fn container_summary(e: &Entry) -> Value {
     })
 }
 
-fn container_inspect(e: &Entry) -> Value {
+pub(crate) fn container_inspect(e: &Entry) -> Value {
     let c = e.config.clone().unwrap_or_default();
     let nets = match (&c.network_name, &e.ip) {
         (Some(n), Some(ip)) => json!({ n: { "IPAddress": ip, "Aliases": c.aliases } }),
@@ -345,7 +353,7 @@ fn container_inspect(e: &Entry) -> Value {
     let exposed: Map<String, Value> = c.ports.iter().map(|p| (format!("{}/{}", p.container, if p.udp { "udp" } else { "tcp" }), json!({}))).collect();
     let bindings: Map<String, Value> = c.ports.iter().map(|p| (format!("{}/{}", p.container, if p.udp { "udp" } else { "tcp" }), json!([{ "HostIp": p.host_ip.map(|i| i.to_string()).unwrap_or_default(), "HostPort": p.host.to_string() }]))).collect();
     json!({
-        "Id": e.id, "Created": rfc3339(e.started_unix), "Path": e.cmd.first(), "Args": e.cmd.iter().skip(1).collect::<Vec<_>>(),
+        "Id": e.id, "Created": rfc3339(e.started_unix), "Path": effective_cmd(e).first().cloned(), "Args": effective_cmd(e).iter().skip(1).cloned().collect::<Vec<_>>(),
         "State": {
             "Status": state_of(e), "Running": e.running(), "Paused": false, "Restarting": e.restarting, "OOMKilled": false, "Dead": false,
             "Pid": e.pid, "ExitCode": e.exit_code.unwrap_or(0), "Error": "",
@@ -369,7 +377,7 @@ fn container_inspect(e: &Entry) -> Value {
     })
 }
 
-fn image_json(m: &docker_image::ImageMeta) -> Value {
+pub(crate) fn image_json(m: &docker_image::ImageMeta) -> Value {
     let exposed: Map<String, Value> = m.exposed.iter().map(|p| (p.clone(), json!({}))).collect();
     json!({
         "Id": format!("sha256:{}", fake_id(&m.name)), "RepoTags": [m.name], "RepoDigests": [], "Created": 0, "Size": m.size(), "VirtualSize": m.size(),
@@ -418,6 +426,8 @@ pub fn config_from_create(body: &Value, ncpu: u64) -> Result<Config, String> {
     cfg.hostname = body.get("Hostname").and_then(Value::as_str).filter(|h| !h.is_empty() && is_volume_name(h)).map(String::from);
     cfg.extra_hosts = strings(host.get("ExtraHosts"));
     cfg.dns = strings(host.get("Dns"));
+    cfg.stop_signal = body.get("StopSignal").and_then(Value::as_str).filter(|s| !s.is_empty()).map(String::from);
+    cfg.stop_timeout = body.get("StopTimeout").and_then(Value::as_u64);
     cfg.read_only = host.get("ReadonlyRootfs").and_then(Value::as_bool).unwrap_or(false);
     cfg.init = host.get("Init").and_then(Value::as_bool).unwrap_or(false);
     cfg.shm_mb = host.get("ShmSize").and_then(Value::as_u64).filter(|b| *b > 0).map(|b| b.div_ceil(1 << 20));
@@ -697,7 +707,7 @@ fn image_name<'a>(path: &'a str, suffix: &str) -> Option<&'a str> {
 }
 
 /// An image id (`sha256:<hex>` or a hex prefix, as clients get from /images/json) -> its name; anything else is returned as is.
-pub fn image_by_id(name: &str, images: &[String]) -> String {
+pub(crate) fn image_by_id(name: &str, images: &[String]) -> String {
     let hex = name.strip_prefix("sha256:").unwrap_or(name);
     if hex.len() >= 4 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
         let mut hits = images.iter().filter(|n| fake_id(n).starts_with(hex));
@@ -718,11 +728,11 @@ fn network_by_id(id: &str) -> String {
     all.into_iter().find(|n| id.len() >= 4 && fake_id(n).starts_with(id)).unwrap_or_else(|| id.to_string())
 }
 
-fn image_names() -> Vec<String> {
+pub(crate) fn image_names() -> Vec<String> {
     store().list().into_iter().map(|m| m.name).collect()
 }
 
-fn find_image(name: &str) -> Result<docker_image::ImageMeta, Reply> {
+pub(crate) fn find_image(name: &str) -> Result<docker_image::ImageMeta, Reply> {
     let name = &image_by_id(name, &image_names());
     let rf = Reference::parse(name).map_err(|_| fail(404, format!("No such image: {name}")))?;
     store().get(&rf).ok().flatten().ok_or_else(|| fail(404, format!("No such image: {name}")))
@@ -735,7 +745,7 @@ fn host_memory() -> u64 {
         .map_or(0, |kb| kb * 1024)
 }
 
-fn info() -> Value {
+pub(crate) fn info() -> Value {
     let all = registry::list();
     let running = all.iter().filter(|e| e.running()).count();
     json!({
@@ -1036,6 +1046,90 @@ fn route(r: &Request, w: &mut dyn Write) -> io::Result<Reply> {
         }
 
         _ => fail(404, "page not found"),
+    })
+}
+
+/// Undoes the HTTP framing of a streamed reply (status line, headers, chunked transfer encoding) so that only the
+/// body reaches `inner`. Lets the CLI reuse the API's handlers for diff, export, events, commit and friends.
+struct BodyWriter<'a> {
+    inner: &'a mut dyn Write,
+    buf: Vec<u8>,
+    head_done: bool,
+    chunked: bool,
+    status: u16,
+    /// chunked: bytes of the current chunk still to come (None = reading a size line)
+    left: Option<usize>,
+}
+
+impl<'a> BodyWriter<'a> {
+    fn new(inner: &'a mut dyn Write) -> Self {
+        BodyWriter { inner, buf: vec![], head_done: false, chunked: false, status: 200, left: None }
+    }
+}
+
+impl Write for BodyWriter<'_> {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        loop {
+            if !self.head_done {
+                let Some(end) = self.buf.windows(4).position(|w| w == b"\r\n\r\n") else { break };
+                let head = String::from_utf8_lossy(&self.buf[..end]).to_string();
+                self.status = head.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(200);
+                self.chunked = head.to_lowercase().contains("transfer-encoding: chunked");
+                self.buf.drain(..end + 4);
+                self.head_done = true;
+                continue;
+            }
+            if !self.chunked {
+                let all = std::mem::take(&mut self.buf);
+                self.inner.write_all(&all)?;
+                break;
+            }
+            match self.left {
+                None => {
+                    let Some(nl) = self.buf.windows(2).position(|w| w == b"\r\n") else { break };
+                    let n = usize::from_str_radix(String::from_utf8_lossy(&self.buf[..nl]).trim(), 16).unwrap_or(0);
+                    self.buf.drain(..nl + 2);
+                    self.left = Some(n);
+                }
+                Some(0) => {
+                    if self.buf.len() < 2 {
+                        break;
+                    }
+                    self.buf.drain(..2); // the CRLF after a chunk
+                    self.left = None;
+                }
+                Some(n) => {
+                    let take = n.min(self.buf.len());
+                    if take == 0 {
+                        break;
+                    }
+                    let part: Vec<u8> = self.buf.drain(..take).collect();
+                    self.inner.write_all(&part)?;
+                    self.left = Some(n - take);
+                }
+            }
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Run one API request inside this process. The body of a streamed reply goes to `sink`; a JSON reply is returned
+/// together with the status code.
+pub(crate) fn call(method: &str, target: &str, body: Vec<u8>, sink: &mut dyn Write) -> io::Result<(u16, Option<Value>)> {
+    let (path, query) = split_target(target);
+    let req = Request { method: method.into(), path, query, body, upgrade: false, stdin: Mutex::new(None) };
+    let mut w = BodyWriter::new(sink);
+    let reply = route(&req, &mut w)?;
+    Ok(match reply {
+        Reply::Json(c, v) => (c, Some(v)),
+        Reply::Text(c, t) => (c, Some(Value::String(t))),
+        Reply::Empty(c) => (c, None),
+        Reply::Streamed | Reply::Hijacked => (w.status, None),
     })
 }
 
@@ -1508,7 +1602,7 @@ fn labels_from(meta: &Value) -> BTreeMap<String, String> {
     meta.get("Labels").and_then(Value::as_object).map(|m| m.iter().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).collect()).unwrap_or_default()
 }
 
-fn labels_of(id: &str) -> BTreeMap<String, String> {
+pub(crate) fn labels_of(id: &str) -> BTreeMap<String, String> {
     let mut labels = labels_from(&meta_of(id));
     // `docker run --label k=v` keeps them in the container's own config
     if let Some(c) = registry::find(id).ok().and_then(|e| e.config) {

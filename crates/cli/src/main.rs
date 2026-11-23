@@ -2,6 +2,8 @@ mod api;
 mod commands;
 mod compose;
 mod emulation;
+mod extra;
+mod format;
 mod swarm;
 mod vm;
 
@@ -9,12 +11,39 @@ use docker_core::cli::{self, Command};
 use docker_core::platform;
 use std::{error::Error, process::ExitCode};
 
+/// `docker --help`, `docker help`, `docker run --help`, `docker --version`: print and stop.
+fn help(args: &[String]) -> Option<ExitCode> {
+    let flag = |a: &String| a == "--help" || a == "-h";
+    let wants_help = args.first().is_some_and(|a| flag(a) || a == "help") || (args.len() >= 2 && args.len() <= 3 && args.last().is_some_and(flag));
+    if args.first().is_some_and(|a| a == "--version" || a == "-v") {
+        println!("Docker version {}, build sasta (compatible with Docker Engine API 1.43)", env!("CARGO_PKG_VERSION"));
+        return Some(ExitCode::SUCCESS);
+    }
+    if !wants_help {
+        return None;
+    }
+    let verb = args.iter().find(|a| !flag(a) && *a != "help");
+    // the usage lines of that command, or everything
+    let lines: Vec<&str> = cli::USAGE.lines().filter(|l| verb.is_some_and(|v| l.trim_start().starts_with(&format!("docker {v}")) || l.trim_start().starts_with('-') && v == "run")).collect();
+    if lines.is_empty() {
+        println!("{}", cli::USAGE);
+    } else {
+        println!("Usage:\n{}", lines.join("\n"));
+    }
+    Some(ExitCode::SUCCESS)
+}
+
 /// Commands that end with the container's own exit code.
 fn exit_with(r: Result<i32, Box<dyn Error>>) -> Result<ExitCode, Box<dyn Error>> {
     r.map(|c| ExitCode::from(c as u8))
 }
 
 fn main() -> ExitCode {
+    // `docker logs x | head`: die quietly when the reader goes away (Rust ignores SIGPIPE, which turns it into a panic)
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     // `docker rm -f a b c`: Docker takes several names at once; run the command once for each
     let mut code = ExitCode::SUCCESS;
     for args in cli::split_multi(std::env::args().skip(1).collect()) {
@@ -41,6 +70,22 @@ fn run(mut args: Vec<String>) -> ExitCode {
         args.remove(0);
         docker_core::registry::set_rootless(true);
     }
+    // Windows without WSL2: keep working in native mode instead of failing on every command
+    let fallback = if native { None } else { vm::native_reason() };
+    if let Some(code) = help(&args) {
+        return code;
+    }
+    // commands with Docker's full set of options and `--format` (ps, images, inspect, logs, exec, info, events, ...)
+    if extra::handles(&args) {
+        let r = if !cfg!(target_os = "linux") && !native && fallback.is_none() { vm::forward_args(args) } else { extra::run(args) };
+        return match r {
+            Ok(code) => ExitCode::from(code as u8),
+            Err(e) => {
+                eprintln!("docker: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let cmd = match cli::parse(args) {
         Ok(c) => c,
         Err(e) => {
@@ -49,8 +94,6 @@ fn run(mut args: Vec<String>) -> ExitCode {
         }
     };
     let ok = |r: Result<(), Box<dyn Error>>| r.map(|()| ExitCode::SUCCESS);
-    // Windows without WSL2: keep working in native mode instead of failing on every command
-    let fallback = if native { None } else { vm::native_reason() };
     let result = match cmd {
         Command::Vm(v) => ok(vm::manage(&v)),
         Command::Version => ok(commands::version()),
@@ -63,9 +106,9 @@ fn run(mut args: Vec<String>) -> ExitCode {
             fallback.as_deref().unwrap_or("--native was given")
         )
         .into()),
-        Command::Run(cfg) => {
+        Command::Run(mut cfg) => {
             if cfg!(target_os = "linux")
-                && let Err(e) = commands::ensure_image(&cfg.target)
+                && let Err(e) = commands::prepare_run(&mut cfg)
             {
                 eprintln!("docker: {e}");
                 return ExitCode::FAILURE;
@@ -89,7 +132,7 @@ fn run(mut args: Vec<String>) -> ExitCode {
         Command::Cp { src, dst } => ok(commands::cp(&src, &dst)),
         Command::Volume(v) => ok(commands::volume(&v)),
         Command::Network(n) => ok(commands::network(&n)),
-        Command::Compose(c) => ok(compose::run(&c)),
+        Command::Compose(c) => exit_with(compose::run(&c)),
         Command::Daemon { host } => ok(api::serve(host.as_deref())),
         Command::SystemDf => ok(commands::system_df()),
         Command::ContainerPrune => ok(commands::container_prune()),

@@ -40,7 +40,7 @@ $ver = D version
 Check 'version shows client and VM' (($ver -match 'Client: Sasta Docker.*windows') -and ($ver -match 'VM:\s+Sasta Docker.*linux'))
 
 "== commands forwarded to the VM"
-Check 'images lists the VM store' ((D images) -match 'alpine:latest')
+Check 'images lists the VM store' ((D images) -match 'alpine\s+latest')
 Check 'run prints container output' ((D run --network none alpine echo hello-from-vm) -match 'hello-from-vm')
 & $docker run --network none alpine sh -c 'exit 7' 2>&1 | Out-Null
 Check 'container exit code reaches PowerShell (7)' ($LASTEXITCODE -eq 7)
@@ -53,7 +53,7 @@ Check 'missing image fails non-zero' ($LASTEXITCODE -ne 0)
 $id = (D run -d --network none --name winweb alpine sh -c 'echo started; sleep 120').Trim()
 Check 'run -d prints an id' ($id.Length -ge 12)
 Start-Sleep 1
-Check 'ps lists it as Up' ((D ps) -match 'winweb.*Up')
+Check 'ps lists it as Up' ((D ps) -match 'Up.*winweb')
 Check 'logs reads container output' ((D logs winweb) -match 'started')
 Check 'exec runs inside the container' ((D exec winweb hostname) -match 'container')
 Check 'stop + rm work' (((D stop winweb) -match 'winweb') -and ((D rm winweb) -match 'winweb') -and -not ((D ps -a) -match 'winweb'))

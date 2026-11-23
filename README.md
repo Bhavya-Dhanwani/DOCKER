@@ -21,12 +21,12 @@ The command is the same everywhere: `docker run`, `docker compose up`, `docker b
 ## What it can do
 
 **Containers**
-- `run` (`-d`, `-it`, `--name`, `-e`, `--env-file`, `-v` (also anonymous `-v /data`), `--mount`, `-p`, `--network`, `--hostname`/`-h`, `--add-host` (including `host-gateway`), `--mem`, `--cpu`, `--procs`, `--restart`, `--rm`, `--entrypoint`, `-w`, `-u`, `--health-*`, `--cap-add/--cap-drop`, `--security-opt`, `--privileged`, `--label`, `--dns`, `--init`, `--read-only`, `--ulimit`, `--tmpfs`, `--shm-size`, `--cpus`). A few flags that only matter on a real orchestrator (`--log-driver`, `--stop-timeout`, `--stop-signal`, `--memory-swap`, `--ipc`, `--pid`, `--pull`, `--platform`, `--oom-kill-disable`) are accepted with a warning instead of failing.
+- `run` (`-d`, `-it`, `--name`, `-e`, `--env-file`, `-v` (also anonymous `-v /data`), `--mount`, `-p`, `-P`, `--network`, `--hostname`/`-h`, `--add-host` (including `host-gateway`), `--mem`, `--cpus`, `--pids-limit`, `--restart`, `--rm`, `--entrypoint`, `-w`, `-u`, `--health-*`, `--cap-add/--cap-drop`, `--security-opt`, `--privileged`, `--label`, `--dns`, `--init`, `--read-only`, `--ulimit`, `--tmpfs`, `--shm-size`, `--volumes-from`, `--stop-signal`, `--stop-timeout`, `--pull`, `--platform`). Options that only tune resources or logging (`--log-driver`, `--memory-swap`, `--oom-kill-disable`, `--cpu-shares`, ...) are accepted and ignored; options this engine cannot honour (`--ipc`, `--pid`, `--device`, `--gpus`, `--sysctl`, `--link`, ...) are accepted with a warning
+- `ps`, `images`, `inspect`, `logs`, `exec` take Docker's options and look like Docker's output: `ps -a -q -n --filter name=/status=/label=/ancestor= --no-trunc --format '{{.Names}}'` (Go templates, `table ...`, `json`), `images -q --filter reference=* --digests --format`, `inspect --format '{{.State.Running}}'` (Docker-shaped JSON, for containers, images, volumes and networks), `logs --tail N -f`, `exec -e -w -u -d`
+- More commands: `info`, `events` (with `--filter` and `--format`), `create`, `diff`, `commit`, `export`, `import`, `port`, `attach`, `stop -s`, `kill -s`, `system prune`, `network prune`, `builder prune`, `manifest inspect`, `context ls`, `version --format`, and `--help` / `--version`. `diff`, `commit` and `export` need a running container (writes live in RAM and are gone at exit)
 - `rm`, `stop`, `start`, `restart`, `kill`, `pause`, `unpause` and `rmi` take several names (`docker rm -f a b c`). Anonymous volumes (`-v /data`) are removed together with the container when it was started with `--rm`
 - Like Docker, containers get `HOME` and `PATH`, `/tmp` is ordinary container storage with no small size limit, and on Windows your own environment variables reach `${VAR}` in compose files and `-e VAR`
-- `exec` (also `-it`), `logs [-f]`, `ps [-a]`, `inspect`, `stop`, `start`, `restart`, `kill`, `pause`, `unpause`, `wait`, `top`, `rename`, `rm [-f]`, `cp`, `stats`
-- `update --mem/--cpu/--procs` changes the limits of a running container
-- Restart policies (`no`, `always`, `unless-stopped`, `on-failure[:n]`) and healthchecks
+- `wait`, `top`, `rename`, `rm [-f]`, `cp`, `stats`, `update --mem/--cpu/--procs`, restart policies (`no`, `always`, `unless-stopped`, `on-failure[:n]`) and healthchecks
 
 **Images**
 - `pull` from Docker Hub and other registries, `push`, `login`/`logout`, `tag`, `images`, `rmi`, `save`/`load`, `prune`
@@ -46,7 +46,9 @@ The command is the same everywhere: `docker run`, `docker compose up`, `docker b
 - Named volumes and bind mounts: `volume create|ls|rm|inspect|prune`, `network create|ls|rm|inspect`
 
 **Swarm-lite (single node)**
-- `swarm init|leave|status`, `service create|ls|ps|inspect|logs|scale|update|rm` with replicas, restart conditions and rolling updates, `stack deploy|ls|ps|services|rm` from a compose file (`deploy:` honoured), round-robin load balancing of published ports across replicas
+- `swarm init|leave|status`, `service create|ls|ps|inspect|logs|scale|update|rollback|rm` with replicas, restart conditions and rolling updates, `stack deploy|ls|ps|services|rm|config` from a compose file (`deploy:` honoured), round-robin load balancing of published ports across replicas
+- `node ls|inspect|ps|update` (this machine is the one node; `--availability drain` stops its tasks), `secret` and `config` (`create|ls|inspect|rm`, mounted into replicas with `--secret`/`--config`, `/run/secrets/<name>`), service options such as `--user`, `--label`, `--mount`, `--limit-memory`, `--limit-cpu`, `--env-file`, `--mode`
+- Not supported: more than one node (`swarm join`). A swarm that spans machines needs networking between them and cannot be tested on one PC
 
 **Rootless mode (Linux)**
 - `docker --rootless ...`, selected automatically when not running as root: user namespaces (full uid/gid mapping with `newuidmap`, or a single-uid fallback), its own layer store, networking through `slirp4netns` or `pasta` (or `--network none|host`), cgroup limits when a delegated cgroup exists
@@ -55,7 +57,8 @@ The command is the same everywhere: `docker run`, `docker compose up`, `docker b
 - User-defined networks (`network create`, `run --network <name> --name <svc>`, `-p`, compose): without root there is no bridge, so all containers of a network share one network namespace. They reach each other by name (every name points at `127.0.0.1`) and share one set of ports, so two containers cannot both listen on port 80. Needs `slirp4netns`
 
 **Compose**
-- `docker compose up|down|ps|logs|config|build` with services, networks, volumes, `depends_on` and healthchecks
+- `docker compose up|down|ps|logs|config|build|exec|run|stop|start|restart|kill|pause|unpause|rm|pull|push|top|port|images|ls|cp|events|create|version`, with `up -d <services>`, `--build`, `--no-start`, `--force-recreate`, `--remove-orphans`, `--wait`, `--abort-on-container-exit`, `run --rm -e -v -p --entrypoint`, `down -v --rmi`, `logs --tail -f --no-log-prefix`, `ps --format/--status/-q/--services`, `config --services/--volumes/--format json`
+- Several `-f` files and the automatic `docker-compose.override.yml`, `--profile` and `profiles:`, `--env-file`, `--project-directory`, `COMPOSE_PROJECT_NAME`, `secrets:` and `configs:` (file, environment or content), compose labels on every container (`docker ps --filter label=com.docker.compose.project=...`); services, networks, volumes, `depends_on` and healthchecks. `compose watch` is not supported
 - `env_file` (one or several files, `required: false`), `${VAR:-default}` and `.env`, `$$` escapes, YAML anchors and `<<` merge keys, long-form volumes (`type: bind`), anonymous volumes (`- /app/node_modules`), `hostname`, `extra_hosts`, `restart`, `container_name`, `command`/`entrypoint`, `build` with `context`/`dockerfile`/`args`
 - Tested on real projects: Node apps with MongoDB, Postgres, Redis and OpenResty; Bun, pnpm and Prisma builds; multi-stage frontend builds; 33 of 42 Dockerfiles and compose files from existing projects build as written (the rest need a `.env` file that is not in the folder, or fail on their own for reasons in the project, such as a missing `python`); `scripts/build-all-projects.ps1` builds every Dockerfile and compose file under a folder and prints one PASS/FAIL line each. Database data in named volumes survives `compose down` and `up`
 
@@ -139,6 +142,9 @@ cargo build --release -p docker-cli --target aarch64-unknown-linux-musl   # or x
 ## Testing
 - Unit tests for every crate: `cargo test --workspace`
 - End-to-end suites in `scripts/` (Linux, run as root, offline): containers, networking (TCP/UDP/IPv6/subnets), user-defined networks, builds (three suites), security, push and registry features, save/load, compose, terminals and healthchecks, Swarm-lite, Engine API, rootless (as an unprivileged user)
+- `scripts/e2e-compat.sh`: Docker's CLI options and `--format`, `info`, `events`, `create`, `diff`, `commit`, `export`, `import`, `port`, prune commands
+- `scripts/e2e-compose2.sh`: compose override files, profiles, `exec`, `run`, `stop`/`start`/`restart`/`kill`/`rm`, `ls`, `cp`, `down -v`
+- `scripts/e2e-swarm2.sh`: `node`, `secret`, `config`, `service rollback`, drain, `--secret`/`--config`
 - `scripts/e2e-flags.sh`: the `docker run` flags (`--dns`, `--read-only`, `--tmpfs`, `--ulimit`, `--init`, `--cpus`, `--label`, `--shm-size`) and anonymous volumes
 - `scripts/e2e-vm.ps1`: Windows to the Linux VM
 - `scripts/e2e-realcli.sh`: the real Docker CLI against our daemon (run, exec, `-it`, build, events, update and more)

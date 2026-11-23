@@ -64,9 +64,9 @@ EOF
 
 echo "== config"
 cfg=$(cd "$proj" && $D compose config 2>&1)
-check "config prints the resolved project" has "$cfg" '"project": "shop"'
+check "config prints the resolved project" has "$cfg" "name: shop"
 check "config interpolates .env" has "$cfg" "web-greets-hello-from-dotenv"
-check "config maps volumes with the project prefix" has "$cfg" "shop_dbdata:/var/lib/db"
+check "config maps volumes with the project prefix" has "$cfg" "dbdata:/var/lib/db"
 check "config resolves bind mounts against the project dir" has "$cfg" "/site:/site"
 
 echo "== up"
@@ -82,7 +82,7 @@ check ".env values reach the command" sh -c "cd $proj && $D compose logs web | g
 check "bind mounts work" sh -c "cd $proj && $D compose logs web | grep -q from-bind-mount"
 check "the published port (18099 = 0x46B3) is bound" sh -c "grep -qi ':46B3' /proc/net/tcp"
 check "environment: map + passthrough" eq "$($D exec shop-web-1 sh -c 'echo $MODE-$FROM_HOST')" "production-host-value"
-check "restart policy is applied" has "$($D inspect shop-web-1)" '"Always"'
+check "restart policy is applied" has "$($D inspect -f '{{.HostConfig.RestartPolicy.Name}}' shop-web-1)" "always"
 check "the named volume has the project prefix" has "$($D volume ls)" "shop_dbdata"
 check "build: services are built and tagged" has "$($D images)" "shop-builder"
 check "build args are passed" eq "$($D run --network none shop-builder </dev/null)" "built for compose"

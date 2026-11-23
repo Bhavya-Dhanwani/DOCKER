@@ -16,10 +16,10 @@ check() { d=$1; shift; if "$@" >/dev/null 2>&1; then echo "PASS $d"; else echo "
 has() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
 # wait up to $1 seconds for the command to succeed
 until_ok() { n=$1; shift; i=0; while [ $i -lt $n ]; do "$@" >/dev/null 2>&1 && return 0; sleep 1; i=$((i+1)); done; return 1; }
-replicas() { $D service ls | awk -v n="$1" '$1==n {print $3}'; }
+replicas() { $D service ls --format '{{.Name}} {{.Replicas}}' | awk -v n="$1" '$1==n {print $2}'; }
 want() { [ "$(replicas "$1")" = "$2" ]; }
 tasks() { $D ps | grep -c "$1\.[0-9]*\.[0-9a-f]\{6\}"; }
-env_of_all() { for c in $($D ps | awk -v n="$1" '$2 ~ "^"n {print $1}'); do $D exec "$c" sh -c 'echo $V'; done | sort | uniq -c | tr -s ' ' | tr '\n' ';'; }
+env_of_all() { for c in $($D ps --format '{{.ID}} {{.Names}}' | awk -v n="$1" '$2 ~ "^"n {print $1}'); do $D exec "$c" sh -c 'echo $V'; done | sort | uniq -c | tr -s ' ' | tr '\n' ';'; }
 get() { timeout 4 bash -c "exec 3<>/dev/tcp/127.0.0.1/$1; cat <&3" 2>/dev/null; }
 
 echo "== swarm"
@@ -34,7 +34,7 @@ echo "== service: replicas, healing, scale"
 check "create" has "$($D service create --name sl --replicas 3 alpine sleep 1000)" "sl"
 check "ls shows 3/3" until_ok 20 want sl 3/3
 check "tasks appear in docker ps with service names" sh -c "[ $(tasks sl) -eq 3 ]"
-victim=$($D ps | awk '$2 ~ /^sl\.2\./ {print $1}')
+victim=$($D ps --format '{{.ID}} {{.Names}}' | awk '$2 ~ /^sl\.2\./ {print $1}')
 $D kill "$victim" >/dev/null 2>&1
 check "killing a replica gets it replaced (back to 3/3, new id)" sh -c "sleep 3; $D service ls | grep -q '3/3' && ! $D ps | grep -q $victim"
 check "slot 2 exists again" sh -c "$D ps | grep -q 'sl\.2\.'"
@@ -66,7 +66,7 @@ $D service update -e V=two roll >/dev/null
 sleep 3
 mid=$(env_of_all roll)
 check "mid-update the replicas are mixed (one at a time)" sh -c "echo '$mid' | grep -q one && echo '$mid' | grep -q two"
-check "update converges: all V=two" until_ok 30 sh -c "[ \"\$(for c in \$($D ps | awk '\$2 ~ /^roll/ {print \$1}'); do $D exec \$c sh -c 'echo \$V'; done | grep -c two)\" = 3 ]"
+check "update converges: all V=two" until_ok 30 sh -c "[ \"\$(for c in \$($D ps --format '{{.ID}} {{.Names}}' | awk '\$2 ~ /^roll/ {print \$1}'); do $D exec \$c sh -c 'echo \$V'; done | grep -c two)\" = 3 ]"
 check "still 3/3 after the update" want roll 3/3
 $D service rm roll >/dev/null
 
@@ -111,11 +111,11 @@ check "stack ls" has "$($D stack ls)" "shop"
 check "stack services shows replicas" until_ok 20 sh -c "$D stack services shop | grep shop_web | grep -q '2/2'"
 check "db is 1/1" until_ok 20 want shop_db 1/1
 check "stack ps lists tasks" sh -c "$D stack ps shop | grep -c 'shop_' | grep -qv '^0'"
-check "deploy: resources.limits.memory is applied" has "$($D inspect $($D ps | awk '$2 ~ /^shop_web/ {print $1; exit}'))" '"mem_bytes": 67108864'
-check "service name is a DNS alias on the stack network" sh -c "$D exec \$($D ps | awk '\$2 ~ /^shop_web/ {print \$1; exit}') sh -c 'nc -w3 db 5432' | grep -q db-here"
+check "deploy: resources.limits.memory is applied" has "$($D inspect -f '{{.HostConfig.Memory}}' $($D ps --format '{{.ID}} {{.Names}}' | awk '$2 ~ /^shop_web/ {print $1; exit}'))" 67108864
+check "service name is a DNS alias on the stack network" sh -c "$D exec \$($D ps --format '{{.ID}} {{.Names}}' | awk '\$2 ~ /^shop_web/ {print \$1; exit}') sh -c 'nc -w3 db 5432' | grep -q db-here"
 sed -i 's/V: s1/V: s2/' "$work/stack.yml"
 check "redeploy updates" has "$($D stack deploy -c "$work/stack.yml" shop 2>&1)" "Updating service shop_web"
-check "redeploy rolls the new env out" until_ok 30 sh -c "[ \"\$($D exec \$($D ps | awk '\$2 ~ /^shop_web/ {print \$1}' | head -1) sh -c 'echo \$V')\" = s2 ] && [ \"\$($D exec \$($D ps | awk '\$2 ~ /^shop_web/ {print \$1}' | tail -1) sh -c 'echo \$V')\" = s2 ]"
+check "redeploy rolls the new env out" until_ok 30 sh -c "[ \"\$($D exec \$($D ps --format '{{.ID}} {{.Names}}' | awk '\$2 ~ /^shop_web/ {print \$1}' | head -1) sh -c 'echo \$V')\" = s2 ] && [ \"\$($D exec \$($D ps --format '{{.ID}} {{.Names}}' | awk '\$2 ~ /^shop_web/ {print \$1}' | tail -1) sh -c 'echo \$V')\" = s2 ]"
 check "stack rm removes services, tasks and network" sh -c "$D stack rm shop >/dev/null && [ $(tasks shop_) -eq 0 ] && ! $D network ls | grep -q shop_default && ! $D stack ls | grep -q shop"
 
 echo "== leave"

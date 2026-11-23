@@ -19,6 +19,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "compose_more.rs"]
+mod more;
+
 type Res<T = ()> = Result<T, Box<dyn Error>>;
 
 #[derive(Deserialize, Default)]
@@ -28,6 +31,8 @@ struct File {
     services: BTreeMap<String, Service>,
     volumes: BTreeMap<String, Value>,
     networks: BTreeMap<String, Value>,
+    secrets: BTreeMap<String, Value>,
+    configs: BTreeMap<String, Value>,
 }
 
 #[derive(Deserialize, Default)]
@@ -67,6 +72,11 @@ struct Service {
     user: Option<String>,
     /// Only read by `docker stack deploy` (see `stack_services`).
     deploy: Option<Value>,
+    /// `secrets:` / `configs:` of the service: names, or `{source, target}`; mounted read-only (`/run/secrets/<name>`, `/<name>`).
+    secrets: Option<Value>,
+    configs: Option<Value>,
+    /// The service only starts when one of these profiles is on (`--profile`, COMPOSE_PROFILES) or it is named.
+    profiles: Vec<String>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
 }
@@ -76,6 +86,10 @@ struct Project {
     name: String,
     dir: PathBuf,
     file: File,
+    /// The merged, interpolated document (what `compose config` prints).
+    raw: Value,
+    /// Profiles that are switched on.
+    profiles: Vec<String>,
 }
 
 fn find_file(arg: &Option<String>) -> Res<PathBuf> {
@@ -89,13 +103,16 @@ fn find_file(arg: &Option<String>) -> Res<PathBuf> {
         .ok_or_else(|| "no compose file found (compose.yaml, docker-compose.yml); use -f".into())
 }
 
-/// `${VAR}` / `${VAR:-default}` from the environment and a `.env` file next to the compose file.
-fn interpolate(text: &str, dir: &Path) -> String {
+/// `${VAR}` / `${VAR:-default}` from the environment, the `--env-file`s and a `.env` file next to the compose file.
+fn interpolate(text: &str, dir: &Path, env_files: &[PathBuf]) -> String {
     let mut vars: HashMap<String, String> = std::env::vars().collect();
-    if let Ok(env) = fs::read_to_string(dir.join(".env")) {
-        for l in env.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
-            if let Some((k, v)) = l.split_once('=') {
-                vars.entry(k.trim().to_string()).or_insert_with(|| v.trim().trim_matches(['"', '\'']).to_string());
+    let defaults = [dir.join(".env")];
+    for f in if env_files.is_empty() { &defaults[..] } else { env_files } {
+        if let Ok(env) = fs::read_to_string(f) {
+            for kv in docker_core::env::parse_env_file(&env) {
+                if let Some((k, v)) = kv.split_once('=') {
+                    vars.entry(k.trim().to_string()).or_insert_with(|| v.to_string());
+                }
             }
         }
     }
@@ -116,18 +133,87 @@ fn sanitize(s: &str) -> String {
     t.trim_start_matches(['_', '-']).to_string()
 }
 
+/// Merge a later compose file over an earlier one (`-f a.yml -f b.yml`, `docker-compose.override.yml`): mappings merge
+/// key by key, lists of things that add up (ports, volumes, env_file, ...) are combined, everything else is replaced.
+fn merge(base: Value, over: Value, key: &str) -> Value {
+    const ADDITIVE: &[&str] = &["ports", "expose", "volumes", "env_file", "dns", "dns_search", "extra_hosts", "cap_add", "cap_drop", "tmpfs", "profiles", "devices", "security_opt"];
+    match (base, over) {
+        (Value::Null, o) => o,
+        (b, Value::Null) => b,
+        (Value::Mapping(mut b), Value::Mapping(o)) => {
+            for (k, v) in o {
+                let name = scalar(&k).unwrap_or_default();
+                let merged = match b.remove(&k) {
+                    Some(old) => merge(old, v, &name),
+                    None => v,
+                };
+                b.insert(k, merged);
+            }
+            Value::Mapping(b)
+        }
+        (Value::Sequence(mut b), Value::Sequence(o)) if ADDITIVE.contains(&key) => {
+            // a later volume or port for the same target replaces the earlier one
+            let target = |v: &Value| match v {
+                Value::Mapping(_) => v.get("target").and_then(scalar),
+                other => scalar(other).map(|s| s.split(':').nth(1).map(String::from).unwrap_or(s)),
+            };
+            for item in o {
+                if key == "volumes" || key == "ports" {
+                    if let Some(t) = target(&item) {
+                        b.retain(|x| target(x).as_deref() != Some(t.as_str()));
+                    }
+                } else {
+                    b.retain(|x| *x != item);
+                }
+                b.push(item);
+            }
+            Value::Sequence(b)
+        }
+        (_, o) => o,
+    }
+}
+
+const DEFAULT_FILES: [&str; 4] = ["compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"];
+
 fn load(args: &ComposeArgs) -> Res<Project> {
     let path = find_file(&args.file)?;
     let abs = fs::canonicalize(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let dir = abs.parent().map(Path::to_path_buf).unwrap_or_default();
-    let text = interpolate(&fs::read_to_string(&abs)?, &dir);
-    // YAML anchors with merge keys (`<<: *defaults`) are common in real compose files
-    let mut doc: Value = serde_yaml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-    doc.apply_merge().map_err(|e| format!("{}: {e}", path.display()))?;
-    let file: File = serde_yaml::from_value(doc).map_err(|e| format!("{}: {e}", path.display()))?;
+    let dir = match &args.opts.project_dir {
+        Some(d) => fs::canonicalize(d).map_err(|e| format!("--project-directory {d}: {e}"))?,
+        None => abs.parent().map(Path::to_path_buf).unwrap_or_default(),
+    };
+    let mut files = vec![abs.clone()];
+    for f in &args.opts.more_files {
+        files.push(fs::canonicalize(f).map_err(|e| format!("{f}: {e}"))?);
+    }
+    // like Docker: next to a default-named file, `<name>.override.<ext>` is merged in automatically
+    if args.opts.more_files.is_empty()
+        && let Some(name) = abs.file_name().and_then(|n| n.to_str())
+        && DEFAULT_FILES.contains(&name)
+    {
+        let (stem, ext) = name.rsplit_once('.').unwrap_or((name, "yml"));
+        for e in [ext, if ext == "yml" { "yaml" } else { "yml" }] {
+            let ov = abs.with_file_name(format!("{stem}.override.{e}"));
+            if ov.is_file() {
+                files.push(ov);
+                break;
+            }
+        }
+    }
+    let env_files: Vec<PathBuf> = args.opts.env_files.iter().map(PathBuf::from).collect();
+    let mut raw = Value::Null;
+    for f in &files {
+        let text = interpolate(&fs::read_to_string(f).map_err(|e| format!("{}: {e}", f.display()))?, &dir, &env_files);
+        // YAML anchors with merge keys (`<<: *defaults`) are common in real compose files
+        let mut doc: Value = serde_yaml::from_str(&text).map_err(|e| format!("{}: {e}", f.display()))?;
+        doc.apply_merge().map_err(|e| format!("{}: {e}", f.display()))?;
+        raw = merge(raw, doc, "");
+    }
+    let file: File = serde_yaml::from_value(raw.clone()).map_err(|e| format!("{}: {e}", path.display()))?;
     let name = args
         .project
         .clone()
+        .or_else(|| std::env::var("COMPOSE_PROJECT_NAME").ok())
         .or_else(|| file.name.clone())
         .or_else(|| dir.file_name().map(|n| sanitize(&n.to_string_lossy())))
         .filter(|n| !n.is_empty())
@@ -135,7 +221,9 @@ fn load(args: &ComposeArgs) -> Res<Project> {
     if file.services.is_empty() {
         return Err("the compose file has no services".into());
     }
-    Ok(Project { name, dir, file })
+    let mut profiles = args.opts.profiles.clone();
+    profiles.extend(std::env::var("COMPOSE_PROFILES").unwrap_or_default().split(',').filter(|p| !p.is_empty()).map(String::from));
+    Ok(Project { name, dir, file, raw, profiles })
 }
 
 fn string_list(v: &Value) -> Vec<String> {
@@ -325,6 +413,52 @@ fn plan(p: &Project, name: &str, s: &Service) -> Res<Plan> {
         tmpfs: s.tmpfs.as_ref().map(string_list).unwrap_or_default(),
         ..Config::default()
     };
+    for (kind, list, top, root) in [("secrets", &s.secrets, &p.file.secrets, "/run/secrets/"), ("configs", &s.configs, &p.file.configs, "/")] {
+        for item in list.iter().flat_map(|l| match l {
+            Value::Sequence(seq) => seq.clone(),
+            other => vec![other.clone()],
+        }) {
+            let (src, target) = match &item {
+                Value::Mapping(_) => (item.get("source").and_then(scalar), item.get("target").and_then(scalar)),
+                other => (scalar(other), None),
+            };
+            let src = src.ok_or_else(|| format!("a {} entry needs a source", kind.trim_end_matches('s')))?;
+            let def = top.get(&src);
+            let inline = |data: &[u8]| -> Res<PathBuf> {
+                let dir = registry::data_dir().join("run").join(format!("compose-{}", p.name)).join(kind);
+                fs::create_dir_all(&dir)?;
+                fs::write(dir.join(&src), data)?;
+                Ok(dir.join(&src))
+            };
+            let file: PathBuf = if let Some(f) = def.and_then(|d| d.get("file")).and_then(scalar) {
+                clean_join(&p.dir, Path::new(&f))
+            } else if let Some(v) = def.and_then(|d| d.get("environment")).and_then(scalar).and_then(|var| std::env::var(&var).ok()) {
+                inline(v.as_bytes())?
+            } else if let Some(c) = def.and_then(|d| d.get("content")).and_then(scalar) {
+                inline(c.as_bytes())?
+            } else if let Some(path) = crate::swarm::object_path(kind, &src) {
+                path // `external: true`, or made with `docker secret create`
+            } else {
+                return Err(format!("{} {src} is not defined in the compose file and does not exist in the swarm", kind.trim_end_matches('s')).into());
+            };
+            let dest = match target {
+                Some(t) if t.starts_with('/') => t,
+                Some(t) => format!("{root}{t}"),
+                None => format!("{root}{src}"),
+            };
+            cfg.volumes.push(Volume { host: file.to_string_lossy().into_owned(), container: dest, ro: true });
+        }
+    }
+    // the labels Docker Compose puts on its containers: `docker ps --filter label=...` and `compose ls` find them by these
+    cfg.labels.splice(
+        0..0,
+        [
+            format!("com.docker.compose.project={}", p.name),
+            format!("com.docker.compose.service={name}"),
+            "com.docker.compose.container-number=1".to_string(),
+            "com.docker.compose.oneoff=False".to_string(),
+        ],
+    );
     if let Some(v) = &s.shm_size {
         cfg.shm_mb = Some(match v {
             Value::Number(n) => docker_core::cli::parse_size_mb(&n.to_string()),
@@ -456,13 +590,14 @@ fn order(plans: &BTreeMap<String, Plan>) -> Res<Vec<String>> {
 fn plans(p: &Project) -> Res<BTreeMap<String, Plan>> {
     for (name, s) in &p.file.services {
         // harmless for a local run: metadata, or behaviour that only matters on a real orchestrator
-        const IGNORED: &[&str] = &["stdin_open", "tty", "expose", "logging", "deploy", "init", "stop_grace_period", "platform", "pull_policy", "profiles", "container_labels"];
+        const IGNORED: &[&str] = &["stdin_open", "tty", "expose", "logging", "deploy", "init", "stop_grace_period", "platform", "pull_policy", "container_labels"];
         let unknown: Vec<&String> = s.extra.keys().filter(|k| !IGNORED.contains(&k.as_str()) && !k.starts_with("x-")).collect();
         if !unknown.is_empty() {
             eprintln!("warning: service {name}: ignoring unsupported keys: {}", unknown.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(", "));
         }
     }
-    p.file.services.iter().map(|(n, s)| Ok((n.clone(), plan(p, n, s).map_err(|e| format!("service {n}: {e}"))?))).collect()
+    let on = |s: &Service| s.profiles.is_empty() || s.profiles.iter().any(|x| p.profiles.contains(x));
+    p.file.services.iter().filter(|(_, s)| on(s)).map(|(n, s)| Ok((n.clone(), plan(p, n, s).map_err(|e| format!("service {n}: {e}"))?))).collect()
 }
 
 fn project_containers(p: &Project) -> Vec<docker_core::registry::Entry> {
@@ -503,51 +638,6 @@ fn ensure_image(store: &Store, plan: &Plan, build: bool) -> Res {
         commands::pull(&plan.cfg.target)?;
     }
     Ok(())
-}
-
-fn up(p: &Project, detach: bool, build: bool) -> Res {
-    let plans = plans(p)?;
-    let order = order(&plans)?;
-    let store = Store::open(registry::data_dir().join("store"));
-
-    // networks and volumes first
-    let mut nets: BTreeSet<String> = BTreeSet::from([format!("{}_default", p.name)]);
-    nets.extend(p.file.networks.keys().map(|n| format!("{}_{n}", p.name)));
-    for n in nets {
-        if !networks::exists(&n) {
-            networks::create(&n)?;
-            println!("Network {n} created");
-        }
-    }
-    for v in p.file.volumes.keys() {
-        volumes::create(&format!("{}_{v}", p.name))?;
-    }
-
-    for name in &order {
-        let pl = &plans[name];
-        ensure_image(&store, pl, build)?;
-        for (dep, healthy) in &pl.deps {
-            if *healthy {
-                println!("Waiting for {dep} to be healthy");
-                wait_healthy(&plans[dep].container, 120)?;
-            }
-        }
-        // replace an old container of the same name (like `up` does when the config changed)
-        if let Ok(old) = registry::find(&pl.container) {
-            if old.running() {
-                println!("Container {} is already running", pl.container);
-                continue;
-            }
-            registry::delete(&old.id);
-        }
-        print!("Container {} started: ", pl.container);
-        platform::run(&pl.cfg)?; // prints the container id
-    }
-    if detach {
-        return Ok(());
-    }
-    println!("Attached. Press Ctrl-C to stop watching (containers keep running; `docker compose down` removes them).");
-    follow(p, None, true)
 }
 
 fn read_new(path: &Path, offset: &mut u64) -> String {
@@ -600,79 +690,19 @@ fn follow(p: &Project, only: Option<&str>, follow: bool) -> Res {
     }
 }
 
-fn down(p: &Project, remove_volumes: bool) -> Res {
-    for e in project_containers(p) {
-        if e.running() || e.restarting {
-            commands::stop(e.label(), 10).or_else(|_| commands::kill(e.label()))?;
-        }
-        let _ = commands::rm(true, &e.id);
-        println!("Container {} removed", e.label());
-    }
-    for n in networks::list().into_iter().filter(|n| n.starts_with(&format!("{}_", p.name))) {
-        if networks::remove(&n).is_ok() {
-            println!("Network {n} removed");
-        }
-    }
-    if remove_volumes {
-        for v in p.file.volumes.keys() {
-            let name = format!("{}_{v}", p.name);
-            if volumes::remove(&name).is_ok() {
-                println!("Volume {name} removed");
-            }
-        }
-    }
-    Ok(())
-}
-
-fn ps(p: &Project) -> Res {
-    println!("{:<28} {:<14} {:<22} {:<24}", "NAME", "SERVICE", "STATUS", "PORTS");
-    let now = registry::now_unix();
-    for (svc, s) in &p.file.services {
-        let name = container_name(p, svc, s);
-        match registry::find(&name) {
-            Ok(e) => println!("{:<28} {:<14} {:<22} {:<24}", name, svc, commands::status_of(&e, now), e.ports.join(",")),
-            Err(_) => println!("{name:<28} {svc:<14} {:<22}", "not created"),
-        }
-    }
-    Ok(())
-}
-
-pub fn run(args: &ComposeArgs) -> Res {
-    let p = load(args)?;
-    match &args.sub {
-        ComposeSub::Up { detach, build } => up(&p, *detach, *build),
-        ComposeSub::Down { volumes } => down(&p, *volumes),
-        ComposeSub::Ps => ps(&p),
-        ComposeSub::Logs { follow: f, service } => follow(&p, service.as_deref(), *f),
-        ComposeSub::Build => {
-            let pl = plans(&p)?;
-            for pl in pl.values().filter(|x| x.build.is_some()) {
-                println!("Building {}", pl.service);
-                platform::build(pl.build.as_ref().expect("filtered"), &mut |l| println!("  {l}"))?;
-            }
-            Ok(())
-        }
-        ComposeSub::Config => {
-            let pl = plans(&p)?;
-            let out: BTreeMap<_, _> = pl
-                .iter()
-                .map(|(n, x)| {
-                    (
-                        n.clone(),
-                        serde_json::json!({
-                            "container": x.container, "image": x.cfg.target, "command": x.cfg.cmd, "entrypoint": x.cfg.entrypoint,
-                            "network": x.cfg.network_name, "ports": x.cfg.ports.iter().map(|p| format!("{}:{}", p.host, p.container)).collect::<Vec<_>>(),
-                            "environment": x.cfg.env, "volumes": x.cfg.volumes.iter().map(|v| format!("{}:{}", v.host, v.container)).collect::<Vec<_>>(),
-                            "restart": x.cfg.restart.to_arg(), "depends_on": x.deps.iter().map(|d| d.0.clone()).collect::<Vec<_>>(),
-                            "build": x.build.as_ref().map(|b| b.context.clone()),
-                        }),
-                    )
-                })
-                .collect();
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "project": p.name, "services": out }))?);
-            Ok(())
-        }
-    }
+/// Run one `docker compose` command (the implementation of every subcommand is in `compose_more.rs`).
+pub fn run(args: &ComposeArgs) -> Res<i32> {
+    let mut p = load(args)?;
+    let words: Vec<String> = match &args.sub {
+        ComposeSub::Raw(w) => w.clone(),
+        ComposeSub::Up { detach, build } => ["up"].into_iter().chain(detach.then_some("-d")).chain(build.then_some("--build")).map(String::from).collect(),
+        ComposeSub::Down { volumes } => ["down"].into_iter().chain(volumes.then_some("-v")).map(String::from).collect(),
+        ComposeSub::Ps => vec!["ps".into()],
+        ComposeSub::Logs { follow, service } => ["logs"].into_iter().chain(follow.then_some("-f")).map(String::from).chain(service.iter().cloned()).collect(),
+        ComposeSub::Build => vec!["build".into()],
+        ComposeSub::Config => vec!["config".into()],
+    };
+    more::run(&mut p, &words)
 }
 
 /// The `deploy:` section of a service, as far as single-node swarm uses it.
@@ -719,7 +749,7 @@ pub struct StackService {
 
 /// Load a compose file for `docker stack deploy`. `build:` is not supported (swarm services need an image).
 pub fn stack_services(file: &str, stack: &str) -> Res<Vec<StackService>> {
-    let p = load(&ComposeArgs { file: Some(file.into()), project: Some(stack.into()), sub: ComposeSub::Config })?;
+    let p = load(&ComposeArgs { file: Some(file.into()), project: Some(stack.into()), opts: Default::default(), sub: ComposeSub::Config })?;
     let mut out = vec![];
     for (name, s) in &p.file.services {
         let pl = plan(&p, name, s)?;
@@ -738,7 +768,7 @@ mod tests {
 
     #[test]
     fn double_dollar_is_a_literal_dollar() {
-        let out = interpolate("cmd: echo $$HOME ${SASTA_UNSET_VAR_X:-dflt}\n", Path::new("/nonexistent"));
+        let out = interpolate("cmd: echo $$HOME ${SASTA_UNSET_VAR_X:-dflt}\n", Path::new("/nonexistent"), &[]);
         assert_eq!(out, "cmd: echo $HOME dflt");
     }
 
@@ -775,7 +805,7 @@ mod tests {
     }
 
     fn project(yaml: &str) -> Project {
-        Project { name: "demo".into(), dir: PathBuf::from("/proj"), file: serde_yaml::from_str(yaml).unwrap() }
+        Project { name: "demo".into(), dir: PathBuf::from("/proj"), file: serde_yaml::from_str(yaml).unwrap(), raw: Value::Null, profiles: vec![] }
     }
 
     fn one(yaml: &str, svc: &str) -> Plan {
@@ -862,7 +892,7 @@ volumes: {data: {}}
         fs::create_dir_all(&dir).unwrap();
         // unlikely names: a variable that is already set in the environment wins over .env (as in Docker)
         fs::write(dir.join(".env"), "RD_TEST_TAG=1.25\n# c\nRD_TEST_NAME=\"quoted\"\n").unwrap();
-        let out = interpolate("image: nginx:${RD_TEST_TAG}\nn: ${RD_TEST_NAME}\nd: ${RD_TEST_MISSING:-dflt}\n# ${RD_TEST_TAG} stays in comments", &dir);
+        let out = interpolate("image: nginx:${RD_TEST_TAG}\nn: ${RD_TEST_NAME}\nd: ${RD_TEST_MISSING:-dflt}\n# ${RD_TEST_TAG} stays in comments", &dir, &[]);
         assert_eq!(out, "image: nginx:1.25\nn: quoted\nd: dflt\n# ${RD_TEST_TAG} stays in comments");
         assert_eq!(sanitize("My App_2!"), "myapp_2");
         assert_eq!(mem_mb(&Value::String("512m".into())).unwrap(), 512);

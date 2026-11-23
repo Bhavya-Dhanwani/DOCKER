@@ -38,7 +38,7 @@ check "layers are in the rootless flavour" test -d "$RH/store/layers-rootless"
 check "root-engine layer dir was not touched" test ! -d "$RH/store/layers"
 out=$(dk run alpine sh -c 'echo data > /tmp/f; cat /tmp/f'); check "write a file in the container" eq "$out" data
 out=$(dk run alpine sh -c 'echo data > /etc/changed; cat /etc/changed'); check "write on the overlay root" eq "$out" data
-check "container root is the unprivileged user on the host" has "$(dk run -d alpine sleep 30 >/tmp/rl.id; ps -o user= -p $(rl "$BIN" inspect $(cat /tmp/rl.id) 2>/dev/null | sed -n 's/.*"pid": *\([0-9]*\).*/\1/p' | head -1))" $U
+check "container root is the unprivileged user on the host" has "$(dk run -d alpine sleep 30 >/tmp/rl.id; ps -o user= -p $(rl "$BIN" inspect -f '{{.State.Pid}}' $(cat /tmp/rl.id) 2>/dev/null))" $U
 dk stop $(cat /tmp/rl.id) >/dev/null 2>&1; dk rm $(cat /tmp/rl.id) >/dev/null 2>&1
 check "uid inside is 0" eq "$(dk run alpine id -u)" 0
 check "full map: two lines in uid_map" eq "$(dk run alpine sh -c 'wc -l < /proc/self/uid_map')" 2

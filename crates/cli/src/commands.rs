@@ -51,6 +51,53 @@ pub fn ensure_image(name: &str) -> Res {
     pull_inner(name, None, true)
 }
 
+/// Everything `docker run` does before it starts the container: fetch the image (`--pull`, `--platform`), publish the
+/// ports the image exposes (`-P`) and take over the volumes of other containers (`--volumes-from`).
+pub fn prepare_run(cfg: &mut docker_core::cli::Config) -> Res {
+    let target = cfg.target.clone();
+    let is_image = !std::path::Path::new(&target).is_dir() && Reference::parse(&target).is_ok();
+    if is_image {
+        let present = store().get(&Reference::parse(&target)?)?.is_some();
+        let host = format!("linux/{}", match std::env::consts::ARCH { "aarch64" => "arm64", "x86_64" => "amd64", other => other });
+        let other_platform = cfg.platform.as_ref().filter(|p| **p != host).cloned();
+        match (cfg.pull.as_deref(), present) {
+            (Some("never"), false) => return Err(format!("Unable to find image '{target}' locally (--pull never)").into()),
+            (Some("always"), _) | (_, false) if other_platform.is_some() => {
+                eprintln!("Pulling {target} for {}", other_platform.as_deref().unwrap_or(""));
+                pull_inner(&target, other_platform.as_deref(), true)?;
+            }
+            (Some("always"), _) => {
+                eprintln!("Pulling {target}");
+                pull_inner(&target, None, true)?;
+            }
+            (_, false) => ensure_image(&target)?,
+            _ => {}
+        }
+    }
+    if cfg.publish_all && is_image {
+        let meta = store().get(&Reference::parse(&target)?)?;
+        for spec in meta.iter().flat_map(|m| m.exposed.iter()) {
+            let (port, proto) = spec.split_once('/').unwrap_or((spec, "tcp"));
+            let Ok(container) = port.parse::<u16>() else { continue };
+            let udp = proto == "udp";
+            if cfg.ports.iter().any(|p| p.container == container && p.udp == udp) {
+                continue;
+            }
+            let free = std::net::TcpListener::bind(("0.0.0.0", 0))?.local_addr()?.port();
+            cfg.ports.push(docker_core::cli::Port { host_ip: None, host: free, container, udp });
+        }
+    }
+    for from in cfg.volumes_from.clone() {
+        let e = registry::find(&from)?;
+        for v in e.config.iter().flat_map(|c| c.volumes.iter()) {
+            if !cfg.volumes.iter().any(|x| x.container == v.container) {
+                cfg.volumes.push(v.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn pull_inner(name: &str, platform: Option<&str>, to_stderr: bool) -> Res {
     let say = |s: &str| if to_stderr { eprintln!("{s}") } else { println!("{s}") };
     let r = Reference::parse(name)?;
@@ -314,12 +361,23 @@ fn stop_signal_of(e: &Entry) -> i32 {
 }
 
 pub fn stop(q: &str, timeout: u64) -> Res {
+    stop_with(q, timeout, None)
+}
+
+/// `stop` with a signal of the caller's choosing (`docker stop -s`); otherwise `--stop-signal` of the container, the
+/// image's STOPSIGNAL, SIGTERM. The container's own `--stop-timeout` replaces the default 10 seconds.
+pub fn stop_with(q: &str, timeout: u64, signal: Option<i32>) -> Res {
     if cancel_restart(q)?.is_some() {
         return Ok(());
     }
     let e = running(q)?;
+    let own = e.config.as_ref();
+    let timeout = if timeout == 10 { own.and_then(|c| c.stop_timeout).unwrap_or(10) } else { timeout };
+    let sig = signal
+        .or_else(|| own.and_then(|c| c.stop_signal.as_deref()).and_then(docker_image::dockerfile::parse_signal))
+        .unwrap_or_else(|| stop_signal_of(&e));
     registry::request_stop(&e.id)?; // a restart policy must not revive it
-    let _ = platform::signal(&e, stop_signal_of(&e));
+    let _ = platform::signal(&e, sig);
     wait_until_gone(&e, timeout * 10);
     if e.running() {
         platform::stop(&e.id)?;

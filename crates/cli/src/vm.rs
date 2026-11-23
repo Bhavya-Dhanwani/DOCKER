@@ -145,6 +145,52 @@ pub fn forward(cmd: Command) -> Res<i32> {
     Ok(status.code().unwrap_or(1))
 }
 
+/// Forward raw arguments (the commands `extra` handles) into the VM, translating the host paths of the options that take one.
+pub fn forward_args(args: Vec<String>) -> Res<i32> {
+    let d = driver(None)?;
+    let args = translate_raw(&d, args)?;
+    ensure_up(&d)?;
+    let argv = d.docker_argv(&args);
+    let mut p = proc(&argv);
+    if matches!(d, Driver::Wsl { .. }) {
+        p.env("WSLENV", wslenv(std::env::vars().map(|(k, _)| k), std::env::var("WSLENV").ok().as_deref()));
+    }
+    let status = p.status().map_err(|e| format!("cannot run {}: {e}", argv[0]))?;
+    Ok(status.code().unwrap_or(1))
+}
+
+/// `-v C:\data:/data`, `--env-file x.env`, `-o out.tar` (export), `import file.tar`: the VM sees these files under another path.
+fn translate_raw(d: &Driver, mut a: Vec<String>) -> Res<Vec<String>> {
+    let importing = a.first().is_some_and(|w| w == "import") || (a.len() > 1 && a[0] == "image" && a[1] == "import");
+    let mut i = 0;
+    let mut first_positional_done = !importing;
+    while i < a.len() {
+        match a[i].as_str() {
+            "-v" | "--volume" if i + 1 < a.len() => {
+                if let Ok(v) = docker_core::cli::Volume::parse(&a[i + 1])
+                    && !v.is_named()
+                {
+                    a[i + 1] = docker_core::cli::Volume { host: d.path(&v.host)?, ..v }.to_arg();
+                }
+                i += 1;
+            }
+            "--env-file" | "-o" | "--output" if i + 1 < a.len() => {
+                a[i + 1] = d.path(&a[i + 1])?;
+                i += 1;
+            }
+            x if !first_positional_done && !x.starts_with('-') && x != "image" && x != "import" => {
+                if std::path::Path::new(x).is_file() {
+                    a[i] = d.path(x)?;
+                }
+                first_positional_done = true;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    Ok(a)
+}
+
 /// Windows variables the forwarded command gets to see (`${TOKEN}` in a compose file, `docker run -e TOKEN`),
 /// like Docker on Windows. System variables that mean something else on Linux stay behind.
 fn wslenv(names: impl Iterator<Item = String>, existing: Option<&str>) -> String {

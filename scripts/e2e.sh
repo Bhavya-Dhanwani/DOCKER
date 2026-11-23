@@ -40,7 +40,7 @@ check "exec: sees container processes" has "$($D exec web ps)" "sleep 60"
 check "exec: inherits env" eq "$($D exec web sh -c 'echo $FOO')" bar
 check "exec: sees the volume" eq "$($D exec web cat /data/a)" seed
 check "exec: exit code propagates" sh -c "$D exec web sh -c 'exit 5'; test \$? -eq 5"
-check "id prefix works" has "$($D inspect "$(echo "$id" | cut -c1-8)")" "\"name\": \"web\""
+check "id prefix works" has "$($D inspect -f '{{.Name}}' "$(echo "$id" | cut -c1-8)")" "/web"
 check "rm refuses a running container" sh -c "! $D rm web"
 $D stop web >/dev/null
 sleep 1

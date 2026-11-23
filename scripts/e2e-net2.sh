@@ -20,7 +20,7 @@ mkdir -p "$RUST_DOCKER_HOME" && cp -r "$SRC" "$RUST_DOCKER_HOME/store"
 fail=0
 check() { d=$1; shift; if "$@" >/dev/null 2>&1; then echo "PASS $d"; else echo "FAIL $d"; fail=$((fail+1)); fi; }
 has() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
-ipof() { $D inspect "$1" | sed -n 's/.*"ip": "\([0-9.]*\)".*/\1/p'; }
+ipof() { $D inspect -f '{{.NetworkSettings.IPAddress}}' "$1"; }
 # udp <host> <port> <payload>: send one datagram, print the reply (empty if none within 4s)
 udp() { python3 -c '
 import socket, sys
@@ -50,7 +50,7 @@ ps=$($D ps)
 check "ps shows the udp mapping" has "$ps" "15353->53/udp"
 check "ps shows the host-ip mapping" has "$ps" "127.0.0.1:18082->80"
 check "ps shows every port of a range" sh -c "echo '$ps' | grep -q '18100->8000' && echo '$ps' | grep -q '18102->8002'"
-check "inspect records the udp port" has "$($D inspect u)" "15353->53/udp"
+check "inspect records the udp port" has "$($D inspect -f '{{json .HostConfig.PortBindings}}' u)" "53/udp"
 if command -v python3 >/dev/null 2>&1; then
   # udp: the datagram reaches the container, and a reply comes back through the same published port
   udp 127.0.0.1 15353 hello-udp >/dev/null

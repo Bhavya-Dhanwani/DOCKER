@@ -79,6 +79,13 @@ pub fn set_digest(store: &Store, r: &Reference, digest: &str) {
 }
 
 /// Docker-style `inspect` document for an image.
+/// `docker manifest inspect <image>`: the manifest (or manifest list) of an image in its registry, as served.
+pub fn manifest_inspect(store: &Store, r: &Reference) -> Result<Value> {
+    let creds = crate::auth::load(store.root(), &r.registry);
+    let client = crate::remote::Client::connect(r, &store.tmp_dir(), creds.as_ref(), false)?;
+    client.raw_manifest(&r.tag)
+}
+
 pub fn inspect(store: &Store, r: &Reference) -> Result<Value> {
     let meta = store.get(r)?.ok_or_else(|| err(format!("no such image: {}", r.display())))?;
     let i = load(store, r);

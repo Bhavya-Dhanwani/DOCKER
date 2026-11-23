@@ -156,11 +156,25 @@ pub enum Network {
 pub struct ComposeArgs {
     pub file: Option<String>,
     pub project: Option<String>,
+    pub opts: ComposeOpts,
     pub sub: ComposeSub,
+}
+
+/// The rest of `docker compose`'s global options.
+#[derive(Debug, PartialEq, Eq, Default, Clone)]
+pub struct ComposeOpts {
+    /// `-f` given a second, third ... time: later files override earlier ones.
+    pub more_files: Vec<String>,
+    pub profiles: Vec<String>,
+    pub env_files: Vec<String>,
+    pub project_dir: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ComposeSub {
+    /// Every other subcommand and every option the simple forms below do not take: the words as typed
+    /// (`exec web sh`, `up --force-recreate web`, `stop`, `run --rm web ...`).
+    Raw(Vec<String>),
     Up { detach: bool, build: bool },
     Down { volumes: bool },
     Ps,
@@ -255,7 +269,7 @@ pub enum Password {
 }
 
 /// `docker build` arguments.
-#[derive(Debug, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BuildArgs {
     pub tag: String,
     pub file: Option<String>,
@@ -369,6 +383,16 @@ pub struct Config {
     pub tmpfs: Vec<String>,
     /// `--shm-size`, in MB (default 64).
     pub shm_mb: Option<u64>,
+    /// `--stop-signal` / `--stop-timeout`: what `docker stop` sends first, and how long it waits.
+    pub stop_signal: Option<String>,
+    pub stop_timeout: Option<u64>,
+    /// `--pull always|missing|never`, `--platform os/arch` (only `docker run` looks at these).
+    pub pull: Option<String>,
+    pub platform: Option<String>,
+    /// `-P`: publish every port the image EXPOSEs on a random host port.
+    pub publish_all: bool,
+    /// `--volumes-from <container>`.
+    pub volumes_from: Vec<String>,
     pub cap_add: Vec<String>,
     pub cap_drop: Vec<String>,
     pub security_opt: Vec<String>,
@@ -604,7 +628,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command> {
         Some("pull") => parse_pull(rest),
         Some("rmi") => flags_then_one(rest, &[], "image").map(|(_, v)| Command::Rmi(v)),
         Some("images") => only_flags(rest, &[]).map(|_| Command::Images),
-        Some(g @ ("swarm" | "service" | "stack")) => Ok(Command::Swarm([vec![g.to_string()], rest].concat())),
+        Some(g @ ("swarm" | "service" | "stack" | "node" | "secret" | "config")) => Ok(Command::Swarm([vec![g.to_string()], rest].concat())),
         Some("search") => flags_then_one(rest, &[], "term").map(|(_, v)| Command::Search(v)),
         Some("emulation") => match rest.as_slice() {
             [w] if matches!(w.as_str(), "enable" | "disable" | "status") => Ok(Command::Emulation(w.clone())),
@@ -715,9 +739,18 @@ fn timeout_and_id(args: Vec<String>) -> Result<(u64, String)> {
 fn parse_compose(args: Vec<String>) -> Result<ComposeArgs> {
     let mut it = args.into_iter().peekable();
     let (mut file, mut project) = (None, None);
+    let mut opts = ComposeOpts::default();
     while let Some(f) = it.next_if(|a| a.starts_with('-')) {
         match f.as_str() {
-            "-f" | "--file" => file = Some(it.next().ok_or_else(|| usage("-f needs a file"))?),
+            "-f" | "--file" => {
+                let name = it.next().ok_or_else(|| usage("-f needs a file"))?;
+                if file.is_none() { file = Some(name) } else { opts.more_files.push(name) }
+            }
+            "--profile" => opts.profiles.push(it.next().ok_or_else(|| usage("--profile needs a name"))?),
+            "--env-file" => opts.env_files.push(it.next().ok_or_else(|| usage("--env-file needs a file"))?),
+            "--project-directory" => opts.project_dir = Some(it.next().ok_or_else(|| usage("--project-directory needs a path"))?),
+            "--ansi" | "--progress" | "--parallel" => drop(it.next()), // accepted, no effect here
+            "--dry-run" | "--compatibility" | "--verbose" => {}
             "-p" | "--project-name" => {
                 let n = it.next().ok_or_else(|| usage("-p needs a project name"))?;
                 if !is_volume_name(&n) {
@@ -734,7 +767,9 @@ fn parse_compose(args: Vec<String>) -> Result<ComposeArgs> {
         rest.iter().try_for_each(|a| if allowed.contains(&a.as_str()) { Ok(()) } else { Err(usage(&format!("unexpected argument {a}"))) })?;
         Ok(rest.clone())
     };
-    let sub = match sub.as_str() {
+    let raw: Vec<String> = std::iter::once(sub.clone()).chain(rest.iter().cloned()).collect();
+    let simple = (|| -> Result<ComposeSub> {
+        Ok(match sub.as_str() {
         "up" => {
             let f = flags(&["-d", "--detach", "--build"])?;
             ComposeSub::Up { detach: f.iter().any(|a| a == "-d" || a == "--detach"), build: f.iter().any(|a| a == "--build") }
@@ -761,8 +796,11 @@ fn parse_compose(args: Vec<String>) -> Result<ComposeArgs> {
             ComposeSub::Logs { follow, service: names.first().map(|s| s.to_string()) }
         }
         other => return Err(usage(&format!("unknown compose command {other:?}"))),
-    };
-    Ok(ComposeArgs { file, project, sub })
+        })
+    })();
+    // anything the simple forms do not cover is handled by the full implementation
+    let sub = simple.unwrap_or(ComposeSub::Raw(raw));
+    Ok(ComposeArgs { file, project, opts, sub })
 }
 
 fn parse_network(args: Vec<String>) -> Result<NetCmd> {
@@ -957,6 +995,7 @@ const RUN_VALUE_FLAGS: &[&str] = &[
     "--security-opt", "--network-alias", "--entrypoint", "-w", "--workdir", "-u", "--user", "--mem", "--cpu", "--procs", "--restart", "--health-cmd", "--health-interval", "--health-timeout",
     "--health-retries", "--health-start-period", "--env-file", "--mount", "--hostname", "-h", "--add-host", "--label", "-l", "--dns", "--log-driver",
     "--shm-size", "--ulimit", "--stop-timeout", "--stop-signal", "--pull", "--platform", "--tmpfs", "--cpus", "--memory-swap", "--ipc", "--pid",
+    "--volumes-from", "--expose", "--log-opt", "--memory-reservation", "--kernel-memory", "--cpu-shares", "--cpuset-cpus", "--blkio-weight", "--uts", "--userns", "--cgroup-parent", "--device", "--gpus", "--sysctl", "--link", "--ip", "--mac-address", "--runtime", "--detach-keys", "--cidfile", "--group-add", "--isolation", "--domainname", "--dns-search", "--dns-option", "--label-file", "--pids-limit",
 ];
 
 /// `nofile=1024:2048`, `nproc=512`, `core=-1` as (RLIMIT_* number on Linux, soft, hard); `-1` is unlimited.
@@ -1205,12 +1244,28 @@ fn parse_run(args: Vec<String>) -> Result<Config> {
                 let c: f64 = value("a number of CPUs")?.parse().ok().filter(|c: &f64| *c > 0.0 && c.is_finite()).ok_or_else(|| usage("--cpus needs a positive number"))?;
                 cfg.cpu_percent = Some(((c * 100.0).round() as u32).max(1));
             }
-            // accepted so existing commands keep working; the engine does not apply them yet
-            "--log-driver" | "--stop-timeout" | "--stop-signal" | "--pull" | "--platform" | "--memory-swap" | "--ipc" | "--pid" => {
-                let v = value("a value")?;
-                eprintln!("warning: {flag} {v} is accepted but not applied by this engine yet");
+            "--stop-signal" => cfg.stop_signal = Some(value("a signal")?),
+            "--stop-timeout" => cfg.stop_timeout = Some(value("seconds")?.parse().map_err(|_| usage("--stop-timeout needs a number of seconds"))?),
+            "--pull" => {
+                let v = value("always, missing or never")?;
+                if !matches!(v.as_str(), "always" | "missing" | "never") {
+                    return Err(usage("--pull must be always, missing or never"));
+                }
+                cfg.pull = Some(v);
             }
-            "--oom-kill-disable" => eprintln!("warning: {flag} is accepted but not applied by this engine yet"),
+            "--platform" => cfg.platform = Some(value("os/arch")?).filter(|p| !p.is_empty()),
+            "-P" | "--publish-all" => cfg.publish_all = true,
+            "--volumes-from" => cfg.volumes_from.push(value("a container")?.split(':').next().unwrap_or("").to_string()),
+            // tuning and bookkeeping options that change nothing about how a container behaves here
+            "--expose" | "--log-driver" | "--log-opt" | "--memory-swap" | "--memory-reservation" | "--kernel-memory" | "--cpu-shares" | "--cpuset-cpus" | "--blkio-weight"
+            | "--detach-keys" | "--cidfile" | "--domainname" | "--dns-search" | "--dns-option" | "--label-file" | "--isolation" | "--runtime" => drop(value("a value")?),
+            "--pids-limit" => cfg.procs = Some(value("a number")?.parse().ok().filter(|&v| v > 0).ok_or_else(|| usage("--pids-limit needs a positive number"))?),
+            // accepted so existing commands keep working, but this engine cannot honour them
+            "--ipc" | "--pid" | "--uts" | "--userns" | "--cgroup-parent" | "--device" | "--gpus" | "--sysctl" | "--link" | "--ip" | "--mac-address" | "--group-add" => {
+                let v = value("a value")?;
+                eprintln!("warning: {flag} {v} is accepted but not applied by this engine");
+            }
+            "--oom-kill-disable" | "--sig-proxy" | "--no-sig-proxy" | "--init=false" => {}
             "-p" | "--publish" => cfg.ports.extend(Port::parse_all(&value("[ip:]host:container[/udp]")?)?),
             "-v" | "--volume" => {
                 let v = value("host:container[:ro]")?;
@@ -1267,7 +1322,7 @@ fn parse_run(args: Vec<String>) -> Result<Config> {
 }
 
 impl Volume {
-    fn to_arg(&self) -> String {
+    pub fn to_arg(&self) -> String {
         format!("{}:{}{}", self.host, self.container, if self.ro { ":ro" } else { "" })
     }
 }
@@ -1337,6 +1392,24 @@ impl Command {
                 }
                 if let Some(h) = &c.hostname {
                     flag("--hostname", Some(h.clone()));
+                }
+                if let Some(x) = &c.stop_signal {
+                    flag("--stop-signal", Some(x.clone()));
+                }
+                if let Some(x) = c.stop_timeout {
+                    flag("--stop-timeout", Some(x.to_string()));
+                }
+                if let Some(x) = &c.pull {
+                    flag("--pull", Some(x.clone()));
+                }
+                if let Some(x) = &c.platform {
+                    flag("--platform", Some(x.clone()));
+                }
+                if c.publish_all {
+                    flag("-P", None);
+                }
+                for x in &c.volumes_from {
+                    flag("--volumes-from", Some(x.clone()));
                 }
                 for h in &c.extra_hosts {
                     flag("--add-host", Some(h.clone()));
@@ -1455,10 +1528,23 @@ impl Command {
                 if let Some(f) = &c.file {
                     a.extend([s("-f"), f.clone()]);
                 }
+                for f in &c.opts.more_files {
+                    a.extend([s("-f"), f.clone()]);
+                }
                 if let Some(p) = &c.project {
                     a.extend([s("-p"), p.clone()]);
                 }
+                for x in &c.opts.profiles {
+                    a.extend([s("--profile"), x.clone()]);
+                }
+                for x in &c.opts.env_files {
+                    a.extend([s("--env-file"), x.clone()]);
+                }
+                if let Some(d) = &c.opts.project_dir {
+                    a.extend([s("--project-directory"), d.clone()]);
+                }
                 match &c.sub {
+                    ComposeSub::Raw(words) => a.extend(words.iter().cloned()),
                     ComposeSub::Up { detach, build } => {
                         a.push(s("up"));
                         if *detach {
@@ -1795,15 +1881,22 @@ mod tests {
     fn compose_commands() {
         assert_eq!(
             p("compose -f x.yml -p demo up -d --build").unwrap(),
-            Command::Compose(ComposeArgs { file: Some("x.yml".into()), project: Some("demo".into()), sub: ComposeSub::Up { detach: true, build: true } })
+            Command::Compose(ComposeArgs { file: Some("x.yml".into()), project: Some("demo".into()), opts: ComposeOpts::default(), sub: ComposeSub::Up { detach: true, build: true } })
         );
         assert_eq!(
             p("compose logs -f web").unwrap(),
-            Command::Compose(ComposeArgs { file: None, project: None, sub: ComposeSub::Logs { follow: true, service: Some("web".into()) } })
+            Command::Compose(ComposeArgs { file: None, project: None, opts: ComposeOpts::default(), sub: ComposeSub::Logs { follow: true, service: Some("web".into()) } })
         );
-        for bad in ["compose", "compose bogus", "compose up --nope", "compose down x", "compose -p ../x up", "compose logs a b", "compose -f"] {
+        for bad in ["compose", "compose -p ../x up", "compose -f"] {
             assert!(p(bad).is_err(), "{bad}");
         }
+        // what the simple forms do not take is handed to the full implementation as typed
+        for (cmd, words) in [("compose exec web sh", "exec web sh"), ("compose up --force-recreate web", "up --force-recreate web"), ("compose stop", "stop"), ("compose logs a b", "logs a b")] {
+            let Command::Compose(c) = p(cmd).unwrap() else { panic!("{cmd}") };
+            assert_eq!(c.sub, ComposeSub::Raw(words.split_whitespace().map(String::from).collect()), "{cmd}");
+        }
+        let Command::Compose(c) = p("compose -f a.yml -f b.yml --profile dev --env-file e.env ps").unwrap() else { panic!() };
+        assert_eq!((c.file.as_deref(), c.opts.more_files.as_slice(), c.opts.profiles.as_slice(), c.opts.env_files.as_slice()), (Some("a.yml"), ["b.yml".to_string()].as_slice(), ["dev".to_string()].as_slice(), ["e.env".to_string()].as_slice()));
     }
 
     #[test]

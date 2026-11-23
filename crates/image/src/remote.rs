@@ -273,6 +273,15 @@ impl Client {
         Ok((serde_json::from_slice(&bytes)?, digest))
     }
 
+    /// The manifest (or manifest list) exactly as the registry serves it, for `docker manifest inspect`.
+    pub fn raw_manifest(&self, tag_or_digest: &str) -> Result<serde_json::Value> {
+        let dest = self.scratch("manifest-raw");
+        self.fetch(&format!("manifests/{tag_or_digest}"), Some(MANIFEST_TYPES), &dest)?;
+        let bytes = fs::read(&dest)?;
+        let _ = fs::remove_file(&dest);
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
     /// Download a blob to `dest` and verify its sha256.
     pub fn blob(&self, digest: &str, dest: &Path) -> Result<()> {
         self.fetch(&format!("blobs/{digest}"), None, dest)?;

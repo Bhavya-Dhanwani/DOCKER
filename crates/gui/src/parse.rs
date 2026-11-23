@@ -82,6 +82,7 @@ fn inner_parens(t: &str) -> Option<&str> {
     t.strip_prefix('(')?.strip_suffix(')')
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 struct Status<'a> {
     state: State,
     health: Option<String>,
@@ -91,6 +92,7 @@ struct Status<'a> {
     rest: Vec<&'a str>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn parse_status(rest: &str) -> Option<Status<'_>> {
     let mut t = rest.split_whitespace().peekable();
     let first = t.next()?;
@@ -121,6 +123,8 @@ fn parse_status(rest: &str) -> Option<Status<'_>> {
     Some(Status { state, health, uptime, exit, restarts, rest: t.collect() })
 }
 
+/// The old fixed-width table (kept for its tests; the app reads the JSON rows now).
+#[cfg_attr(not(test), allow(dead_code))]
 /// `docker ps -a`. Columns are fixed-width (id 18, name 12, image 14, command 24); the status column
 /// can overflow its width, so everything after the command is parsed by token.
 pub fn parse_ps(out: &str) -> Vec<Container> {
@@ -152,6 +156,46 @@ pub fn parse_ps(out: &str) -> Vec<Container> {
         .collect()
 }
 
+/// `docker ps -a --format '{{json .}}'`: one JSON object per line (Docker's fields plus a few the app needs).
+pub fn parse_ps_json(out: &str) -> Vec<Container> {
+    out.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|v| {
+            let s = |k: &str| v[k].as_str().unwrap_or("").to_string();
+            let state = match v["State"].as_str()? {
+                "running" => State::Running,
+                "paused" => State::Paused,
+                "restarting" => State::Restarting,
+                "created" => State::Created,
+                _ => State::Exited,
+            };
+            let health = v["Health"].as_str().map(str::to_string);
+            Some(Container {
+                id: s("Id"),
+                name: s("Names"),
+                image: s("Image"),
+                command: s("FullCommand"),
+                state,
+                health,
+                uptime: (state == State::Running).then(|| v["UptimeSeconds"].as_u64()).flatten(),
+                exit_code: v["ExitCode"].as_i64().map(|c| c as i32),
+                restarts: (state == State::Restarting).then(|| v["Restarts"].as_u64().map(|n| n as u32)).flatten(),
+                ip: s("IP"),
+                ports: s("PortsRaw"),
+            })
+        })
+        .collect()
+}
+
+/// `docker images --format '{{json .}}'`.
+pub fn parse_images_json(out: &str) -> Vec<Image> {
+    out.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .map(|v| Image { name: v["Name"].as_str().unwrap_or("").to_string(), size: v["SizeBytes"].as_u64().unwrap_or(0), layers: v["Layers"].as_u64().unwrap_or(0) as usize })
+        .collect()
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn parse_images(out: &str) -> Vec<Image> {
     out.lines()
         .skip(1)
@@ -251,6 +295,25 @@ mod tests {
         assert_eq!(v[2].state, State::Created);
         assert_eq!((v[3].state, v[3].restarts), (State::Restarting, Some(3)));
         assert!(v[3].is_live());
+    }
+
+    #[test]
+    fn ps_json_rows() {
+        let rows = [
+            r#"{"Id":"0123456789abcdef","Names":"web","Image":"nginx:latest","FullCommand":"nginx","State":"running","Health":"healthy","UptimeSeconds":65,"ExitCode":null,"Restarts":0,"IP":"10.0.0.2","PortsRaw":"8080->80"}"#,
+            r#"{"Id":"fedcba9876543210","Names":"job","Image":"alpine:latest","FullCommand":"echo hi","State":"exited","ExitCode":0,"Restarts":0,"IP":"","PortsRaw":""}"#,
+            r#"{"Id":"2222222222222222","Names":"flaky","Image":"busybox","State":"restarting","Restarts":3,"ExitCode":null}"#,
+            "not json",
+        ]
+        .join("
+");
+        let v = parse_ps_json(&rows);
+        assert_eq!(v.len(), 3);
+        assert_eq!((v[0].state, v[0].uptime, v[0].health.as_deref(), v[0].ip.as_str()), (State::Running, Some(65), Some("healthy"), "10.0.0.2"));
+        assert_eq!((v[1].state, v[1].exit_code, v[1].uptime), (State::Exited, Some(0), None));
+        assert_eq!((v[2].state, v[2].restarts), (State::Restarting, Some(3)));
+        let img = parse_images_json(r#"{"Name":"alpine:latest","SizeBytes":4000000,"Layers":1}"#);
+        assert_eq!(img, vec![Image { name: "alpine:latest".into(), size: 4_000_000, layers: 1 }]);
     }
 
     #[test]

@@ -45,7 +45,7 @@ check "after it stops, it disappears from its peers' /etc/hosts" sh -c "! $D exe
 
 echo "== the default bridge has no name resolution"
 check "a container on the default bridge cannot resolve srv" sh -c "! $D run alpine ping -c1 -W2 srv </dev/null"
-ip=$($D inspect srv | sed -n 's/.*"ip": "\([0-9.]*\)".*/\1/p')
+ip=$($D inspect -f '{{.NetworkSettings.IPAddress}}' srv)
 check "networks do not isolate: the IP is still reachable (documented limitation)" $D run alpine ping -c1 -W2 "$ip" </dev/null
 check "a container's own name resolves on the default bridge" has "$($D run --name solo alpine cat /etc/hosts </dev/null)" " solo "
 

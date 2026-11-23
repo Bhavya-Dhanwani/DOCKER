@@ -118,6 +118,9 @@ impl Driver {
                     let name = ["compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"].into_iter().find(|n| std::path::Path::new(n).exists()).unwrap_or("docker-compose.yml");
                     c.file = Some(self.path(name)?);
                 }
+                c.opts.more_files = c.opts.more_files.iter().map(|f| self.path(f)).collect::<Result<_>>()?;
+                c.opts.env_files = c.opts.env_files.iter().map(|f| self.path(f)).collect::<Result<_>>()?;
+                c.opts.project_dir = c.opts.project_dir.as_deref().map(|d| self.path(d)).transpose()?;
                 Command::Compose(c)
             }
             Command::Save { out, images } => Command::Save { out: self.path(&out)?, images },

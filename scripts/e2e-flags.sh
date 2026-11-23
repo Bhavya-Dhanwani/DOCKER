@@ -36,7 +36,7 @@ $D rm -f "$id" >/dev/null 2>&1
 
 # --label shows up in inspect
 id=$($D run -d --label app=web --label tier alpine sleep 20)
-$D inspect "$id" 2>/dev/null | grep -q 'app=web' && ok label || bad label "$($D inspect "$id" 2>&1 | head -5)"
+[ "$($D inspect -f '{{index .Config.Labels "app"}}' "$id" 2>/dev/null)" = "web" ] && ok label || bad label "$($D inspect "$id" 2>&1 | head -5)"
 $D rm -f "$id" >/dev/null 2>&1
 
 # anonymous volumes: kept for a normal container, removed with --rm
@@ -47,6 +47,34 @@ after=$($D volume ls | grep -c '^anon-')
 $D run -v /data --name keep alpine sh -c 'echo x > /data/f'
 [ "$($D volume ls | grep -c '^anon-')" = "$((before + 1))" ] && ok anon-volume-kept-without-rm || bad anon-keep "$($D volume ls)"
 $D rm -f keep >/dev/null 2>&1
+
+# --stop-signal, stop -s, kill -s
+$D run -d --name sig1 --stop-signal SIGUSR1 alpine sh -c 'trap "echo got-usr1; exit 0" USR1; while true; do sleep 1; done' >/dev/null
+sleep 1; $D stop sig1 >/dev/null 2>&1
+out=$($D logs sig1); case "$out" in *got-usr1*) ok stop-signal ;; *) bad stop-signal "$out" ;; esac
+$D rm -f sig1 >/dev/null 2>&1
+$D run -d --name sig2 alpine sh -c 'trap "echo got-hup; exit 0" HUP; while true; do sleep 1; done' >/dev/null
+sleep 1; $D stop -s SIGHUP sig2 >/dev/null 2>&1
+out=$($D logs sig2); case "$out" in *got-hup*) ok stop-s ;; *) bad stop-s "$out" ;; esac
+$D rm -f sig2 >/dev/null 2>&1
+$D run -d --name sig3 alpine sh -c 'trap "echo got-usr2" USR2; while true; do sleep 1; done' >/dev/null
+sleep 1; $D kill -s USR2 sig3 >/dev/null 2>&1; sleep 1
+out=$($D logs sig3); case "$out" in *got-usr2*) ok kill-s ;; *) bad kill-s "$out" ;; esac
+$D rm -f sig3 >/dev/null 2>&1
+
+# --pull, --platform, -P, --volumes-from, --pids-limit, hints that change nothing
+$D run --rm --pull never no-such-image-here true >/dev/null 2>&1 && bad pull-never-missing "" || ok pull-never-missing
+$D run --rm --pull missing --log-driver json-file --memory-swap 128m --oom-kill-disable --cpu-shares 512 --expose 99 alpine echo quiet-hints 2>&1 | grep -q warning && bad hints-are-quiet "" || ok hints-are-quiet
+$D pull nginx:alpine >/dev/null 2>&1
+id=$($D run -d -P nginx:alpine)
+sleep 1
+case "$($D port "$id")" in *"80/tcp -> 0.0.0.0:"*) ok publish-all ;; *) bad publish-all "$($D port "$id")" ;; esac
+$D rm -f "$id" >/dev/null 2>&1
+$D run -d --name vf1 -v vfdata:/data alpine sh -c 'echo shared > /data/f; sleep 120' >/dev/null
+sleep 1
+out=$($D run --rm --volumes-from vf1 alpine cat /data/f); case "$out" in *shared*) ok volumes-from ;; *) bad volumes-from "$out" ;; esac
+$D rm -f vf1 >/dev/null 2>&1; $D volume rm vfdata >/dev/null 2>&1
+out=$($D run --rm --pids-limit 5 alpine sh -c 'cat /sys/fs/cgroup/pids.max 2>/dev/null || echo n/a'); ok pids-limit-accepted
 
 [ $fail = 0 ] && echo "ALL PASSED"
 exit $fail

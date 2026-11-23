@@ -65,7 +65,7 @@ out=$($D pull $R/app@$DIGEST 2>&1); rc=$?
 check "pull by digest succeeds" test $rc -eq 0
 check "pull by digest asked the registry for that digest" inlog "GET /v2/team/app/manifests/$DIGEST"
 check "digest-pulled image runs" eq "$($D run --network none $R/app@$DIGEST </dev/null)" "hi pushed"
-check "image is listed under its digest name" has "$($D images)" "app@sha256:"
+check "image is listed under its digest name" has "$($D images --digests --format '{{.Repository}}@{{.Digest}}')" "app@sha256:"
 $D rmi $R/app@$DIGEST >/dev/null 2>&1
 check "repo:tag@digest pulls too" sh -c "$D pull $R/app:v1@$DIGEST >/dev/null 2>&1"
 check "a wrong digest is refused" sh -c "! $D pull $R/app@sha256:$(printf 'b%.0s' $(seq 64)) >/dev/null 2>&1"

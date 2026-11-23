@@ -32,6 +32,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "swarm_more.rs"]
+mod more;
+
+pub use more::{node_cmd, object_cmd, object_path, stack_config};
+
 type Res<T = ()> = Result<T, Box<dyn Error>>;
 
 /// Environment variable that marks a container as a replica of a service.
@@ -82,6 +87,9 @@ struct Spec {
     /// Replicas replaced per step of a rolling update, and the pause between steps.
     parallelism: u32,
     delay_s: u64,
+    /// The spec before the last `service update` (`service rollback` goes back to it).
+    #[serde(default)]
+    prev: Option<Box<Spec>>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -89,6 +97,9 @@ struct State {
     id: String,
     /// Set by `swarm leave`: the supervisor removes every replica and exits.
     leaving: bool,
+    /// `docker node update --availability`: `drain` stops every task.
+    #[serde(default)]
+    availability: String,
     services: BTreeMap<String, Spec>,
 }
 
@@ -177,6 +188,7 @@ fn is_current(spec: &Spec, c: &Config) -> bool {
         && a.cpu_percent == b.cpu_percent
         && a.network_name == b.network_name
         && a.health == b.health
+        && a.volumes == b.volumes
         && a.env.iter().eq(env)
 }
 
@@ -398,7 +410,15 @@ fn supervisor() -> Res {
         }
         let orphans: Vec<String> = all_tasks().into_iter().filter(|(s, ..)| !st.services.contains_key(s)).map(|(.., e)| e.id).collect();
         remove_tasks(&orphans);
-        for spec in st.services.values() {
+        for stored in st.services.values() {
+            // a drained node keeps no tasks
+            let drained;
+            let spec = if st.availability == "drain" && stored.replicas > 0 {
+                drained = Spec { replicas: 0, ..stored.clone() };
+                &drained
+            } else {
+                stored
+            };
             let now = Instant::now();
             let tasks: Vec<Task> = tasks_of(&spec.name).iter().map(|(n, e)| task_view(spec, *n, e)).collect();
             let budget = if next_step.get(&spec.name).is_none_or(|t| now >= *t) { spec.parallelism.max(1) as usize } else { 0 };
@@ -482,7 +502,14 @@ pub fn run(words: &[String]) -> Res {
         ["swarm", "status"] => status(),
         ["swarm", "join", ..] | ["swarm", "join-token", ..] => Err("not supported: single-node only (swarm init makes this machine the one manager)".into()),
         ["service", "create", ..] => service_create(rest(2)),
-        ["service", "ls" | "list"] => service_ls(None),
+        ["service", "ls" | "list", ..] => more::service_ls(None, rest(2)),
+        ["service", "rollback", name] => more::rollback(name),
+        ["node", ..] => node_cmd(rest(1)),
+        ["secret", ..] => object_cmd("secrets", rest(1)),
+        ["config", ..] => object_cmd("configs", rest(1)),
+        ["stack", "config", ..] => stack_config(rest(2)),
+        ["swarm", "init", ..] => init(),
+        ["swarm", "update", ..] | ["swarm", "ca", ..] | ["swarm", "unlock-key", ..] | ["swarm", "unlock"] => Err("not applicable: a single-node swarm has no certificates to rotate or lock".into()),
         ["service", "ps", name] => service_ps(&[name]),
         ["service", "inspect", name] => service_inspect(name),
         ["service", "logs", name] | ["service", "logs", "-f", name] => service_logs(name),
@@ -491,7 +518,7 @@ pub fn run(words: &[String]) -> Res {
         ["service", "rm" | "remove", ..] if words.len() > 2 => rest(2).iter().try_for_each(|n| remove_service(n)),
         ["stack", "deploy", ..] => stack_deploy(rest(2)),
         ["stack", "ls" | "list"] => stack_ls(),
-        ["stack", "services", name] => service_ls(Some(name)),
+        ["stack", "services", name, ..] => more::service_ls(Some(name), rest(3)),
         ["stack", "ps", name] => stack_ps(name),
         ["stack", "rm" | "remove", ..] if words.len() > 2 => rest(2).iter().try_for_each(|n| stack_rm(n)),
         _ => Err(format!("usage: see `docker` for swarm|service|stack commands (got {:?})", w.join(" ")).into()),
@@ -595,7 +622,11 @@ fn apply(spec: &mut Spec, flag: &str, v: String, create: bool) -> Res {
         "--update-parallelism" => spec.parallelism = number(flag, &v)?,
         "--health-cmd" => spec.cfg.health = Some(Health::new(vec!["/bin/sh".into(), "-c".into(), v])),
         "--health-interval" => spec.cfg.health.as_mut().ok_or("--health-interval needs --health-cmd first")?.interval_s = seconds(&v)?,
-        other => return Err(format!("unknown flag {other}").into()),
+        other => {
+            if !more::apply_extra(spec, other, &v, create)? {
+                return Err(format!("unknown flag {other}").into());
+            }
+        }
     }
     Ok(())
 }
@@ -605,8 +636,9 @@ fn parse_flags(args: &[String], spec: &mut Spec, create: bool) -> Res<usize> {
     let mut i = 0;
     while let Some(a) = args.get(i).filter(|a| a.starts_with('-')) {
         i += 1;
-        if a == "-d" || a == "--detach" {
-            continue; // creating and updating never wait for convergence here
+        if more::is_bool_flag(a) {
+            more::apply_bool(spec, a); // creating and updating never wait for convergence here, so -d and friends do nothing
+            continue;
         }
         let (flag, v) = match a.split_once('=').filter(|_| a.starts_with("--")) {
             Some((f, v)) => (f.to_string(), v.to_string()),
@@ -629,6 +661,7 @@ fn new_spec() -> Spec {
         cond: Cond::Any,
         parallelism: 1,
         delay_s: 0,
+        prev: None,
     }
 }
 
@@ -671,7 +704,9 @@ fn service_update(args: &[String]) -> Res {
     // replay the flags on the stored spec (parsing needs a Spec to write into)
     with_state(|st| {
         let spec = st.services.get_mut(name).ok_or_else(|| format!("no such service: {name}"))?;
+        let before = Spec { prev: None, ..spec.clone() };
         parse_flags(&args[..n], spec, false)?;
+        spec.prev = Some(Box::new(before));
         if args[..n].iter().any(|a| a == "--image" || a.starts_with("--image=")) {
             check_image(&spec.cfg.target)?;
         }
@@ -712,16 +747,6 @@ fn remove_service(name: &str) -> Res {
 fn services(stack: Option<&str>) -> Res<Vec<Spec>> {
     let st = load().ok_or(NOT_ACTIVE)?;
     Ok(st.services.into_values().filter(|s| stack.is_none_or(|n| s.stack.as_deref() == Some(n))).collect())
-}
-
-fn service_ls(stack: Option<&str>) -> Res {
-    println!("{:<24} {:<12} {:<10} {:<20} PORTS", "NAME", "MODE", "REPLICAS", "IMAGE");
-    for s in services(stack)? {
-        let up = tasks_of(&s.name).iter().filter(|(_, e)| e.running()).count();
-        let ports: Vec<String> = s.cfg.ports.iter().map(|p| format!("*:{}->{}/tcp", p.host, p.container)).collect();
-        println!("{:<24} {:<12} {:<10} {:<20} {}", s.name, "replicated", format!("{up}/{}", s.replicas), s.cfg.target, ports.join(", "));
-    }
-    Ok(())
 }
 
 fn service_ps(names: &[&str]) -> Res {
@@ -803,6 +828,7 @@ fn stack_spec(stack: &str, s: compose::StackService) -> Spec {
         cond: deploy.restart_condition.as_deref().and_then(|c| Cond::parse(c).ok()).unwrap_or(Cond::Any),
         parallelism: deploy.parallelism.unwrap_or(1),
         delay_s: deploy.delay_s.unwrap_or(0),
+        prev: None,
     }
 }
 

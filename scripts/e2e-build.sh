@@ -40,7 +40,7 @@ out=$($D build -t app:1 "$ctx" 2>&1); rc=$?
 p1=$($D ps -a | wc -l)
 check "build succeeds" test $rc -eq 0
 check "build prints steps" has "$out" "Step 11/11"
-check "build tags the image" has "$($D images)" "app:1"
+check "build tags the image" has "$($D images --format '{{.Repository}}:{{.Tag}}')" "app:1"
 check "CMD runs: ARG default + ENV substituted" eq "$($D run app:1 </dev/null)" "hello world"
 check "COPY file to a dir" eq "$($D run app:1 cat /app/hello.txt </dev/null)" "from-file"
 check "COPY dir contents" eq "$($D run app:1 cat /data/sub/x </dev/null)" "deep"

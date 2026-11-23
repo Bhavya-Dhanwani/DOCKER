@@ -626,7 +626,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command> {
         Some("build") => parse_build(rest).map(Command::Build),
         Some("prune") => only_flags(rest, &[]).map(|_| Command::Prune),
         Some("pull") => parse_pull(rest),
-        Some("rmi") => flags_then_one(rest, &[], "image").map(|(_, v)| Command::Rmi(v)),
+        Some("rmi") => flags_then_one(rest, &["-f", "--force", "--no-prune"], "image").map(|(_, v)| Command::Rmi(v)),
         Some("images") => only_flags(rest, &[]).map(|_| Command::Images),
         Some(g @ ("swarm" | "service" | "stack" | "node" | "secret" | "config")) => Ok(Command::Swarm([vec![g.to_string()], rest].concat())),
         Some("search") => flags_then_one(rest, &[], "term").map(|(_, v)| Command::Search(v)),
@@ -1738,6 +1738,7 @@ mod tests {
     fn other_subcommands() {
         assert_eq!(p("pull alpine:3.19").unwrap(), Command::Pull("alpine:3.19".into()));
         assert_eq!(p("rmi alpine").unwrap(), Command::Rmi("alpine".into()));
+        assert_eq!(p("rmi -f alpine").unwrap(), Command::Rmi("alpine".into()));
         assert_eq!(p("stop abc").unwrap(), Command::Stop { id: "abc".into(), timeout: 10 });
         assert_eq!(p("stop -t 2 abc").unwrap(), Command::Stop { id: "abc".into(), timeout: 2 });
         assert_eq!(p("images").unwrap(), Command::Images);

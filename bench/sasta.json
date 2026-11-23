@@ -1,0 +1,37 @@
+﻿{
+    "engine":  "sasta",
+    "date":  "2026-11-23",
+    "runs":  15,
+    "containers":  20,
+    "base_ram_mb":  0,
+    "ready_s":  6.1,
+    "idle_ram_mb":  850,
+    "loaded_ram_mb":  1264,
+    "start_ms":  [
+                     847,
+                     624,
+                     658,
+                     495,
+                     606,
+                     583,
+                     579,
+                     506,
+                     730,
+                     783,
+                     554,
+                     645,
+                     502,
+                     575,
+                     698
+                 ],
+    "start_median_ms":  606,
+    "start_min_ms":  495,
+    "pull_ms":  {
+                    "nginx:alpine":  16621,
+                    "redis:alpine":  20814
+                },
+    "build_cold_ms":  1426,
+    "build_cached_ms":  379,
+    "vhdx_mb":  347,
+    "install_mb":  20
+}

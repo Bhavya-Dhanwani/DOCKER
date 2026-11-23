@@ -56,6 +56,44 @@ Layers are stored once and shared. Container writes go to RAM by default, so not
 
 ---
 
+## Benchmarks
+
+Sasta Docker against Docker Desktop 29.9.2, measured on the same PC: Windows 11 on a Snapdragon X (ARM64), 15.6 GB RAM, both engines running in WSL2, one after the other from a fresh `wsl --shutdown`. Lower is better in every chart. The numbers are in [`bench/`](bench) and `scripts/bench.ps1` repeats the test (`scripts/bench_charts.py` redraws the charts).
+
+<table>
+<tr>
+<td><img src="bench/ram-idle.svg" alt="RAM used while idle" width="440"></td>
+<td><img src="bench/ram-loaded.svg" alt="RAM with 20 containers" width="440"></td>
+</tr>
+<tr>
+<td><img src="bench/ready.svg" alt="Engine ready after launch" width="440"></td>
+<td><img src="bench/start.svg" alt="Start a container" width="440"></td>
+</tr>
+<tr>
+<td><img src="bench/build.svg" alt="Build" width="440"></td>
+<td><img src="bench/disk.svg" alt="VM disk" width="440"></td>
+</tr>
+<tr>
+<td><img src="bench/install.svg" alt="Installed size" width="440"></td>
+<td><img src="bench/pull.svg" alt="Pull" width="440"></td>
+</tr>
+</table>
+
+| | Docker Desktop | Sasta Docker |
+|---|---|---|
+| RAM while idle (the VM plus the engine's own processes) | 4,492 MB | 850 MB |
+| RAM with 20 nginx containers running | 5,014 MB | 1,264 MB |
+| Engine ready after launch | 51 s | 6 s |
+| Start a container (`run --rm alpine true`, median of 15) | 745 ms | 606 ms |
+| Build, nothing cached / everything cached | 4.0 s / 1.3 s | 1.4 s / 0.4 s |
+| Pull `nginx:alpine` + `redis:alpine` | 21.7 s | 37.4 s |
+| VM disk file after the test | 2,348 MB | 347 MB |
+| Installed size | 3,670 MB | 20 MB |
+
+**Where Sasta Docker is not faster:** pulling images. It downloads through the system `curl` and was slower here (the pull numbers also move with the internet connection of the moment). Each number is one run on one machine, so treat the exact figures as an indication, not a guarantee. The engines were measured as installed with their default settings.
+
+---
+
 ## Install
 
 ### One line
@@ -67,6 +105,17 @@ Layers are stored once and shared. Container writes go to RAM by default, so not
 | **Windows** (CMD) | `powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/Bhavya-Dhanwani/DOCKER/main/install.ps1 \| iex"` |
 
 On Windows these commands download the installer without the browser, so Windows does not show its "Windows protected your PC" screen. The `.exe` is not code-signed (that costs money): if you download it in a browser and SmartScreen warns, click **More info**, then **Run anyway**.
+
+### Which command: `docker` or `sdocker`
+
+Every installer asks which command you want, and there are two choices:
+
+| Choice | Meaning |
+|---|---|
+| `docker` | Sasta Docker answers to `docker`, so existing scripts, Dockerfiles and tools work unchanged. Replaces the `docker` command of a Docker Desktop on your PATH. |
+| `sdocker` | Use Sasta Docker next to a real Docker: `sdocker run alpine echo hello`. The desktop app is `sdocker-gui` on Linux and macOS, `docker-gui` on Windows. |
+
+The Windows installer shows it as a page; the Linux and macOS script asks in the terminal. To answer up front: `SASTA_CMD=sdocker` in front of the install command (Linux, macOS), or `$env:SASTA_CMD='sdocker'` before the PowerShell command, or `/CMDNAME=sdocker` for a silent Windows install. The examples below use `docker`.
 
 ### Or download
 

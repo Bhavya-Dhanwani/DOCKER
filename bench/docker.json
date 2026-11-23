@@ -1,0 +1,37 @@
+﻿{
+    "engine":  "docker",
+    "date":  "2026-11-23",
+    "runs":  15,
+    "containers":  20,
+    "base_ram_mb":  0,
+    "ready_s":  51.1,
+    "idle_ram_mb":  4492,
+    "loaded_ram_mb":  5014,
+    "start_ms":  [
+                     1032,
+                     755,
+                     833,
+                     730,
+                     676,
+                     745,
+                     770,
+                     729,
+                     751,
+                     718,
+                     732,
+                     847,
+                     805,
+                     741,
+                     711
+                 ],
+    "start_median_ms":  745,
+    "start_min_ms":  676,
+    "pull_ms":  {
+                    "nginx:alpine":  9474,
+                    "redis:alpine":  12197
+                },
+    "build_cold_ms":  3997,
+    "build_cached_ms":  1320,
+    "vhdx_mb":  2348,
+    "install_mb":  3670
+}

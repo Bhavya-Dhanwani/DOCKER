@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/logo.png" alt="Sasta Docker" width="260">
+<img src="assets/sasta-docker-logo.png" alt="Sasta Docker" width="260">
 
 # Sasta Docker
 

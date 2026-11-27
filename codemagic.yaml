@@ -1,0 +1,34 @@
+# Builds the macOS installers (Apple silicon and Intel) on Codemagic, for when GitHub Actions can't.
+# Codemagic -> add this repository -> Start new build -> "macOS packages". Download the .pkg files from the build page.
+workflows:
+  macos:
+    name: macOS packages
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    environment:
+      vars:
+        VERSION: 0.1.0 # the release the Linux VM engine is taken from
+    scripts:
+      - name: Build and package
+        script: |
+          set -euo pipefail
+          command -v rustup >/dev/null || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup update stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          mkdir -p dist
+          for arch in aarch64 x86_64; do
+            cargo +stable build --release -p docker-cli -p docker-gui --target $arch-apple-darwin
+            root=build/$arch/usr/local/bin
+            mkdir -p $root
+            cp target/$arch-apple-darwin/release/docker target/$arch-apple-darwin/release/docker-gui $root/
+            # the engine that runs inside the Linux VM
+            curl -fsSL https://github.com/$CM_REPO_SLUG/releases/download/v$VERSION/sasta-docker-linux-$arch.tar.gz \
+              | tar -xzO sasta-docker-linux-$arch/docker-linux-$arch > $root/docker-linux-$arch
+            chmod +x $root/docker-linux-$arch
+            pkgbuild --root build/$arch --identifier dev.sasta.docker --version $VERSION --install-location / dist/SastaDocker-macos-$arch.pkg
+          done
+          # smoke test: the native binary starts
+          target/aarch64-apple-darwin/release/docker --version
+    artifacts:
+      - dist/*.pkg

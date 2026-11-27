@@ -68,6 +68,17 @@ pub fn run_cli(args: &[String]) -> Res<String> {
     }
 }
 
+/// Like `run_cli`, with `input` on stdin: a registry password never appears in the process list.
+pub fn run_cli_input(args: &[String], input: &str) -> Res<()> {
+    let fail = |e: std::io::Error| format!("cannot run {}: {e}", cli_path().display());
+    let mut child = command(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(fail)?;
+    if let Some(mut stdin) = child.stdin.take() {
+        std::io::Write::write_all(&mut stdin, input.as_bytes()).map_err(fail)?;
+    }
+    let out = child.wait_with_output().map_err(fail)?;
+    if out.status.success() { Ok(()) } else { Err(clean_error(&String::from_utf8_lossy(&out.stderr))) }
+}
+
 pub fn args(a: &[&str]) -> Vec<String> {
     a.iter().map(|s| s.to_string()).collect()
 }

@@ -35,6 +35,7 @@ usage:
   docker vm init [--distro <name>] [--use-existing] [--dry-run] | start | stop | status
   docker login [-u <user>] (-p <password> | --password-stdin) [server]
   docker logout [server]
+  docker catalog [ls] | add <image> [description] | rm <image>
   docker images
   docker rmi <image>
   docker search <term>             search Docker Hub

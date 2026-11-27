@@ -129,6 +129,8 @@ mod tests {
         let mut h = tar::Header::new_gnu();
         h.set_size(5);
         h.set_mode(0o640);
+        h.set_uid(0); // real tars always carry an owner; unpacking restores it
+        h.set_gid(0);
         b.append_data(&mut h, "d/hello.txt", &b"hello"[..]).unwrap();
         b.into_inner().unwrap()
     }

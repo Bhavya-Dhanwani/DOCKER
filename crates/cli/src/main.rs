@@ -1,4 +1,5 @@
 mod api;
+mod catalog;
 mod commands;
 mod compose;
 mod emulation;
@@ -69,6 +70,16 @@ fn run(mut args: Vec<String>) -> ExitCode {
     if args.first().is_some_and(|a| a == "--rootless") {
         args.remove(0);
         docker_core::registry::set_rootless(true);
+    }
+    // your own image list is a file on this computer: never forwarded into the VM
+    if args.first().is_some_and(|a| a == "catalog") {
+        return match catalog::run(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("docker: {e}");
+                ExitCode::FAILURE
+            }
+        };
     }
     // Windows without WSL2: keep working in native mode instead of failing on every command
     let fallback = if native { None } else { vm::native_reason() };

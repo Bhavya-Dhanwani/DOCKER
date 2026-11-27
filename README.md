@@ -294,6 +294,12 @@ Without WSL2 the app runs in native mode and uses no VM memory at all.
 
 **43 images run and checked:** alpine, ubuntu, debian, busybox, fedora, kali, archlinux · node, python, golang, rust, php, ruby, java, .NET · nginx, httpd, caddy, traefik, haproxy · postgres, mysql, mariadb, mongo, redis, memcached, cassandra, couchdb, influxdb · rabbitmq, nats, redpanda, mosquitto · wordpress, ghost, grafana, prometheus, vault, registry, mailhog, adminer · jenkins, gitea
 
+**128 images in the app's "Add image" window:** several versions of Node, Python, PHP, Java, PostgreSQL and more. The 43 above were run on this engine; each of the others was checked to exist on Docker Hub but not run.
+
+- **Any other image:** search Docker Hub from the same window, or run `docker search <term>`
+- **Your own list:** press "Save to my list" in the window, or run `docker catalog add ghcr.io/org/app:1 "my app"` (`docker catalog` lists them, `docker catalog rm <image>` removes one)
+- **Private registries:** use "Connect a registry" in the window, or `docker login <server>`
+
 **Languages checked** (compile and run a program in each): Python, Node.js, Bun, Deno, Go, Rust, Java, PHP, Ruby, Perl, C, C++, Lua, Elixir, .NET, R, Haskell, Kotlin
 </details>
 

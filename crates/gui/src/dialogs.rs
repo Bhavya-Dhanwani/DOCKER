@@ -10,7 +10,7 @@ pub enum Dialog {
     Run(Box<RunDialog>),
     Build(BuildDialog),
     Group(crate::group_dialog::GroupDialog),
-    Catalog(crate::catalog_dialog::CatalogDialog),
+    Catalog(Box<crate::catalog_dialog::CatalogDialog>),
 }
 
 #[derive(Default)]

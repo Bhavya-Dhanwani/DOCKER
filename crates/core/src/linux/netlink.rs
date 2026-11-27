@@ -371,7 +371,7 @@ mod tests {
         assert_eq!(mask_bytes(20, 4), [0xff, 0xff, 0xf0, 0]);
         let net = [0xfd, 0, 0x5a, 0x57, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let b = nat_batch("t", "c", &[(net.to_vec(), 64)], true);
-        assert_eq!(b[16], 10, "nfgenmsg family is NFPROTO_IPV6");
+        assert_eq!(b[20 + 16], 10, "nfgenmsg family is NFPROTO_IPV6 (first message after the 20-byte batch marker)");
         assert!(b.windows(16).any(|w| w == net));
         let d = drop_table_batch("t", false);
         assert_eq!(count_acks(&d), 2);

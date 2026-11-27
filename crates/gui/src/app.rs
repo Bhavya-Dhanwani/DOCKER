@@ -353,7 +353,7 @@ impl App {
                     self.start_pull(n, vec![]);
                 }
                 Cmd::GroupDialog(imgs) => self.dialog = Some(Dialog::Group(GroupDialog::new(&imgs))),
-                Cmd::CatalogDialog => self.dialog = Some(Dialog::Catalog(CatalogDialog::default())),
+                Cmd::CatalogDialog => self.dialog = Some(Dialog::Catalog(Box::new(CatalogDialog::open()))),
                 Cmd::CopyNote(text, note) => {
                     ctx.copy_text(text);
                     self.toast(Level::Ok, note);

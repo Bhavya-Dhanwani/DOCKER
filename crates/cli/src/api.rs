@@ -1342,10 +1342,11 @@ fn exec_tty(r: &Request, eid: &str, args: &[String], w: &mut dyn Write) -> io::R
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::process::CommandExt;
     let (mut m, mut s) = (0, 0);
-    let ws = libc::winsize { ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0 };
+    let mut ws = libc::winsize { ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0 };
     // SAFETY: openpty fills the two fds, which we immediately take ownership of.
+    #[allow(clippy::unnecessary_mut_passed)] // macOS declares the winsize argument *mut, Linux *const
     let (master, slave) = unsafe {
-        if libc::openpty(&mut m, &mut s, std::ptr::null_mut(), std::ptr::null_mut(), &ws) != 0 {
+        if libc::openpty(&mut m, &mut s, std::ptr::null_mut(), std::ptr::null_mut(), &mut ws) != 0 {
             return Err(io::Error::last_os_error());
         }
         (OwnedFd::from_raw_fd(m), OwnedFd::from_raw_fd(s))

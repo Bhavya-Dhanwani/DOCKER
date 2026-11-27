@@ -18,8 +18,17 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
 if [ "$1" = "--uninstall" ]; then
-  $SUDO rm -f /usr/local/bin/docker /usr/local/bin/docker-gui /usr/local/bin/docker-linux-* /usr/local/share/applications/sasta-docker.desktop
-  $SUDO find /usr/local/bin -type l -lname "*/lib/sasta-docker/*" -delete 2>/dev/null || true
+  # `docker` goes only if it is ours: with the `sdocker` choice it belongs to a real Docker
+  if /usr/local/bin/docker --version 2>/dev/null | grep -q "build sasta"; then
+    $SUDO rm -f /usr/local/bin/docker /usr/local/bin/docker-gui
+  fi
+  $SUDO rm -f /usr/local/bin/docker-linux-* /usr/local/share/applications/sasta-docker.desktop
+  # the `sdocker` commands: links (Linux) or small scripts (macOS) that point into our lib folder
+  for f in /usr/local/bin/sdocker /usr/local/bin/sdocker-gui; do
+    if { [ -L "$f" ] && readlink "$f" | grep -q /lib/sasta-docker/; } || { [ ! -L "$f" ] && grep -q /lib/sasta-docker/ "$f" 2>/dev/null; }; then
+      $SUDO rm -f "$f"
+    fi
+  done
   $SUDO rm -rf /usr/local/lib/sasta-docker
   [ "$OS" = Darwin ] && $SUDO pkgutil --forget dev.sasta.docker >/dev/null 2>&1 || true
   echo "Sasta Docker removed."
@@ -54,12 +63,21 @@ case "$OS" in
     FILE="SastaDocker-macos-$ARCH.pkg"
     echo "Downloading $FILE ..."
     curl -fSL "$BASE/$FILE" -o "$TMP/$FILE"
-    $SUDO installer -pkg "$TMP/$FILE" -target /
-    if [ "$NAME" != docker ]; then
-      $SUDO mkdir -p /usr/local/lib/sasta-docker
-      for f in docker docker-gui docker-linux-*; do [ -f "/usr/local/bin/$f" ] && $SUDO mv "/usr/local/bin/$f" /usr/local/lib/sasta-docker/; done
-      $SUDO ln -sf /usr/local/lib/sasta-docker/docker "/usr/local/bin/$NAME"
-      $SUDO ln -sf /usr/local/lib/sasta-docker/docker-gui "/usr/local/bin/$NAME-gui"
+    if [ "$NAME" = docker ]; then
+      $SUDO installer -pkg "$TMP/$FILE" -target /
+    else
+      # unpack instead of installing: the package writes /usr/local/bin/docker, which here belongs to a real Docker
+      pkgutil --expand-full "$TMP/$FILE" "$TMP/pkg"
+      LIB=/usr/local/lib/sasta-docker
+      $SUDO mkdir -p "$LIB" /usr/local/bin
+      $SUDO cp "$TMP/pkg/Payload/usr/local/bin/"* "$LIB/"
+      $SUDO chmod 755 "$LIB/"*
+      # small scripts, not links: macOS would otherwise look for the other programs next to the link
+      for p in "$NAME:docker" "$NAME-gui:docker-gui"; do
+        $SUDO rm -f "/usr/local/bin/${p%:*}"
+        printf '#!/bin/sh\nexec "%s/%s" "$@"\n' "$LIB" "${p#*:}" | $SUDO tee "/usr/local/bin/${p%:*}" >/dev/null
+        $SUDO chmod 755 "/usr/local/bin/${p%:*}"
+      done
     fi
     echo
     echo "Done. macOS runs Linux containers in a small VM:"

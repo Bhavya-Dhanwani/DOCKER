@@ -9,7 +9,11 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 LIB="$PREFIX/lib/sasta-docker"
 if [ "$1" = "--uninstall" ]; then
   PREFIX=/usr/local; LIB="$PREFIX/lib/sasta-docker"
-  rm -f "$PREFIX/bin/docker" "$PREFIX/bin/docker-gui" "$PREFIX/bin/docker-linux-"* "$PREFIX/share/applications/sasta-docker.desktop"
+  # `docker` goes only if it is ours: with the `sdocker` choice it belongs to a real Docker
+  if "$PREFIX/bin/docker" --version 2>/dev/null | grep -q "build sasta"; then
+    rm -f "$PREFIX/bin/docker" "$PREFIX/bin/docker-gui"
+  fi
+  rm -f "$PREFIX/bin/docker-linux-"* "$PREFIX/share/applications/sasta-docker.desktop"
   find "$PREFIX/bin" -type l -lname "*/lib/sasta-docker/*" -delete 2>/dev/null || true
   rm -rf "$LIB"
   echo "Sasta Docker removed."; exit 0
